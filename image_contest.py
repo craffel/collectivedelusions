@@ -48,10 +48,7 @@ def generate_round_submissions(round_n):
         prev_winners = get_images_from_folder(prev_winners_dir)[:3]
     
     with open(GEN_PROMPT_FILE, "r") as f:
-        base_prompt = f.read()
-    
-    # "with nano banana" requirement
-    full_prompt = f"{base_prompt}\n\nPlease generate a new image that includes a 'nano banana'. Ensure the style is consistent with the attached winning images."
+        full_prompt = f.read()
     
     print(f"--- Round {round_n}: Generating 10 submissions ---")
     
