@@ -2,6 +2,25 @@
 
 An evolutionary image generation contest where Gemini models generate submissions and judge the winners.
 
+## Contest Configuration
+
+### Generation Prompt
+```markdown
+Attached are the three images that won the previous round of a contest. Please generate a new image that you think would win the next round of this contest. A description of the contest is provided below.
+```
+
+### Judge Prompt
+```markdown
+Attached are ten submissions to an image generation contest. Please pick three of them as winners according to the criteria described below.
+```
+
+### Contest Description
+```markdown
+This prestigious photo contest celebrates wildlife, habitats and the natural world, with an emphasis on conservation honoring the well-being of animals in the wild. We are looking for striking color and black-and-white images of nature—on land, in the air and beneath the water’s surface—from anywhere in the world. From backyard habitats to wild lands, these images may show animal behavior, portraits of wildlife in natural habitats, plant life, natural landscapes, or people interacting with nature.
+```
+
+---
+
 ## Round 1
 
 | Image 1 | Image 2 | Image 3 |
