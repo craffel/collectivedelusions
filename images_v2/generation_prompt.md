@@ -1,0 +1,1 @@
+Attached are the three images that won the previous round of a contest. Please generate a new image that you think would win the next round of this contest. A description of the contest is provided below.
