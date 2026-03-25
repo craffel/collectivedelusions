@@ -168,11 +168,10 @@ def main():
         print(f"\n=== STARTING ROUND {n} ===")
         generate_round_submissions(n)
         judge_round_winners(n)
-        print(f"=== COMPLETED ROUND {n} ===\n")
-
-if __name__ == "__main__":
-    main()
-and pushing to GitHub for Round {n}...")
+        print(f"=== COMPLETED ROUND {n} ===")
+        
+        # Generate README and push to Git
+        print(f"Updating README and pushing to GitHub for Round {n}...")
         try:
             generate_readme.generate_readme()
             subprocess.run(["git", "add", "."], check=True, capture_output=True)
@@ -180,7 +179,7 @@ and pushing to GitHub for Round {n}...")
             subprocess.run(["git", "push", "origin", "main"], check=True, capture_output=True)
             print("Successfully pushed to GitHub!")
         except subprocess.CalledProcessError as e:
-            print(f"Git push failed: {e.stderr.decode('utf-8') if e.stderr else str(e)}")
+            print(f"Git push failed: {e.stderr.decode("utf-8") if e.stderr else str(e)}")
         except Exception as e:
             print(f"Failed to update README or push: {e}")
             
