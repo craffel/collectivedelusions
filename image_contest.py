@@ -5,6 +5,7 @@ import pathlib
 import shutil
 import time
 import subprocess
+import argparse
 from io import BytesIO
 from PIL import Image
 try:
@@ -25,10 +26,17 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-3-flash-preview" # Updated from 2.0 to 3.0 flash preview
 
-BASE_DIR = pathlib.Path("/fsx/craffel/collectivedelusions/images")
-GEN_PROMPT_FILE = BASE_DIR / "generation_prompt.md"
-JUDGE_PROMPT_FILE = BASE_DIR / "judge_prompt.md"
-ORIGINAL_WINNERS_DIR = BASE_DIR / "original_winners"
+BASE_DIR = None
+GEN_PROMPT_FILE = None
+JUDGE_PROMPT_FILE = None
+ORIGINAL_WINNERS_DIR = None
+
+def setup_directories(base_dir_path):
+    global BASE_DIR, GEN_PROMPT_FILE, JUDGE_PROMPT_FILE, ORIGINAL_WINNERS_DIR
+    BASE_DIR = pathlib.Path(base_dir_path).resolve()
+    GEN_PROMPT_FILE = BASE_DIR / "generation_prompt.md"
+    JUDGE_PROMPT_FILE = BASE_DIR / "judge_prompt.md"
+    ORIGINAL_WINNERS_DIR = BASE_DIR / "original_winners"
 
 def get_images_from_folder(folder):
     return sorted(list(folder.glob("*.jpg")) + list(folder.glob("*.png")) + list(folder.glob("*.jpeg")))
@@ -49,6 +57,11 @@ def generate_round_submissions(round_n):
     
     with open(GEN_PROMPT_FILE, "r") as f:
         full_prompt = f.read()
+    
+    desc_file = BASE_DIR / "contest_description.md"
+    if desc_file.exists():
+        with open(desc_file, "r") as f:
+            full_prompt += "\n\n" + f.read()
     
     print(f"--- Round {round_n}: Generating 10 submissions ---")
     
@@ -103,6 +116,11 @@ def judge_round_winners(round_n):
 
     with open(JUDGE_PROMPT_FILE, "r") as f:
         judge_prompt = f.read()
+        
+    desc_file = BASE_DIR / "contest_description.md"
+    if desc_file.exists():
+        with open(desc_file, "r") as f:
+            judge_prompt += "\n\n" + f.read()
     
     # Add explicit instructions for parsing
     parse_instruction = "\n\nPlease identify exactly three winners. List only the numbers of the winners as a comma-separated list, e.g., 'Winners: 1, 4, 7'."
@@ -152,17 +170,15 @@ def judge_round_winners(round_n):
         print(f"Error during judging: {e}")
 
 def main():
-    if len(sys.argv) > 1:
-        try:
-            num_rounds = int(sys.argv[1])
-        except ValueError:
-            print("Invalid number of rounds. Please provide an integer.")
-            return
-    else:
-        num_rounds = int(input("Enter the number of rounds to run: "))
+    parser = argparse.ArgumentParser(description="Run the image generation contest.")
+    parser.add_argument("base_dir", type=str, help="The base images directory (e.g., images_v2)")
+    parser.add_argument("num_rounds", type=int, nargs="?", default=1, help="Number of rounds to run")
+    args = parser.parse_args()
 
-    for n in range(1, num_rounds + 1):
-        print(f"\n=== STARTING ROUND {n} ===")
+    setup_directories(args.base_dir)
+
+    for n in range(1, args.num_rounds + 1):
+        print(f"\\n=== STARTING ROUND {n} ===")
         generate_round_submissions(n)
         judge_round_winners(n)
         print(f"=== COMPLETED ROUND {n} ===")
@@ -170,17 +186,17 @@ def main():
         # Generate README and push to Git
         print(f"Updating README and pushing to GitHub for Round {n}...")
         try:
-            generate_readme.generate_readme()
+            generate_readme.generate_readme(args.base_dir)
             subprocess.run(["git", "add", "."], check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", f"Add results for Round {n}"], check=True, capture_output=True)
             subprocess.run(["git", "push", "origin", "main"], check=True, capture_output=True)
             print("Successfully pushed to GitHub!")
         except subprocess.CalledProcessError as e:
-            print(f"Git push failed: {e.stderr.decode("utf-8") if e.stderr else str(e)}")
+            print(f"Git push failed: {e.stderr.decode('utf-8') if e.stderr else str(e)}")
         except Exception as e:
             print(f"Failed to update README or push: {e}")
             
-        print("\n")
+        print("\\n")
 
 if __name__ == "__main__":
     main()

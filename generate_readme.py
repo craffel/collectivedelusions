@@ -1,10 +1,13 @@
 import pathlib
+import sys
 
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
-IMAGES_DIR = BASE_DIR / "images"
 README_PATH = BASE_DIR / "README.md"
 
-def generate_readme():
+def generate_readme(images_dir_str):
+    IMAGES_DIR = pathlib.Path(images_dir_str).resolve()
+    README_PATH = IMAGES_DIR / "README.md"
+    
     with open(README_PATH, "w") as f:
         f.write("# Collective Delusions: Nano Banana Contest\n\n")
         f.write("An evolutionary image generation contest where Gemini models generate submissions and judge the winners.\n\n")
@@ -39,7 +42,11 @@ def generate_readme():
             
             row = []
             for sub in submissions:
-                rel_path = sub.relative_to(BASE_DIR)
+                try:
+                    rel_path = sub.relative_to(IMAGES_DIR)
+                except ValueError:
+                    rel_path = sub # Fallback if not relative
+                
                 is_winner = sub.name in winners
                 status = "🏆 **WINNER**" if is_winner else "Submission"
                 
@@ -60,4 +67,7 @@ def generate_readme():
             f.write("\n---\n\n")
 
 if __name__ == "__main__":
-    generate_readme()
+    if len(sys.argv) > 1:
+        generate_readme(sys.argv[1])
+    else:
+        print("Please provide the images directory as an argument.")
