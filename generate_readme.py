@@ -2,7 +2,6 @@ import pathlib
 import sys
 
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
-README_PATH = BASE_DIR / "README.md"
 
 def generate_readme(images_dir_str):
     IMAGES_DIR = pathlib.Path(images_dir_str).resolve()
@@ -11,6 +10,33 @@ def generate_readme(images_dir_str):
     with open(README_PATH, "w") as f:
         f.write("# Collective Delusions: Nano Banana Contest\n\n")
         f.write("An evolutionary image generation contest where Gemini models generate submissions and judge the winners.\n\n")
+        
+        # Add Prompts Section
+        f.write("## Contest Configuration\n\n")
+        
+        gen_prompt_path = IMAGES_DIR / "generation_prompt.md"
+        judge_prompt_path = IMAGES_DIR / "judge_prompt.md"
+        desc_path = IMAGES_DIR / "contest_description.md"
+        
+        if gen_prompt_path.exists():
+            f.write("### Generation Prompt\n")
+            f.write("```markdown\n")
+            f.write(gen_prompt_path.read_text().strip())
+            f.write("\n```\n\n")
+            
+        if judge_prompt_path.exists():
+            f.write("### Judge Prompt\n")
+            f.write("```markdown\n")
+            f.write(judge_prompt_path.read_text().strip())
+            f.write("\n```\n\n")
+            
+        if desc_path.exists():
+            f.write("### Contest Description\n")
+            f.write("```markdown\n")
+            f.write(desc_path.read_text().strip())
+            f.write("\n```\n\n")
+            
+        f.write("---\n\n")
         
         # Find all round folders
         sub_dirs = sorted([d for d in IMAGES_DIR.glob("submissions_round_*") if d.is_dir()], key=lambda x: int(x.name.split("_")[-1]))
