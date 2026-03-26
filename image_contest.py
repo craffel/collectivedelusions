@@ -50,6 +50,12 @@ def generate_round_submissions(round_n):
         all_prev_winners = get_images_from_folder(ORIGINAL_WINNERS_DIR)
         prev_winners = random.sample(all_prev_winners, min(3, len(all_prev_winners)))
         print(f"Round 1: Randomly selected {len(prev_winners)} seeds from original_winners.")
+        
+        # Save seeds for README visualization
+        winners_0_dir = BASE_DIR / "winners_round_0"
+        winners_0_dir.mkdir(parents=True, exist_ok=True)
+        for w in prev_winners:
+            shutil.copy(w, winners_0_dir / w.name)
     else:
         # In subsequent rounds, pick from the previous round's winners
         prev_winners_dir = BASE_DIR / f"winners_round_{round_n - 1}"
@@ -173,7 +179,11 @@ def main():
     parser = argparse.ArgumentParser(description="Run the image generation contest.")
     parser.add_argument("base_dir", type=str, help="The base images directory (e.g., images_v2)")
     parser.add_argument("num_rounds", type=int, nargs="?", default=1, help="Number of rounds to run")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for initial image selection")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
 
     setup_directories(args.base_dir)
 

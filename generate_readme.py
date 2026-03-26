@@ -38,6 +38,27 @@ def generate_readme(images_dir_str):
             
         f.write("---\n\n")
         
+        # Render initial seeds if available
+        winners_0_dir = IMAGES_DIR / "winners_round_0"
+        if winners_0_dir.exists():
+            seeds = sorted(list(winners_0_dir.glob("*.jpg")) + list(winners_0_dir.glob("*.png")))
+            if seeds:
+                f.write("## Initial Seeds (Round 0)\n\n")
+                f.write("| Seed 1 | Seed 2 | Seed 3 |\n")
+                f.write("| :---: | :---: | :---: |\n")
+                
+                row = []
+                for seed in seeds:
+                    try:
+                        rel_path = seed.relative_to(IMAGES_DIR)
+                    except ValueError:
+                        rel_path = seed
+                    row.append(f"<img src='{rel_path}' width='250'><br>🏆 **SEED**<br>`{seed.name}`")
+                
+                while len(row) < 3:
+                    row.append("")
+                f.write(f"| {' | '.join(row)} |\n\n---\n\n")
+
         # Find all round folders
         sub_dirs = sorted([d for d in IMAGES_DIR.glob("submissions_round_*") if d.is_dir()], key=lambda x: int(x.name.split("_")[-1]))
         
