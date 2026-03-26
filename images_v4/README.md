@@ -112,3 +112,12 @@ vi. People in Nature: People responsibly connecting with nature, enjoying wildli
 
 ---
 
+## Round 8
+
+| Image 1 | Image 2 | Image 3 |
+| :---: | :---: | :---: |
+| <img src='submissions_round_8/submission_3.jpg' width='250'><br>Submission<br>`submission_3.jpg` | <img src='submissions_round_8/submission_4.jpg' width='250'><br>🏆 **WINNER**<br>`submission_4.jpg` | <img src='submissions_round_8/submission_5.jpg' width='250'><br>🏆 **WINNER**<br>`submission_5.jpg` |
+| <img src='submissions_round_8/submission_7.jpg' width='250'><br>🏆 **WINNER**<br>`submission_7.jpg` | <img src='submissions_round_8/submission_9.jpg' width='250'><br>Submission<br>`submission_9.jpg` |  |
+
+---
+
