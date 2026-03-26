@@ -740,3 +740,11 @@ vi. People in Nature: People responsibly connecting with nature, enjoying wildli
 
 ---
 
+## Round 66
+
+| Image 1 | Image 2 | Image 3 |
+| :---: | :---: | :---: |
+| <img src='submissions_round_66/submission_2.jpg' width='250'><br>Submission<br>`submission_2.jpg` |  |  |
+
+---
+
