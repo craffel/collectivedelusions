@@ -21,6 +21,14 @@ This prestigious photo contest celebrates wildlife, habitats and the natural wor
 
 ---
 
+## Initial Seeds (Round 0)
+
+| Seed 1 | Seed 2 | Seed 3 |
+| :---: | :---: | :---: |
+| <img src='winners_round_0/PCWINNERS-Baby-Animals-1st-WINTER26-960x686.jpg' width='250'><br>🏆 **SEED**<br>`PCWINNERS-Baby-Animals-1st-WINTER26-960x686.jpg` | <img src='winners_round_0/PCWINNERS-Birds-2nd-WINTER26-960x642.jpg' width='250'><br>🏆 **SEED**<br>`PCWINNERS-Birds-2nd-WINTER26-960x642.jpg` | <img src='winners_round_0/PCWINNERS-Other-Wildlife-1st-WINTER26_960x678.jpg' width='250'><br>🏆 **SEED**<br>`PCWINNERS-Other-Wildlife-1st-WINTER26_960x678.jpg` |
+
+---
+
 ## Round 1
 
 | Image 1 | Image 2 | Image 3 |
