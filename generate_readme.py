@@ -68,6 +68,9 @@ def generate_readme(images_dir_str):
             
         for sub_dir in sub_dirs:
             round_n = int(sub_dir.name.split("_")[-1])
+            if round_n > 10 and round_n % 10 != 0:
+                continue
+                
             win_dir = IMAGES_DIR / f"winners_round_{round_n}"
             
             f.write(f"## Round {round_n}\n\n")
