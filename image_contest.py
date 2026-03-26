@@ -187,7 +187,24 @@ def main():
 
     setup_directories(args.base_dir)
 
-    for n in range(1, args.num_rounds + 1):
+    start_round = 1
+    while True:
+        winners_dir = BASE_DIR / f"winners_round_{start_round}"
+        if winners_dir.exists() and len(get_images_from_folder(winners_dir)) >= 3:
+            start_round += 1
+        else:
+            break
+
+    if start_round <= args.num_rounds:
+        print(f"Resuming from round {start_round}...")
+        partial_sub_dir = BASE_DIR / f"submissions_round_{start_round}"
+        if partial_sub_dir.exists():
+            shutil.rmtree(partial_sub_dir)
+        partial_win_dir = BASE_DIR / f"winners_round_{start_round}"
+        if partial_win_dir.exists():
+            shutil.rmtree(partial_win_dir)
+
+    for n in range(start_round, args.num_rounds + 1):
         print(f"\\n=== STARTING ROUND {n} ===")
         generate_round_submissions(n)
         judge_round_winners(n)
