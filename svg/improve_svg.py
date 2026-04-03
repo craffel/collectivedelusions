@@ -19,6 +19,7 @@ def main():
     parser.add_argument("iterations_n", type=int, help="Number of iterations (n)")
     parser.add_argument("improvements_m", type=int, help="Number of improvements per iteration (m)")
     parser.add_argument("--prompts", default="/fsx/craffel/collectivedelusions/svg/prompts.md", help="Path to the prompts file (default: /fsx/craffel/collectivedelusions/svg/prompts.md)")
+    parser.add_argument("--model", default="gemini-3.1-pro-preview", help="Gemini model to use (default: gemini-3.1-pro-preview)")
     
     args = parser.parse_args()
 
@@ -26,6 +27,7 @@ def main():
     n = args.iterations_n
     m = args.improvements_m
     prompts_file = args.prompts
+    model_name = args.model
 
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
@@ -37,7 +39,6 @@ def main():
 
     # Use the new SDK client
     client = genai.Client(api_key=api_key)
-    model_name = 'gemini-3.1-pro-preview'
 
     # 1) Pick random prompt from prompts.md
     if not os.path.exists(prompts_file):
