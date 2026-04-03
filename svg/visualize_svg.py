@@ -1,65 +1,76 @@
 import os
 import sys
+import subprocess
+
+def get_git_info():
+    """Get GitHub repository owner/name and current branch."""
+    try:
+        remote_url = subprocess.check_output(["git", "remote", "get-url", "origin"], stderr=subprocess.DEVNULL).decode().strip()
+        # Handle both SSH and HTTPS formats
+        if remote_url.startswith("git@github.com:"):
+            repo_path = remote_url.split("git@github.com:")[1].replace(".git", "")
+        elif remote_url.startswith("https://github.com/"):
+            repo_path = remote_url.split("https://github.com/")[1].replace(".git", "")
+        else:
+            repo_path = "USER/REPO" # Fallback
+
+        branch = subprocess.check_output(["git", "branch", "--show-current"], stderr=subprocess.DEVNULL).decode().strip()
+        if not branch:
+            branch = "main"
+
+        # Get repo root for relative path calculations
+        repo_root = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL).decode().strip()
+        
+        return repo_path, branch, repo_root
+    except Exception:
+        return "USER/REPO", "main", os.getcwd()
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python visualize_svg.py <output_directory>")
         sys.exit(1)
 
-    target_dir = sys.argv[1]
+    target_dir = os.path.abspath(sys.argv[1])
     
     if not os.path.exists(target_dir):
         print(f"Error: Directory '{target_dir}' does not exist.")
         sys.exit(1)
 
-    html_path = os.path.join(target_dir, "index.html")
+    repo_path, branch, repo_root = get_git_info()
+    
+    # Calculate relative path from repo root to target_dir
+    try:
+        rel_path = os.path.relpath(target_dir, repo_root)
+    except ValueError:
+        rel_path = target_dir
+
+    md_path = os.path.join(target_dir, "RESULTS.md")
 
     # Detect the number of iterations (n)
     n = 0
     while os.path.exists(os.path.join(target_dir, f"{n+1}.svg")):
         n += 1
 
-    html_content = [
-        "<!DOCTYPE html>",
-        "<html>",
-        "<head>",
-        "    <meta charset='utf-8'>",
-        "    <title>SVG Evolution</title>",
-        "    <style>",
-        "        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f4f9; color: #333; padding: 20px; }",
-        "        h1 { text-align: center; color: #2c3e50; }",
-        "        .round { background: #fff; margin-bottom: 40px; padding: 25px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }",
-        "        .round h2 { margin-top: 0; color: #34495e; border-bottom: 2px solid #eee; padding-bottom: 10px; }",
-        "        .grid { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }",
-        "        .card { border: 3px solid transparent; padding: 15px; border-radius: 10px; background: #fafafa; text-align: center; width: 300px; display: flex; flex-direction: column; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }",
-        "        .card.chosen { border-color: #2ecc71; background: #eafaf1; box-shadow: 0 0 15px rgba(46, 204, 113, 0.4); transform: scale(1.02); transition: transform 0.2s; }",
-        "        .card img { max-width: 100%; max-height: 250px; border: 1px dashed #ccc; background: #fff; margin-top: 10px; padding: 5px; border-radius: 5px; }",
-        "        .badge { display: inline-block; background: #2ecc71; color: white; padding: 5px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }",
-        "        .filename { font-family: monospace; font-size: 14px; color: #555; background: #eee; padding: 3px 8px; border-radius: 4px; }",
-        "    </style>",
-        "</head>",
-        "<body>",
-        "    <h1>SVG Generation and Improvement Process</h1>"
+    md_content = [
+        "# SVG Generation and Improvement Process",
+        ""
     ]
+
+    def get_raw_url(filename):
+        return f"https://raw.githubusercontent.com/{repo_path}/{branch}/{rel_path}/{filename}?sanitize=true"
 
     # Round 0 (Initial Generation)
     if os.path.exists(os.path.join(target_dir, "0.svg")):
-        html_content.append("    <div class='round'>")
-        html_content.append("        <h2>Initial Generation (Round 0)</h2>")
-        html_content.append("        <div class='grid'>")
-        html_content.append("            <div class='card chosen'>")
-        html_content.append("                <div class='badge'>Base Image</div>")
-        html_content.append("                <div class='filename'>0.svg</div>")
-        html_content.append("                <img src='0.svg' alt='0.svg'>")
-        html_content.append("            </div>")
-        html_content.append("        </div>")
-        html_content.append("    </div>")
+        md_content.append("## Initial Generation (Round 0)")
+        md_content.append("")
+        md_content.append(f"**Base Image (0.svg):**")
+        md_content.append(f"![0.svg]({get_raw_url('0.svg')})")
+        md_content.append("")
 
     # Iterative improvements
     for k in range(1, n + 1):
-        html_content.append(f"    <div class='round'>")
-        html_content.append(f"        <h2>Iteration {k}</h2>")
-        html_content.append("        <div class='grid'>")
+        md_content.append(f"## Iteration {k}")
+        md_content.append("")
 
         chosen_svg_path = os.path.join(target_dir, f"{k}.svg")
         chosen_content = ""
@@ -68,47 +79,36 @@ def main():
                 chosen_content = f.read().strip()
 
         m = 1
-        match_found = False
+        md_content.append("### Candidates")
+        md_content.append("")
+        
         while os.path.exists(os.path.join(target_dir, f"{k-1}-{m}.svg")):
             cand_path = os.path.join(target_dir, f"{k-1}-{m}.svg")
+            filename = f"{k-1}-{m}.svg"
             with open(cand_path, 'r', encoding='utf-8') as f:
                 cand_content = f.read().strip()
 
-            # Check if this candidate is the chosen one
             is_chosen = (cand_content == chosen_content) and (cand_content != "")
-            if is_chosen:
-                match_found = True
-
-            css_class = "card chosen" if is_chosen else "card"
             
-            html_content.append(f"            <div class='{css_class}'>")
-            if is_chosen:
-                html_content.append("                <div class='badge'>Winner</div>")
-            html_content.append(f"                <div class='filename'>{k-1}-{m}.svg</div>")
-            html_content.append(f"                <img src='{k-1}-{m}.svg' alt='{k-1}-{m}.svg'>")
-            html_content.append("            </div>")
+            status = " ✅ **(WINNER)**" if is_chosen else ""
+            md_content.append(f"#### {filename}{status}")
+            md_content.append(f"![{filename}]({get_raw_url(filename)})")
+            md_content.append("")
             
             m += 1
             
         # Fallback if somehow the content doesn't perfectly match any candidate
-        # but the k.svg file exists
-        if not match_found and os.path.exists(chosen_svg_path):
-            html_content.append(f"            <div class='card chosen'>")
-            html_content.append("                <div class='badge'>Winner (Standalone)</div>")
-            html_content.append(f"                <div class='filename'>{k}.svg</div>")
-            html_content.append(f"                <img src='{k}.svg' alt='{k}.svg'>")
-            html_content.append("            </div>")
+        if not any(open(os.path.join(target_dir, f"{k-1}-{x}.svg")).read().strip() == chosen_content 
+                   for x in range(1, m) if os.path.exists(os.path.join(target_dir, f"{k-1}-{x}.svg"))):
+            if os.path.exists(chosen_svg_path):
+                md_content.append(f"#### {k}.svg ✅ **(WINNER)**")
+                md_content.append(f"![{k}.svg]({get_raw_url(f'{k}.svg')})")
+                md_content.append("")
 
-        html_content.append("        </div>")
-        html_content.append("    </div>")
+    with open(md_path, "w", encoding='utf-8') as f:
+        f.write("\n".join(md_content))
 
-    html_content.append("</body>")
-    html_content.append("</html>")
-
-    with open(html_path, "w", encoding='utf-8') as f:
-        f.write("\n".join(html_content))
-
-    print(f"Visualization successfully generated at: {html_path}")
+    print(f"Markdown visualization successfully generated at: {md_path}")
 
 if __name__ == "__main__":
     main()
