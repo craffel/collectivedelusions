@@ -24,7 +24,7 @@ while true; do
     echo "[$(date)] Invoking gemini-cli..."
     
     # Run the agent autonomously
-    gemini --yolo --debug --prompt "Read the instructions in plan.md"
+    gemini --yolo --debug --model "gemini-3.1-pro-preview" --prompt "Read the instructions in plan.md"
     
     echo "[$(date)] gemini-cli invocation finished. Sleeping for 10 minutes."
     sleep 600
