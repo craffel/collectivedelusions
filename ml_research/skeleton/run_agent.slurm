@@ -8,24 +8,44 @@
 #SBATCH --gpus-per-node=8
 #SBATCH -o %x_%j.out
 #SBATCH -e %x_%j.err
-#SBATCH --time=24:00:00
-
-# We don't use 'set -e' here so that if an agent invocation fails,
-# the script will still sleep and retry rather than terminating the whole job.
-source ~/.bashrc
-source "$CONDA_ROOT/etc/profile.d/conda.sh"
-source activate gemini
+#SBATCH --time=6:00:00
 
 echo "Starting Autoresearch Agent Job: $SLURM_JOB_ID"
 echo "Allocated Node: $(hostname)"
 
 # Repeatedly invoke the agent with a 10-minute (600 seconds) delay
 while true; do
-    echo "[$(date)] Invoking gemini-cli..."
+    echo "[$(date)] Invoking claude..."
     
     # Run the agent autonomously
-    gemini --yolo --debug --model "gemini-3.1-pro-preview" --prompt "Read the instructions in plan.md"
+    /admin/home/craffel/.local/bin/claude --bare --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions --model "claude-opus-4-7" -p "Follow the instructions in plan.md" | jq -rj '
+  if .type == "system" then
+    "\n[\(.subtype | ascii_upcase): \(.status)]\n"
+  elif .type == "stream_event" then
+    .event |
+    if .type == "content_block_start" then
+      .content_block |
+      if .type == "thinking" then "\n[THINKING]\n"
+      elif .type == "tool_use" then "\n[TOOL: \(.name)]\n"
+      elif .type == "text" then "\n[RESPONSE]\n"
+      else ""
+      end
+    elif .type == "content_block_delta" then
+      .delta |
+      if .type == "thinking_delta" then .thinking
+      elif .type == "text_delta" then .text
+      elif .type == "input_json_delta" then .partial_json
+      else ""
+      end
+    elif .type == "content_block_stop" then "\n"
+    else ""
+    end
+  elif .type == "result" then
+    "\n[RESULT]\n\(.result)\n"
+  else ""
+  end
+'
     
-    echo "[$(date)] gemini-cli invocation finished. Sleeping for 10 minutes."
+    echo "[$(date)] claude-cli invocation finished. Sleeping for 10 minutes."
     sleep 600
 done
