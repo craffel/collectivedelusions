@@ -21,8 +21,9 @@ Most of these things can be learned from experience, but reading them and keepin
 ## Experimentation
 
 - After you've picked a problem and a plan of attack, try to design your first experiment as a minimum viable proof-of-concept of the idea. Toy settings or scaled-down are fine at this stage.  
-- When evaluating a newly proposed method, it's best to reuse an experimental setting proposed in past published work.  
-- On the other hand, the experimental setting itself can be part of the contribution if you can justify a new experimental setting or configuration.
+- When evaluating a newly proposed method, it's best to reuse and reproduce an experimental setting proposed in past published work. If you aren't able to reproduce baseline numbers from past work, this is a big warning sign. Iterate on your reimplementation until you can resolve the differences.
+- On the other hand, proposing and using a new experimental setting itself can be part of the contribution as long as you can justify it.
+- Modern machine learning is heavily empirical. Running experiments on diverse experimental settings (for example, multiple domains, model families, or scales) makes results more convincing.
 
 ## Implementation
 
