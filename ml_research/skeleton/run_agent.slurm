@@ -16,35 +16,9 @@ echo "Allocated Node: $(hostname)"
 # Repeatedly invoke the agent with a 10-minute (600 seconds) delay
 while true; do
     echo "[$(date)] Invoking claude..."
-    
-    # Run the agent autonomously
-    /admin/home/craffel/.local/bin/claude --bare --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions --model "claude-opus-4-7" -p "Follow the instructions in plan.md" | jq -rj '
-  if .type == "system" then
-    "\n[\(.subtype | ascii_upcase): \(.status)]\n"
-  elif .type == "stream_event" then
-    .event |
-    if .type == "content_block_start" then
-      .content_block |
-      if .type == "thinking" then "\n[THINKING]\n"
-      elif .type == "tool_use" then "\n[TOOL: \(.name)]\n"
-      elif .type == "text" then "\n[RESPONSE]\n"
-      else ""
-      end
-    elif .type == "content_block_delta" then
-      .delta |
-      if .type == "thinking_delta" then .thinking
-      elif .type == "text_delta" then .text
-      elif .type == "input_json_delta" then .partial_json
-      else ""
-      end
-    elif .type == "content_block_stop" then "\n"
-    else ""
-    end
-  elif .type == "result" then
-    "\n[RESULT]\n\(.result)\n"
-  else ""
-  end
-'
+
+    # Run the agent autonomously inside a bwrap sandbox (only CWD is visible).
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 stdbuf -oL -eL ./sandbox_run.sh /admin/home/craffel/.local/bin/claude --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions --model "claude-opus-4-7" -p "Follow the instructions in plan.md" | stdbuf -oL jq --unbuffered -rj -f format_log.jq
     
     echo "[$(date)] claude-cli invocation finished. Sleeping for 10 minutes."
     sleep 600
