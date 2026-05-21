@@ -1,0 +1,73 @@
+#!/bin/bash
+# Wrapper around sbatch enforcing per-agent node cap and tagging jobs with the agent's ID.
+# Caller (sandbox_run.sh) must set AGENT_ID and REAL_SLURM_BIN.
+set -euo pipefail
+
+: "${AGENT_ID:?AGENT_ID env var must be set by the sandbox}"
+REAL_BIN="${REAL_SLURM_BIN:-/run/slurm-real/bin}"
+REAL_SBATCH="$REAL_BIN/sbatch"
+REAL_SQUEUE="$REAL_BIN/squeue"
+TAG="agent-${AGENT_ID}"
+CAP="${AGENT_NODE_CAP:-1}"
+
+# Prevent env-based comment override.
+unset SBATCH_COMMENT 2>/dev/null || true
+
+# Strip caller-supplied --comment / --comment=X so we control the tag.
+filtered=()
+i=0
+args=("$@")
+while [[ $i -lt ${#args[@]} ]]; do
+    a="${args[$i]}"
+    case "$a" in
+        --comment=*) ;;                       # drop
+        --comment)   i=$((i+1)) ;;            # drop next arg too
+        *)           filtered+=("$a") ;;
+    esac
+    i=$((i+1))
+done
+
+# Determine node count this submission would consume.
+# Order: command-line override -> #SBATCH directive in script -> default 1.
+get_max_int() { # turns "2" or "2-4" into the larger number
+    local v="$1"
+    [[ "$v" == *-* ]] && v="${v#*-}"
+    echo "$v"
+}
+
+requested=""
+i=0
+while [[ $i -lt ${#filtered[@]} ]]; do
+    a="${filtered[$i]}"
+    case "$a" in
+        --nodes=*) requested="${a#--nodes=}" ;;
+        --nodes)   requested="${filtered[$((i+1))]:-1}" ;;
+        -N)        requested="${filtered[$((i+1))]:-1}" ;;
+        -N*)       requested="${a#-N}" ;;
+    esac
+    i=$((i+1))
+done
+if [[ -z "$requested" ]]; then
+    # Find a positional file arg (the slurm script).
+    script=""
+    for a in "${filtered[@]}"; do
+        [[ "$a" != -* && -f "$a" ]] && script="$a"
+    done
+    if [[ -n "$script" ]]; then
+        n=$(grep -E '^[[:space:]]*#SBATCH[[:space:]]+(--nodes(=|[[:space:]])|-N)' "$script" \
+              | tail -1 | grep -oE '[0-9]+(-[0-9]+)?' | tail -1 || true)
+        [[ -n "$n" ]] && requested="$n"
+    fi
+fi
+requested=$(get_max_int "${requested:-1}")
+
+# Sum running+pending nodes for this agent's tag.
+existing=$("$REAL_SQUEUE" --me -h -o '%k %D %t' 2>/dev/null \
+    | awk -v tag="$TAG" '$1==tag && ($3=="R" || $3=="PD" || $3=="CF") { sum += $2 } END { print sum+0 }')
+
+if (( existing + requested > CAP )); then
+    echo "[sbatch-wrapper] Refusing: agent $AGENT_ID has $existing node(s) running/pending; this would add $requested (cap=$CAP)." >&2
+    exit 2
+fi
+
+exec "$REAL_SBATCH" --comment="$TAG" "${filtered[@]}"

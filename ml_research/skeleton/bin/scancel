@@ -1,0 +1,54 @@
+#!/bin/bash
+# Wrapper around scancel that only allows cancelling jobs tagged for this agent.
+# Bulk/filter flags (-u, -A, -p, -n, -q, -t, --user, --account, --partition, --name, --qos, --state)
+# are rejected outright; the caller must specify explicit job IDs.
+set -euo pipefail
+
+: "${AGENT_ID:?AGENT_ID env var must be set by the sandbox}"
+REAL_BIN="${REAL_SLURM_BIN:-/run/slurm-real/bin}"
+REAL_SCANCEL="$REAL_BIN/scancel"
+REAL_SQUEUE="$REAL_BIN/squeue"
+TAG="agent-${AGENT_ID}"
+
+jobids=()
+i=0
+args=("$@")
+while [[ $i -lt ${#args[@]} ]]; do
+    a="${args[$i]}"
+    case "$a" in
+        -u|--user|-A|--account|-p|--partition|-n|--name|-q|--qos|-t|--state)
+            echo "[scancel-wrapper] Refusing: filter flag '$a' not allowed; pass explicit job IDs only." >&2
+            exit 2
+            ;;
+        --user=*|--account=*|--partition=*|--name=*|--qos=*|--state=*|-u=*|-A=*|-p=*|-n=*|-q=*|-t=*)
+            echo "[scancel-wrapper] Refusing: filter flag '${a%%=*}' not allowed; pass explicit job IDs only." >&2
+            exit 2
+            ;;
+        -*) ;;  # other options (e.g. -v, -Q, -s SIGNAL) pass through
+        *)  jobids+=("$a") ;;
+    esac
+    i=$((i+1))
+done
+
+if [[ ${#jobids[@]} -eq 0 ]]; then
+    echo "[scancel-wrapper] Refusing: must specify explicit job IDs (this agent's only)." >&2
+    exit 2
+fi
+
+# Build the set of job IDs owned by this agent (by comment tag).
+declare -A ours=()
+while read -r jid tag; do
+    [[ "$tag" == "$TAG" ]] || continue
+    ours["$jid"]=1
+    ours["${jid%%_*}"]=1   # also allow base of array job
+done < <("$REAL_SQUEUE" --me -h -o '%i %k')
+
+for j in "${jobids[@]}"; do
+    base="${j%%[._]*}"  # strip array/step suffix
+    if [[ -z "${ours[$j]:-}" && -z "${ours[$base]:-}" ]]; then
+        echo "[scancel-wrapper] Refusing: job $j is not tagged $TAG (not owned by agent $AGENT_ID)." >&2
+        exit 2
+    fi
+done
+
+exec "$REAL_SCANCEL" "$@"
