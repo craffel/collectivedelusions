@@ -18,7 +18,7 @@ Write a slurm script (example below) and submit it with `sbatch your_job.slurm`.
 #!/bin/bash
 #SBATCH --job-name=my-experiment
 #SBATCH --partition=hopper-prod
-#SBATCH --qos=normal
+#SBATCH --qos=normal           # see "Choosing a QoS" below
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=88
@@ -32,14 +32,23 @@ python train.py --config configs/run.yaml
 
 Submit with `sbatch my_experiment.slurm`; check status with `squeue`; cancel with `scancel <jobid>`. Output streams to `<jobname>_<jobid>.{out,err}` in the working directory by default.
 
+### Choosing a QoS — and why you should be ambitious
+The cluster has two QoS levels you can target. They behave very differently for this agent's cap policy:
+
+- **`--qos=normal`** — higher scheduling priority, but **you are capped at 1 GPU node running or pending at a time**. Good for the single experiment you are actively iterating on.
+- **`--qos=low`** — lower scheduling priority (may queue longer; can be preempted), but **no per-agent cap**. Use this for everything else: hyperparameter sweeps, ablations, baselines, scaling-law curves, multi-seed runs, robustness checks. You can have dozens of `--qos=low` jobs queued or running simultaneously.
+
+**Be ambitious.** A common failure mode for time-pressured research is shrinking the experiment to fit a single normal-priority node. Don't. When you have a sweep or a set of baselines to run, fan them out as `--qos=low` jobs in parallel — there is no cap, and a high-quality paper almost always has more than one experiment in it. Plan to use `--qos=normal` for the one foreground job you're babysitting, and `--qos=low` for the rest of the experimental program.
+
 ### Slurm restrictions enforced for this agent
 `sbatch`, `squeue`, and `scancel` are wrappers in front of the real slurm commands. They enforce:
 
-- **One GPU node at a time.** You can have at most **1** node running or pending at any moment. The wrapper inspects `--nodes`/`-N` on the command line and `#SBATCH --nodes=` in the script. If submitting would exceed the cap, you will see:
+- **`--qos=normal` (or any QoS other than `low`) is capped at 1 GPU node at a time.** Total of all running+pending non-low jobs for this agent. The wrapper inspects `--nodes`/`-N` on the command line and `#SBATCH --nodes=` in the script. If submitting would exceed the cap you will see:
   ```
-  [sbatch-wrapper] Refusing: agent <ID> has N node(s) running/pending; this would add M (cap=1).
+  [sbatch-wrapper] Refusing: agent <ID> has N non-low-priority node(s) running/pending; this would add M (cap=1). For larger fan-out, submit with --qos=low (no per-agent cap).
   ```
-  and the `sbatch` command exits with code 2 and no job is queued. Wait for your current job to finish (or `scancel` it) before submitting the next one.
+  and `sbatch` exits with code 2 and no job is queued. Either wait for your current normal job to finish, `scancel` it, or resubmit the new one with `--qos=low`.
+- **`--qos=low` jobs are unlimited.** The cap does not apply to them. Use this for parallel sweeps.
 - **All jobs you submit are auto-tagged** with `--comment=agent-<your_id>`. Do not pass your own `--comment` — it will be stripped.
 - **`squeue` only shows your own tagged jobs.** Other users' jobs and any of your own jobs not submitted through this wrapper will be invisible.
 - **`scancel` only acts on your own tagged jobs.** Bulk/filter flags are rejected outright:
@@ -52,7 +61,7 @@ Submit with `sbatch my_experiment.slurm`; check status with `squeue`; cancel wit
   ```
   In both cases the command exits with code 2 and no cancellation happens. Only pass job IDs that came from your own `sbatch` calls.
 
-If you hit one of these errors, the fix is procedural (wait for your current job, cancel only your own jobs), not technical — do not try to work around the wrappers (e.g., calling slurm via absolute paths). They are also installed at `/opt/slurm/bin/`, so PATH tricks will not bypass them.
+If you hit one of these errors, the fix is procedural (use `--qos=low` for fan-out, wait for your foreground job, cancel only your own jobs), not technical — do not try to work around the wrappers (e.g., calling slurm via absolute paths). They are also installed at `/opt/slurm/bin/`, so PATH tricks will not bypass them.
 
 ## Runtime Instructions
 This agent is invoked every 10 minutes. On each start:
@@ -75,7 +84,7 @@ This agent is invoked every 10 minutes. On each start:
 - **Formulation:** Design a set of experiments to test the hypothesis. Reuse an experimental setting (including datasets, baselines, and models) from past work if possible.
 - **Implementation:** Write the necessary Python code, reusing code from past research as much as possible to ensure valid results.
 - **Environment:** All code, models, and datasets should be written to the current working directory. Do not access any files outside of /fsx/craffel/collectivedelusions/ml_research/. Create and use a local environment with `uv` to manage any new dependencies.
-- **Execution:** Run experiments by submitting slurm jobs to the GPU partition as described in `## Compute` above. You are capped at one GPU node at a time, so plan experiment sweeps as a sequence of submissions rather than as a parallel fan-out. The total time budget (this agent + every GPU job it submits) must fit within the 6-hour controller window.
+- **Execution:** Run experiments by submitting slurm jobs to the GPU partition as described in `## Compute` above. Use `--qos=normal` for the single experiment you are actively iterating on (capped at 1 node), and `--qos=low` to fan out sweeps, baselines, ablations, and multi-seed runs in parallel (uncapped). The total time budget (this agent + every GPU job it submits) must fit within the 6-hour controller window.
 - **LLM API:** Optionally use the Gemini API with the `GEMINI_API_KEY` environment variable.
 - **Analysis:** Collect and analyze results. Save key plots and metrics.
 
@@ -106,4 +115,4 @@ This agent is invoked every 10 minutes. On each start:
 ## Critical Requirements
 - **Persistence:** Every action and decision MUST be recorded in `progress.md`. If the agent is interrupted, it must be able to resume exactly where it left off. All updates should be appended to progress.md.
 - **Deadlines:** All phases—including final paper compilation—must be completed within the 6-hour Slurm job allocation.
-- **Efficiency:** Within a single GPU job, parallelize across the node's 8 H100s. Across jobs, you are limited to one node at a time, so prefer fewer, larger, well-scoped jobs over many small ones.
+- **Efficiency:** Within a single GPU job, parallelize across the node's 8 H100s. Across jobs, use `--qos=low` to run sweeps, ablations, and baselines in parallel — there is no cap on low-priority jobs, so be ambitious about what you launch.

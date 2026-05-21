@@ -61,13 +61,39 @@ if [[ -z "$requested" ]]; then
 fi
 requested=$(get_max_int "${requested:-1}")
 
-# Sum running+pending nodes for this agent's tag.
-existing=$("$REAL_SQUEUE" --me -h -o '%k %D %t' 2>/dev/null \
-    | awk -v tag="$TAG" '$1==tag && ($3=="R" || $3=="PD" || $3=="CF") { sum += $2 } END { print sum+0 }')
+# Determine QoS for this submission: cmdline overrides script, otherwise unset
+# (cluster default kicks in). Submissions at --qos=low bypass the cap so the
+# agent can fan out large sweeps; everything else counts against AGENT_NODE_CAP.
+submission_qos=""
+i=0
+while [[ $i -lt ${#filtered[@]} ]]; do
+    a="${filtered[$i]}"
+    case "$a" in
+        --qos=*) submission_qos="${a#--qos=}" ;;
+        --qos)   submission_qos="${filtered[$((i+1))]:-}" ;;
+        -q)      submission_qos="${filtered[$((i+1))]:-}" ;;
+        -q*)     submission_qos="${a#-q}" ;;
+    esac
+    i=$((i+1))
+done
+if [[ -z "$submission_qos" && -n "${script:-}" ]]; then
+    q=$(grep -E '^[[:space:]]*#SBATCH[[:space:]]+(--qos(=|[[:space:]])|-q)' "$script" 2>/dev/null \
+          | tail -1 \
+          | sed -E 's/^[[:space:]]*#SBATCH[[:space:]]+(--qos[[:space:]]*=?[[:space:]]*|-q[[:space:]]*=?[[:space:]]*)//' \
+          | awk '{print $1}' || true)
+    [[ -n "$q" ]] && submission_qos="$q"
+fi
 
-if (( existing + requested > CAP )); then
-    echo "[sbatch-wrapper] Refusing: agent $AGENT_ID has $existing node(s) running/pending; this would add $requested (cap=$CAP)." >&2
-    exit 2
+if [[ "$submission_qos" != "low" ]]; then
+    # Sum running+pending non-low-priority nodes for this agent's tag.
+    # squeue format: comment nodes state qos
+    existing=$("$REAL_SQUEUE" --me -h -o '%k %D %t %q' 2>/dev/null \
+        | awk -v tag="$TAG" '$1==tag && $4!="low" && ($3=="R" || $3=="PD" || $3=="CF") { sum += $2 } END { print sum+0 }')
+
+    if (( existing + requested > CAP )); then
+        echo "[sbatch-wrapper] Refusing: agent $AGENT_ID has $existing non-low-priority node(s) running/pending; this would add $requested (cap=$CAP). For larger fan-out, submit with --qos=low (no per-agent cap)." >&2
+        exit 2
+    fi
 fi
 
 exec "$REAL_SBATCH" --comment="$TAG" "${filtered[@]}"
