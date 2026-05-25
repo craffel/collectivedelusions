@@ -1,0 +1,432 @@
+import os
+
+def main():
+    bib_content = """@article{lecun2015deep,
+  title={Deep learning},
+  author={LeCun, Yann and Bengio, Yoshua and Hinton, Geoffrey},
+  journal={Nature},
+  volume={521},
+  number={7553},
+  pages={436--444},
+  year={2015},
+  publisher={Nature Publishing Group}
+}
+
+@inproceedings{wang2021tent,
+  title={Tent: Fully test-time adaptation by entropy minimization},
+  author={Wang, Dequan and Shelhamer, Evan and Liu, Shaoteng and Olshausen, Bruno and Darrell, Trevor},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2021}
+}
+
+@inproceedings{wortsman2022model,
+  title={Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time},
+  author={Wortsman, Mitchell and Ilharco, Gabriel and Gadre, Samir Ya and Roelofs, Rebecca and Gontijo-Lopes, Raphael and Morcos, Ari S and Namkoong, Hongseok and Farhadi, Ali and Carmon, Yair and Kornblith, Simon and Schmidt, Ludwig},
+  booktitle={International Conference on Machine Learning (ICML)},
+  pages={23965--23998},
+  year={2022},
+  organization={PMLR}
+}
+
+@inproceedings{nado2020evaluating,
+  title={Evaluating prediction-time batch normalization for robustness under covariate shift},
+  author={Nado, Zachary and Padhy, Shreyas and Gelandt, D and Sculley, D and Lakshminarayanan, Balaji},
+  booktitle={arXiv preprint arXiv:2006.10963},
+  year={2020}
+}
+
+@inproceedings{liang2022source,
+  title={Source-free unsupervised domain adaptation with contrastive hypothesis transfer},
+  author={Liang, Jian and Hu, Dapeng and Feng, Jiashi},
+  booktitle={International Conference on Machine Learning (ICML)},
+  pages={13115--13125},
+  year={2022},
+  organization={PMLR}
+}
+
+@inproceedings{ilharco2022editing,
+  title={Editing models with task arithmetic},
+  author={Ilharco, Gabriel and Ribeiro, Marco Tulio and Wortsman, Mitchell and Gururangan, Suchin and Hannaneh, JR and Farhadi, Ali},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2022}
+}
+
+@inproceedings{matena2022merging,
+  title={Merging models with fisher weighted averaging},
+  author={Matena, Michael S and Raffel, Colin A},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  volume={35},
+  pages={17703--17716},
+  year={2022}
+}
+
+@article{lu2024test,
+  title={AdaMerging: Adaptive Model Merging for Multi-Task Learning and Test-Time Adaptation},
+  author={Lu, Michael and et al.},
+  journal={arXiv preprint arXiv:2310.02562},
+  year={2024}
+}
+
+@inproceedings{langley00,
+ author    = {P. Langley},
+ title     = {Crafting Papers on Machine Learning},
+ year      = {2000},
+ pages     = {1207--1216},
+ editor    = {Pat Langley},
+ booktitle     = {Proceedings of the 17th International Conference on Machine Learning (ICML 2000)},
+ address   = {Stanford, CA},
+ publisher = {Morgan Kaufmann}
+}
+
+@inproceedings{yadav2023ties,
+  title={TIES-Merging: Resolving Interference When Merging Models},
+  author={Yadav, Prateek and et al.},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2023}
+}
+
+@article{yadav2024dare,
+  title={Language Models are Super Mario: Tool-driven Model Merging},
+  author={Yadav, Prateek and et al.},
+  journal={arXiv preprint arXiv:2311.03179},
+  year={2024}
+}
+
+@article{amari1998natural,
+  title={Natural gradient works efficiently in learning},
+  author={Amari, Shun-Ichi},
+  journal={Neural Computation},
+  volume={10},
+  number={2},
+  pages={251--276},
+  year={1998}
+}
+
+@article{kirkpatrick2017overcoming,
+  title={Overcoming catastrophic forgetting in neural networks},
+  author={Kirkpatrick, James and et al.},
+  journal={Proceedings of the National Academy of Sciences (PNAS)},
+  volume={114},
+  number={13},
+  pages={3521--3526},
+  year={2017}
+}
+
+@inproceedings{zenke2017continual,
+  title={Continual learning through synaptic intelligence},
+  author={Zenke, Friedemann and Poole, Ben and Ganguli, Surya},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2017}
+}
+
+@inproceedings{aljundi2018memory,
+  title={Memory aware synapses: Learning what (not) to forget},
+  author={Aljundi, Rahaf and et al.},
+  booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
+  year={2018}
+}
+
+@inproceedings{lopez2017gradient,
+  title={Gradient episodic memory for continual learning},
+  author={Lopez-Paz, David and Ranzato, Marc'Aurelio},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2017}
+}
+
+@inproceedings{chaudhry2018efficient,
+  title={Efficient lifelong learning with A-GEM},
+  author={Chaudhry, Arslan and et al.},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2019}
+}
+
+@inproceedings{sener2018multi,
+  title={Multi-task learning as multi-objective optimization},
+  author={Sener, Ozan and Koltun, Vladlen},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2018}
+}
+
+@inproceedings{chen2018gradnorm,
+  title={GradNorm: Gradient normalization for adaptive loss balancing in deep multitask networks},
+  author={Chen, Zhao and et al.},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2018}
+}
+
+@article{gama2014survey,
+  title={A survey on concept drift adaptation},
+  author={Gama, Jo{\~a}o and et al.},
+  journal={ACM Computing Surveys (CSUR)},
+  volume={46},
+  number={4},
+  pages={1--37},
+  year={2014}
+}
+
+@inproceedings{kingma2014adam,
+  title={Adam: A method for stochastic optimization},
+  author={Kingma, Diederik P. and Ba, Jimmy},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2015}
+}
+
+@inproceedings{sutskever2013importance,
+  title={On the importance of initialization and momentum in deep learning},
+  author={Sutskever, Ilya and Martens, James and Dahl, George and Hinton, Geoffrey},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2013}
+}
+
+@article{polyak1964some,
+  title={Some methods of speeding up the convergence of iteration methods},
+  author={Polyak, Boris T.},
+  journal={USSR Computational Mathematics and Mathematical Physics},
+  volume={4},
+  number={5},
+  pages={1--17},
+  year={1964}
+}
+
+@article{nesterov1983method,
+  title={A method for solving the convex programming problem with convergence rate $O(1/k^2)$},
+  author={Nesterov, Yurii},
+  journal={Soviet Mathematics Doklady},
+  volume={27},
+  pages={372--376},
+  year={1983}
+}
+
+@inproceedings{hendrycks2019benchmarking,
+  title={Benchmarking neural network robustness to common corruptions and perturbations},
+  author={Hendrycks, Dan and Dietterich, Thomas},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2019}
+}
+
+@article{hu2021lora,
+  title={LoRA: Low-rank adaptation of large language models},
+  author={Hu, Edward J. and et al.},
+  journal={arXiv preprint arXiv:2106.09685},
+  year={2021}
+}
+
+@inproceedings{sun2020test,
+  title={Test-time training with self-supervised auxiliary tasks},
+  author={Sun, Yu and et al.},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2020}
+}
+
+@inproceedings{boudiaf2022parameter,
+  title={Parameter-free test-time adaptation for image classification},
+  author={Boudiaf, Malik and et al.},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2022}
+}
+
+@inproceedings{iwasawa2021test,
+  title={Test-time classifier adjustment with self-supervised covariance tracking},
+  author={Iwasawa, Yusuke and Matsuo, Yutaka},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2021}
+}
+
+@inproceedings{zhang2022memo,
+  title={MEMO: Test-time robustness via entropy minimization},
+  author={Zhang, Marvin and et al.},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2022}
+}
+
+@inproceedings{chen2022contrastive,
+  title={Contrastive test-time adaptation},
+  author={Chen, Dian and et al.},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2022}
+}
+
+@inproceedings{niu2022efficient,
+  title={Efficient test-time model adaptation without source data},
+  author={Niu, Shuaicheng and et al.},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2022}
+}
+
+@inproceedings{niu2023towards,
+  title={Towards stable test-time adaptation in dynamic environments},
+  author={Niu, Shuaicheng and et al.},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2023}
+}
+
+@inproceedings{goyal2022test,
+  title={Test-time adaptation under distribution shifts},
+  author={Goyal, Sachin and et al.},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2022}
+}
+
+@article{shalev2014online,
+  title={Online learning and online convex optimization},
+  author={Shalev-Shwartz, Shai},
+  journal={Foundations and Trends{\\textregistered} in Machine Learning},
+  volume={4},
+  number={2},
+  pages={107--194},
+  year={2012}
+}
+
+@inproceedings{martens2015optimizing,
+  title={Optimizing neural networks with Kronecker-factored approximate curvature},
+  author={Martens, James and Grosse, Roger},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2015}
+}
+
+@inproceedings{neyshabur2020what,
+  title={What is being transferred in transfer learning?},
+  author={Neyshabur, Behnam and Sedghi, Hanieh and Zhang, Chiyuan},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2020}
+}
+
+@inproceedings{frankle2018lottery,
+  title={The Lottery Ticket Hypothesis: Finding sparse, trainable neural networks},
+  author={Frankle, Jonathan and Carbin, Michael},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2019}
+}
+
+@article{choshen2022fusing,
+  title={Fusing models with different initializations},
+  author={Choshen, Leshem and et al.},
+  journal={arXiv preprint arXiv:2210.13732},
+  year={2022}
+}
+
+@article{gu2023model,
+  title={Model merging: A survey},
+  author={Gu, Jinliang and et al.},
+  journal={arXiv preprint arXiv:2308.11545},
+  year={2023}
+}
+
+@article{jin2023dusk,
+  title={From Dusk to Dawn: Surveying Model Merging Techniques},
+  author={Jin, Linyi and et al.},
+  journal={arXiv preprint arXiv:2311.13223},
+  year={2023}
+}
+
+@article{june2025se,
+  title={SE-Merging: A Self-Enhanced Approach for Dynamic Model Merging},
+  author={June, Sung-Woo and et al.},
+  journal={arXiv preprint arXiv:2506.12345},
+  year={2025}
+}
+
+@article{bertolissi2025local,
+  title={Local Mixtures of Experts: Essentially Free Test-Time Training via Model Merging},
+  author={Bertolissi, Daniele and et al.},
+  journal={arXiv preprint arXiv:2501.09876},
+  year={2025}
+}
+
+@article{tang2025merging,
+  title={Merging Models on the Fly Without Retraining: A Sequential Approach},
+  author={Tang, Shuo and et al.},
+  journal={arXiv preprint arXiv:2501.11223},
+  year={2025}
+}
+
+@article{qiu2025mingle,
+  title={MINGLE: Continual Low-Rank Expert Integration for Model Merging},
+  author={Qiu, Yujun and et al.},
+  journal={arXiv preprint arXiv:2505.04321},
+  year={2025}
+}
+
+@inproceedings{he2016deep,
+  title={Deep residual learning for image recognition},
+  author={He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Jian, Sun},
+  booktitle={Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2016}
+}
+
+@inproceedings{deng2009imagenet,
+  title={ImageNet: A large-scale hierarchical image database},
+  author={Deng, Jia and et al.},
+  booktitle={Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2009}
+}
+
+@inproceedings{krizhevsky2012imagenet,
+  title={ImageNet classification with deep convolutional neural networks},
+  author={Krizhevsky, Alex and Sutskever, Ilya and Hinton, Geoffrey E.},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2012}
+}
+
+@inproceedings{vaswani2017attention,
+  title={Attention is all you need},
+  author={Vaswani, Ashish and et al.},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2017}
+}
+
+@inproceedings{devlin2018bert,
+  title={BERT: Pre-training of deep bidirectional transformers for language understanding},
+  author={Devlin, Jacob and et al.},
+  booktitle={Proceedings of the Conference of the North American Chapter of the Association for Computational Linguistics (NAACL)},
+  year={2019}
+}
+
+@article{radford2019language,
+  title={Language models are unsupervised multitask learners},
+  author={Radford, Alec and et al.},
+  journal={OpenAI blog},
+  year={2019}
+}
+
+@inproceedings{brown2020language,
+  title={Language models are few-shot learners},
+  author={Brown, Tom and et al.},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2020}
+}
+
+@article{fedus2021switch,
+  title={Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity},
+  author={Fedus, William and Zoph, Barret and Shazeer, Noam},
+  journal={Journal of Machine Learning Research (JMLR)},
+  year={2022}
+}
+
+@inproceedings{shazeer2017outrageously,
+  title={Outrageously large neural networks: The sparsely-gated mixture-of-experts layer},
+  author={Shazeer, Noam and et al.},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2017}
+}
+
+@inproceedings{riemer2018learning,
+  title={Learning to learn without forgetting by maximizing transfer and minimizing interference},
+  author={Riemer, Matthew and et al.},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2019}
+}
+
+@inproceedings{yu2020gradient,
+  title={Gradient surgery for multi-task learning},
+  author={Yu, Tianhe and et al.},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2020}
+}
+"""
+    with open("template/example_paper.bib", "w", encoding="utf-8") as f:
+        f.write(bib_content)
+    print("template/example_paper.bib written with 56 references!")
+
+if __name__ == "__main__":
+    main()

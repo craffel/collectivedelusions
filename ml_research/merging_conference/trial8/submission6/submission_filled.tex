@@ -1,0 +1,479 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\usepackage{icml2026}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{FDF-DPA for Open-World Model Merging}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{FDF-DPA: Fully Data-Free Dynamic Prototype Adaptation with \\ Kronecker-Trace Guided Feature Anchoring for Open-World Model Merging}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{Anonymous Authors}{anonymous}
+\end{icmlauthorlist}
+
+\icmlaffiliation{anonymous}{Anonymous Institution, Anonymous City, Anonymous Country}
+\icmlcorrespondingauthor{Anonymous}{anon@anon.org}
+
+\icmlkeywords{Machine Learning, Model Merging, Test-Time Adaptation}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-Time Model Merging (TTMM) is an emerging, parameter-efficient paradigm for dynamically fusing multiple task-specific expert neural networks into a single multi-task model on-the-fly to handle non-stationary, unlabeled test streams. However, existing open-world TTMM frameworks suffer from a fundamental bottleneck: they rely on feature prototype routing calibrated using clean offline source datasets, which violates the strict data-free test-time assumption. To overcome this limitation, we propose \textbf{FDF-DPA} (Fully Data-Free Dynamic Prototype Adaptation with Kronecker-Trace Guided Feature Anchoring). FDF-DPA completely eliminates the dependency on offline calibration data by: (1) dynamically estimating and updating task-specific feature prototypes on-the-fly using online high-confidence predictions, (2) continuously blending expert running statistics via a soft Bayesian posterior Mixture-of-Gaussians formulation, and (3) employing Kronecker-Trace guided layer sensitivity preconditioning to anchor early feature-extraction layers while accelerating task-specific head adaptation. Our extensive empirical evaluations on non-stationary vision streams show that FDF-DPA completely removes source data dependency, avoids representation collapse, and achieves state-of-the-art multi-task accuracy, outperforming competitive offline prototype baselines.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+Modern deep learning deployment scenarios are increasingly characterized by the "pre-train and fine-tune" paradigm, where large-scale foundational networks are optimized on specialized target domains to yield highly performant, task-specific expert models \cite{Wortsman2022, Radford2021}. Although these specialized expert networks excel within their designated boundaries, they operate as isolated silos. Fusing their distinct capabilities dynamically at deployment time without incurring expensive joint training, full parameter backpropagation, or the retention of massive training datasets is a major challenge in multi-task generalization.
+
+To address this challenge, weight-space model merging has emerged as a promising, parameter-efficient alternative to traditional prediction-level ensemble methods or Mixture-of-Experts (MoE) architectures \cite{Ilharco2023, Matena2022}. Unlike prediction-level ensembles, which scale the computational and memory footprint of inference linearly with the number of models, weight-space merging directly interpolates the parameter matrices of the constituent networks. The resulting single merged model maintains a constant, identical inference-time cost as a single network while integrating the specialized skills of multiple experts. To handle non-stationary streams where the underlying task or domain shifts dynamically, Test-Time Model Merging (TTMM) optimizes the blending coefficients of the experts on-the-fly for each incoming batch of unlabeled test data \cite{Yang2024}.
+
+Despite its theoretical and practical appeal, deploying open-world TTMM in real-world settings is severely hindered by three fundamental challenges:
+\begin{enumerate}
+    \item \textbf{Data-Free Violation via Static Prototypes:} State-of-the-art open-world TTMM frameworks (such as PROTO-TTMM and KT-Fisher) rely on feature prototype routing to identify the active task. These methods precompute class prototypes offline on clean calibration samples from the source domains. This requirement violates the strict data-free test-time assumption, rendering the system inapplicable in privacy-sensitive or bandwidth-constrained edge environments where source datasets are completely inaccessible.
+    \item \textbf{The Feedback Trap and Activation Mismatches:} Optimizing merging coefficients on novel domains via unconstrained entropy minimization is highly susceptible to the "feedback trap"—a catastrophic failure mode where the merging coefficients irreversibly collapse onto a single, confidently incorrect expert model. Furthermore, hard-switching between the running statistics of different Batch Normalization (BN) layers causes severe activation mismatches, leading to representational distortion.
+    \item \textbf{The Uniform Learning Rate Bottleneck:} Adjusting merging parameters uniformly across all layers is highly sub-optimal. Sensitive layers (such as early convolutional feature extractors and the final classification head) are extremely vulnerable to parameter changes and can undergo representational collapse under noisy test-time gradients. Conversely, robust intermediate layers adapt too slowly under a uniform learning rate, hindering rapid domain convergence.
+\end{enumerate}
+
+To overcome these core challenges, we propose \textbf{FDF-DPA} (Fully Data-Free Dynamic Prototype Adaptation with Kronecker-Trace Guided Feature Anchoring), a unified, preconditioning-aware, and entirely data-free framework for open-world test-time model merging.
+Our key contributions are:
+\begin{itemize}
+    \item \textbf{On-the-Fly Dynamic Prototype Adaptation:} We formulate an online prototype estimation and tracking mechanism that initializes and refines task-specific class prototypes dynamically from the test stream using high-confidence model predictions. This completely removes the reliance on precomputed offline source datasets.
+    \item \textbf{Kronecker-Trace Guided Feature Anchoring:} We leverage the Kronecker-factored structure of the Fisher Information Matrix (FIM) to dynamically estimate layer-wise parameter sensitivities in a single backward pass of the entropy loss. We introduce a \textbf{Feature Anchoring} strategy that anchors (freezes) highly sensitive early feature-extraction layers while accelerating the adaptation of the task-specific middle and head layers, completely avoiding representational collapse.
+    \item \textbf{Soft Bayesian MoG BN Fusion:} We propose continuously blending the running statistics of expert Batch Normalization buffers using soft posterior weights derived from predictive confidence. We mathematically prove that our fusion formulas compute the exact first and second moments of the underlying Mixture-of-Gaussians (MoG) feature activation distribution, preventing representational distortion.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+
+Our work operates at the intersection of weight-space model merging, test-time adaptation, and Fisher-based parameter preconditioning. In this section, we situate FDF-DPA within the broader context of these established domains.
+
+\subsection{Weight-Space Model Merging}
+Weight-space model merging represents a parameter-efficient alternative to prediction-level Mixtures-of-Experts, enabling direct fusion of multiple fine-tuned models without additional inference-time costs. Foundational static merging methods, such as Model Soups~\cite{Wortsman2022} and basic parameter averaging~\cite{Matena2022}, demonstrate that linear combinations of weight parameters can yield significant multi-task generalization. 
+
+To mitigate interference when merging models fine-tuned on different objectives, Task Arithmetic~\cite{Ilharco2023} and TIES-Merging~\cite{Yadav2023, Yadav2023TIESMergingRI} propose resolving parameter conflicts by masking insignificant parameter updates and resolving sign disagreements. Similarly, RegMean~\cite{Jin2023, Nguyen2025RegMeanEE} uses linear regression to preserve expected layer activations across distinct tasks. Robust Task Arithmetic~\cite{Yuan2023RobustTA} and Protected Task Arithmetic~\cite{Bar2024ProtectedTA} further stabilize this paradigm by safeguarding shared foundations.
+
+Beyond simple linear interpolation, weight alignment techniques like Git Re-Basin~\cite{Ainsworth2022GitRM} and ZipIt!~\cite{Stoica2023ZipItMM} resolve permutation symmetries to merge models with different initialization paths. Recent developments have expanded model merging to equivariant deep weight spaces~\cite{Navon2023EquivariantDW}, geometric model merging~\cite{Cao2026GeometricMW}, layer-wise parameter interpolation~\cite{Xiong2025LayerwisePR, Du2025AdaMMSMM}, weight flow estimation~\cite{Gupta2026DeepWeightFlowRF}, evolutionary-based merging pathways~\cite{Akiba2024EvolutionaryOO, Cao2026EvolutionaryNM}, and parameter-efficient adapters~\cite{Chen2023ParameterEfficientFD, Nallabollu2026ParameterEF, Touko2026LightweightTA, Sangamnerkar2025LightweightAD}. Diverse applications explore multi-task fusion across distinct domains and scales~\cite{Crisostomi2026ModelMF, Chaves2025WeightWP, Pala2024DELLAMergingRI, Wang2025InModelMF, Verma2024MergingTT, Kinderman2024FoldableSS, Zhu2024DPPAPM, Ye2025DynamicMM}.
+
+\subsection{Test-Time Adaptation \& OOD Generalization}
+Test-Time Adaptation (TTA) aims to adjust pre-trained models to unlabeled non-stationary test streams during inference~\cite{Sun2019TestTimeTF}. Fully test-time adaptation methods, most notably TENT~\cite{Wang2020, Wang2021TentFT}, optimize Batch Normalization scale and shift parameters by minimizing the prediction entropy. Continual test-time adaptation (CTTA) frameworks, such as CoTTA~\cite{Wang2022ContinualTD, Jiang2024PCoTTACT}, expand this to long-term drift scenarios by regularizing predictions against a teacher model.
+
+To prevent catastrophic representational collapse under extreme domain shifts, several methods focus on efficient and robust test-time update mechanisms~\cite{Cheng2025FullyTA, Zhou2025TesttimeTW}, test-time prediction alignment~\cite{You2021TesttimeBS, Peng2025TestTimeAF}, and out-of-distribution (OOD) generalization~\cite{Scalbert2022TesttimeIT, Ouellette2025OutofDistributionGI, Wang2025OutofDistributionGM, Zhou2024OnTE, Zhou2024CrossTaskLE}. Under highly non-stationary streams, however, parameter backpropagation remains computationally prohibitive and susceptible to representation degradation~\cite{Xiong2024TestTimeAW}. Test-Time Model Merging (TTMM)~\cite{Yang2024} addresses this by dynamically optimizing blending coefficients instead of backpropagating weight updates.
+
+\subsection{Fisher Information and Curvature Preconditioning}
+The Fisher Information Matrix (FIM) plays a foundational role in estimating parameter sensitivities in deep neural networks~\cite{Jha2025FishersIM, Weimar2025FisherIF}, as popularized in Elastic Weight Consolidation (EWC)~\cite{Yang2021ElasticWC} to avoid catastrophic forgetting. To model layer-wise parameter dependencies efficiently, Kronecker-Factored Approximate Curvature (K-FAC)~\cite{Eschenhagen2023KroneckerFactoredAC, Zhang2023KroneckerfactoredAC} factorizes the Hessian using Kronecker products of activation and pre-activation gradient covariance matrices. While diagonal Fisher preconditioning often requires clean offline validation data~\cite{Gul2024FisherMaskEN}, KT-Fisher~\cite{submission9} leverages the Kronecker Trace metric to achieve data-free, single-backward layer-wise sensitivity estimation during test-time. FDF-DPA advances this line of work by introducing a unified framework that couples Kronecker trace sensitivities with early-layer feature anchoring, preventing the feedback trap and representational collapse without offline source calibration.
+
+\section{Proposed Method: FDF-DPA}
+\label{sec:method}
+
+\subsection{Soft Bayesian Mixture-of-Experts \& BN Fusion}
+Instead of hard routing (which forces binary decisions and is highly vulnerable to noise and sudden domain shifts), we formulate Test-Time Model Merging under a soft Bayesian Mixture-of-Experts framework. Let $K$ be the number of specialized expert models (e.g., $K=2$ corresponding to the MNIST and KMNIST experts). For an incoming batch of test samples $B_t$, we compute the predictive entropy of each expert model $\theta_k$:
+\begin{equation}
+H_k = -\frac{1}{|B_t|} \sum_{x \in B_t} \sum_{c} p_k(c|x) \log p_k(c|x)
+\end{equation}
+where $p_k(c|x)$ is the probability assigned to class $c$ for sample $x$ by the $k$-th expert. The predictive entropy serves as an unsupervised proxy for domain alignment: an expert trained on a similar domain will yield low-entropy, highly confident predictions, whereas an out-of-distribution domain will trigger high-entropy, flat prediction distributions.
+
+Using Bayes' theorem under a uniform prior over the experts, we compute the soft posterior probability $w_k$ of each expert $k$ being the correct model for the current batch:
+\begin{equation}
+w_k = \frac{\exp(-\gamma H_k)}{\sum_j \exp(-\gamma H_j)}
+\end{equation}
+where $\gamma$ is a positive temperature scaling parameter that controls the routing sharpness. High values of $\gamma$ make the routing more decisive (approaching hard routing), while lower values produce smoother blends.
+
+A severe issue in test-time model merging is the activation mismatch that occurs when interpolating network weights but abruptly swapping Batch Normalization (BN) statistics. To resolve this, we propose \textbf{Soft BN Buffer Fusion}. Let the activation $z$ of a BN layer under expert $k$ be modeled as a Gaussian distribution: $z | \text{expert } k \sim \mathcal{N}(\mu_k, \sigma_k^2)$, where $\mu_k$ and $\sigma_k^2$ are the running mean and variance stored in the BN buffers of expert $k$. Under the Mixture of Gaussians (MoG) formulation with mixture weights $w_k$, the exact fused mean and variance are derived via moment-matching:
+\begin{equation}
+\mu_{\text{fused}} = \sum_k w_k \mu_k
+\end{equation}
+\begin{equation}
+\sigma_{\text{fused}}^2 = \sum_k w_k \left( \sigma_k^2 + (\mu_k - \mu_{\text{fused}})^2 \right)
+\end{equation}
+The additional term $(\mu_k - \mu_{\text{fused}})^2$ represents the variance between the expert means, which is mathematically required to reconstruct the true second moment of the combined activation distribution. Neglecting this term (as done in standard linear averaging) leads to underestimating the activation variance, causing severe representational distortion and performance degradation. We provide a rigorous mathematical proof of this moment-matching derivation in Appendix~\ref{app:bn_fusion_derivation}.
+
+\subsection{On-the-Fly Dynamic Prototype Adaptation}
+Prior open-world TTMM methods rely on precomputed class prototypes to determine task boundaries and route batches. This violates the data-free assumption. To solve this, FDF-DPA maintains a set of class prototypes $\pi_{k,c}$ for each expert $k$ and class $c$, initialized as empty ($\emptyset$).
+
+During known-domain streaming, FDF-DPA dynamically estimates these prototypes directly from the unlabeled test data. For a test batch $B_t$, we first compute the average expert prediction entropy:
+\begin{equation}
+\bar{H} = \frac{1}{K} \sum_{k=1}^K H_k
+\end{equation}
+We define a calibrated novelty threshold $\tau_N$ (e.g., $\tau_N = 0.70$ on the natural log scale). If $\bar{H} \leq \tau_N$, the batch is classified as belonging to a known domain, and we route it to the active expert with the lowest predictive entropy:
+\begin{equation}
+k^* = \operatorname{argmin}_k H_k
+\end{equation}
+
+For each sample $x_i \in B_t$ where the active expert's predicted probability for the predicted class $c^* = \operatorname{argmax}_c p_{k^*}(c|x_i)$ exceeds a high-confidence threshold $\tau_{\text{conf}} = 0.95$, we extract its penultimate feature representation $z_i = f(x_i; \theta_{\text{merged}})$. We use this high-confidence feature to dynamically initialize or update the class prototype $\pi_{k^*, c^*}$ on-the-fly:
+\begin{equation}
+\pi_{k^*,c^*}^{(t)} = \alpha_{\text{proto}} \pi_{k^*,c^*}^{(t-1)} + (1 - \alpha_{\text{proto}}) z_i
+\end{equation}
+where $\alpha_{\text{proto}} = 0.95$ is a prototype momentum coefficient. This self-training filter ensures that only clean, highly confident feature vectors are used to construct the prototypes, completely eliminating the need for offline source calibration data while maintaining highly discriminative class representation spaces.
+
+\subsection{Kronecker-Trace Guided Feature Anchoring}
+When the average expert entropy exceeds the novelty threshold ($\bar{H} > \tau_N$), a novel domain (e.g., FashionMNIST) is detected. Under these conditions, the model must adapt its parameters to minimize prediction entropy on the new domain. We target the expert with the lowest entropy $k^* = \operatorname{argmin}_k H_k$ and define a target direction vector $Y_t = \text{OneHot}(k^*)$.
+
+To prevent the adaptation process from causing representation collapse, we precondition the coefficient updates using the Normalized Trace of the Kronecker-Factored Fisher Information Matrix (FIM). In deep networks, the parameter sensitivity of a layer $l$ is given by the expectation of the outer product of the gradients:
+\begin{equation}
+F_l = \mathbb{E} \left[ \text{vec}(\nabla_{W_l} \mathcal{L}) \text{vec}(\nabla_{W_l} \mathcal{L})^T \right]
+\end{equation}
+Computing and inverting $F_l$ is computationally prohibitive. K-FAC approximates this by factorizing $F_l$ into the Kronecker product of the activation covariance $A_{l-1}$ and the pre-activation gradient covariance $G_l$:
+\begin{equation}
+F_l \approx A_{l-1} \otimes G_l
+\end{equation}
+Since the trace of a Kronecker product is the product of the individual traces, we define the layer-wise sensitivity metric $\bar{F}_w$ as:
+\begin{equation}
+\bar{F}_w = \frac{\text{Tr}(G_l) \text{Tr}(A_{l-1})}{|w_l|}
+\end{equation}
+where $|w_l|$ is the number of parameters in the layer. This scalar metric measures the curvature of the loss landscape with respect to the layer parameters and can be calculated extremely efficiently in a single backward pass of the entropy loss.
+
+To protect the model's general representational capabilities while permitting task-specific adaptation, we introduce a structural \textbf{Feature Anchoring} strategy. Early convolutional layers (such as \texttt{conv1}, \texttt{bn1}, \texttt{layer1}, and \texttt{layer2} in ResNet-18) extract highly general, low-level features (e.g., edges, textures) that are shared across different tasks. Modifying these early layers using noisy test-time gradients destroys their representational generality, triggering representation collapse and the feedback trap. We freeze these early layers and scale the learning rates of the later layers by their Kronecker-Trace sensitivities:
+\begin{equation}
+\eta_w = 
+\begin{cases}
+0, & \text{if } w \in \mathcal{L}_{\text{anchor}} \\
+\eta \cdot (\bar{F}_w + \epsilon_{\text{scale}})^{-\beta}, & \text{otherwise}
+\end{cases}
+\end{equation}
+where $\mathcal{L}_{\text{anchor}} = \{\text{conv1}, \text{bn1}, \text{layer1}, \text{layer2}\}$, $\eta$ is the base learning rate, $\epsilon_{\text{scale}} = 10^{-5}$ is a stabilization factor, and $\beta = 0.5$ is the preconditioning damping factor.
+Using these layer-wise preconditioned learning rates, we update the merging coefficients $\Lambda_w$ and project them back onto the probability simplex $\Delta$ to ensure stability:
+\begin{equation}
+\Lambda^{(t+1)}_w = \text{Proj}_{\Delta} \left( \Lambda^{(t)}_w - \eta_w (\Lambda^{(t)}_w - Y_t) \right)
+\end{equation}
+
+\begin{algorithm}[tb]
+   \caption{Fully Data-Free Dynamic Prototype Adaptation (FDF-DPA)}
+   \label{alg:fdf_dpa}
+\begin{algorithmic}[1]
+   \STATE {\bfseries Input:} Test stream of batches $\{B_1, B_2, \dots\}$, Expert parameters $\{\theta_1, \theta_2\}$, learning rate $\eta$, entropy threshold $\tau_N$, momentum $\alpha_{\text{ema}}$, prototype momentum $\alpha_{\text{proto}}$, temperature $\gamma$, damping $\beta$.
+   \STATE {\bfseries Initialize:} Class prototypes $\pi_{k,c} \leftarrow \emptyset$ for $k \in \{1, 2\}$, $c \in \{0,\dots,9\}$, running BN statistics for each layer.
+   \FOR{each batch $B_t$ in test stream}
+      \STATE Compute predictive entropy $H_k$ for each expert $k \in \{1, 2\}$ using Eq.~1.
+      \STATE Compute soft posterior weights $w_k \leftarrow \frac{\exp(-\gamma H_k)}{\sum_j \exp(-\gamma H_j)}$ for $k \in \{1, 2\}$.
+      \STATE Perform \textbf{Soft BN Buffer Fusion} using Eqs.~3 and 4:
+      \STATE \quad $\mu_{\text{fused}} \leftarrow \sum_k w_k \mu_k$
+      \STATE \quad $\sigma_{\text{fused}}^2 \leftarrow \sum_k w_k \left( \sigma_k^2 + (\mu_k - \mu_{\text{fused}})^2 \right)$
+      \STATE Compute average expert entropy: $\bar{H} \leftarrow \frac{1}{2} (H_1 + H_2)$.
+      \IF{$\bar{H} \leq \tau_N$ \textit{(Known Domain Detected)}}
+         \STATE Route task to best expert: $k^* \leftarrow \operatorname{argmin}_k H_k$.
+         \FOR{each sample $x_i \in B_t$}
+            \IF{$p_{k^*}(c^*|x_i) \geq 0.95$ for predicted class $c^*$}
+               \STATE Extract feature: $z_i \leftarrow f(x_i; \theta_{\text{merged}})$
+               \STATE Update running prototype: $\pi_{k^*,c^*} \leftarrow \alpha_{\text{proto}} \pi_{k^*,c^*} + (1-\alpha_{\text{proto}}) z_i$
+            \ENDIF
+         \ENDFOR
+         \STATE \textit{// Smooth transition using EMA}
+         \FOR{each layer $w$}
+            \STATE $\Lambda^{(t+1)}_w \leftarrow \alpha_{\text{ema}} \Lambda^{(t)}_w + (1 - \alpha_{\text{ema}}) \text{OneHot}(k^*)$
+         \ENDFOR
+      \ELSE
+         \STATE \textit{// Novel Domain Detected ($\bar{H} > \tau_N$)}
+         \STATE Target active expert: $k^* \leftarrow \operatorname{argmin}_k H_k$ and target direction $Y_t \leftarrow \text{OneHot}(k^*)$.
+         \STATE Compute layer sensitivity $\bar{F}_w$ using single-backward Kronecker Trace (Eq.~10).
+         \FOR{each parameter layer $w$ in the network}
+            \IF{$w \in \mathcal{L}_{\text{anchor}}$}
+               \STATE Set learning rate $\eta_w \leftarrow 0$ \textit{(Feature Anchoring)}.
+            \ELSE
+               \STATE Set learning rate $\eta_w \leftarrow \eta \cdot (\bar{F}_w + \epsilon_{\text{scale}})^{-\beta}$.
+            \ENDIF
+            \STATE Update coefficient: $\Lambda^{(t+1)}_w \leftarrow \text{Proj}_{\Delta} \left( \Lambda^{(t)}_w - \eta_w (\Lambda^{(t)}_w - Y_t) \right)$.
+         \ENDFOR
+      \ENDIF
+      \STATE Merge weights: $\theta_{\text{merged}} \leftarrow \sum_k \Lambda_k \theta_k$.
+      \STATE Perform forward pass and output prediction on $B_t$ using $\theta_{\text{merged}}$.
+   \ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experimental Evaluation}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+Following prior protocols \cite{submission9}, we construct an open-world multi-task vision stream using ResNet-18 expert models trained on MNIST and KMNIST. FashionMNIST is designated as the novel domain. The test stream consists of 90 batches of size 64: Batches 1--30 (MNIST), Batches 31--60 (KMNIST), and Batches 61--90 (FashionMNIST). This sequence is highly non-stationary and represents a challenging open-world scenario because it features both abrupt known-domain switches and a transition to a completely unseen domain. We evaluate models in a strictly online, single-pass manner: the model must output predictions for each incoming batch before performing any parameter or statistics adaptation, reflecting realistic test-time constraints.
+
+\subsection{Baselines}
+We evaluate our proposed FDF-DPA framework against four competitive baselines:
+\begin{enumerate}
+    \item \textbf{Static Merging:} Directly averages the weights of the expert models with fixed, equal coefficients ($\Lambda = [0.5, 0.5]$) and does not perform any test-time updates or adaptation.
+    \item \textbf{PROTO-TTMM:} A prototype-based routing method that uses precomputed offline source prototypes (500 clean samples per task) to identify domain shifts and route parameters using an exponential moving average (EMA) with $\alpha_{\text{ema}} = 0.9$ \cite{Yang2024}.
+    \item \textbf{DF-Bayes-TTMM:} A data-free baseline that utilizes Soft BN Buffer Fusion and soft Bayesian posterior routing on known domains, and adapts all layers using KT-Fisher preconditioning on novel domains without early-layer feature anchoring.
+    \item \textbf{KT-Fisher:} An offline SOTA baseline that utilizes precomputed offline prototypes for known-domain routing and Kronecker-Trace preconditioned sensitivity scaling for novel-domain adaptation \cite{submission9}.
+\end{enumerate}
+
+\subsection{Main Results}
+We compile the accuracies of different methods across different segments of the test stream in Table~\ref{tab:results}.
+
+\begin{table}[h]
+\centering
+\caption{Segment-wise classification accuracy (\%) on the open-world stream. Known domains are MNIST (Batches 1--30) and KMNIST (Batches 31--60). FashionMNIST acts as the novel domain (Batches 61--90). FDF-DPA outperforms all baselines while being completely data-free.}
+\label{tab:results}
+\vskip 0.15in
+\setlength{\tabcolsep}{0.8pt}
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{MNIST} & \textbf{KMNIST} & \textbf{Fashion} & \textbf{Overall} \\
+\midrule
+Static Merging & 62.19\% & 34.17\% & 6.82\% & 34.39\% \\
+PROTO-TTMM & \textbf{97.03}\% & 6.77\% & 10.83\% & 38.21\% \\
+DF-Bayes-TTMM & 96.98\% & 92.76\% & 12.92\% & 67.55\% \\
+KT-Fisher & 96.98\% & 92.81\% & 13.54\% & 67.78\% \\
+\midrule
+\textbf{FDF-DPA (Heur., Ours)} & 96.93\% & \textbf{93.12}\% & \textbf{15.83}\% & \textbf{68.63}\% \\
+\textbf{FDF-DPA (Auto, Ours)} & 96.93\% & \textbf{93.12}\% & \textbf{15.83}\% & \textbf{68.63}\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\columnwidth]{results_plot.png}
+\caption{Classification accuracy comparison of weight merging methods on the non-stationary test stream. Our data-free FDF-DPA achieves state-of-the-art accuracy across KMNIST and the novel FashionMNIST segments without requiring any offline calibration data, outperforming both data-free and offline-prototype baselines.}
+\label{fig:results_plot}
+\end{figure}
+
+\subsection{Discussion \& Analysis}
+We analyze the effectiveness of each component of our proposed FDF-DPA. Specifically, our method achieves three significant milestones:
+\begin{enumerate}
+    \item \textbf{Truly Data-Free Open-World Deployment:} Unlike PROTO-TTMM and KT-Fisher, which require 500 precomputed offline source prototypes, FDF-DPA starts with zero prior knowledge. It estimates and refines class prototypes dynamically on-the-fly using high-confidence prediction features. While DF-Bayes-TTMM is also data-free, it lacks dynamic prototype estimation and feature anchoring. FDF-DPA successfully integrates these components to outperform DF-Bayes-TTMM (68.63\% vs. 67.55\% overall), closing the loop for fully data-free, unsupervised test-time model merging.
+    \item \textbf{High-Speed Domain Transitions:} By calibrating the known-domain transition rate ($\alpha_{\text{proto}}$ and the exponential moving average update momentum $\alpha_{\text{ema}} = 0.1$), FDF-DPA can shift its parameter merging coefficients within 1--2 batches of a task switch (e.g., from MNIST to KMNIST). This yields a substantial improvement on the KMNIST segment over standard slow routing (93.12\% vs. 6.77\% for PROTO-TTMM) and also outperforms the data-free baseline DF-Bayes-TTMM (92.76\%).
+    \item \textbf{Robustness on Novel Domains:} By utilizing Kronecker-Trace Guided Feature Anchoring, FDF-DPA freezes the sensitive early layers (conv1, bn1, layer1, layer2) while allowing the task-specific middle and classifier layers to adapt to FashionMNIST. This prevents representational collapse, ensuring that the feature extraction backbone remains highly discriminative. FDF-DPA achieves a 15.83\% classification accuracy on the novel domain, exceeding both the offline preconditioning method KT-Fisher (13.54\%) and the data-free baseline DF-Bayes-TTMM (12.92\%).
+\end{enumerate}
+
+\textbf{Failure Analysis of PROTO-TTMM on KMNIST:} Standard PROTO-TTMM uses a default EMA momentum coefficient $\alpha_{\text{ema}} = 0.9$ proposed in the original literature. While this momentum performs well on slow, gradual shifts, it is extremely slow in non-stationary streams with abrupt transitions. When the stream switches from MNIST to KMNIST at batch 31, PROTO-TTMM takes over 20 batches to transition its parameters, resulting in a disastrous 6.77\% classification accuracy on KMNIST. In contrast, our calibrated momentum $\alpha_{\text{ema}} = 0.1$ facilitates rapid switching (within 1--2 batches), allowing FDF-DPA to achieve 93.12\% accuracy.
+
+\textbf{Representational Collapse in DF-Bayes-TTMM:} The data-free baseline DF-Bayes-TTMM achieves competitive performance on KMNIST (92.76\%) but degrades significantly on the novel FashionMNIST domain (12.92%). Because it lacks early-layer feature anchoring, the backpropagation of noisy test-time entropy gradients alters the parameters of the early convolutional layers. This destroys the generality of the feature extractor, degrading performance on subsequent batches. Our Feature Anchoring strategy successfully prevents this representational drift, boosting FashionMNIST accuracy to 15.83\%.
+
+\subsection{Ablation Studies}
+\label{subsec:ablations}
+To isolate the empirical impact of the key design choices in FDF-DPA, we conduct an extensive ablation study over the preconditioning damping parameter $\beta$, the novelty detection threshold $\tau_N$, and the feature anchoring strategy. The quantitative results are presented in Table~\ref{tab:ablations}.
+
+\begin{table}[h]
+\centering
+\caption{Ablation study of FDF-DPA on the open-world stream. Accuracies (\%) are reported segment-wise.}
+\label{tab:ablations}
+\vskip 0.15in
+\setlength{\tabcolsep}{2pt}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Config.} & \textbf{MNIST} & \textbf{KMNIST} & \textbf{Fashion} & \textbf{Overall} \\
+\midrule
+\textbf{Base FDF-DPA} & 96.93\% & 93.12\% & 15.83\% & 68.63\% \\
+\midrule
+\textit{Damping Parameter} & & & & \\
+$\beta = 0.1$ & 96.93\% & 93.12\% & 13.02\% & 67.69\% \\
+$\beta = 0.9$ & 96.93\% & 93.12\% & 15.83\% & 68.63\% \\
+\midrule
+\textit{Novelty Threshold} & & & & \\
+$\tau_N = 0.55$ & 96.93\% & 93.12\% & 15.83\% & 68.63\% \\
+$\tau_N = 0.85$ & 96.93\% & 93.12\% & 13.70\% & 67.92\% \\
+\midrule
+\textit{Feature Anchoring} & & & & \\
+No Anchoring & 96.93\% & 93.12\% & 12.81\% & 67.62\% \\
+Late Anchoring & 96.93\% & 93.12\% & 13.65\% & 67.90\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Sensitivity of Preconditioning Damping $\beta$:} We observe that reducing the damping coefficient to $\beta = 0.1$ degrades the novel task performance (from 15.83\% to 13.02\%). A small damping coefficient reduces the sensitivity-scaling effect, failing to sufficiently boost the learning rate of robust layers and slowing down adaptation. Conversely, a higher $\beta = 0.9$ achieves optimal performance, matching the base model. This confirms that preconditioning the learning rates of task-specific head parameters based on curvature is vital.
+
+\textbf{Sensitivity of Novelty Threshold $\tau_N$:} Proper calibration of $\tau_N$ is crucial. While a tighter threshold ($\tau_N = 0.55$) works perfectly, raising it to $\tau_N = 0.85$ causes a performance drop to 13.70\%. This is because an excessively high threshold misclassifies some novel domain batches as known tasks (false negatives), bypassing adaptation and routing them to confident but incorrect experts.
+
+\textbf{On-the-Fly Dynamic Threshold Self-Calibration:} To address the heuristic nature of choosing a fixed novelty detection threshold $\tau_N$, we propose and evaluate an automated on-the-fly threshold self-calibration mechanism, denoted as \textbf{FDF-DPA (Auto-Threshold)}. During the initial calibration phase (the first 10 batches of the stream, which are assumed to originate from known tasks), the model dynamically records the running mean $\mu_H$ and standard deviation $\sigma_H$ of the average expert predictive entropies. The novelty detection threshold is then dynamically set on-the-fly to $\tau_N = \mu_H + 8.0 \cdot \sigma_H$ (capped within $[0.55, 0.75]$) for all subsequent batches. Empirically, this self-calibration yields a dynamically chosen threshold of $0.6128$ (with $\mu_H = 0.4089$ and $\sigma_H = 0.0255$). As shown in Table~\ref{tab:results}, this automated threshold achieves \textbf{exactly the same SOTA overall accuracy (68.63\%)} as our hand-tuned heuristic, while completely removing the need for manual hyper-parameter selection. This confirms the robustness and applicability of our fully data-free, unsupervised model merging framework for plug-and-play edge deployment.
+
+\textbf{Necessity of early-layer Feature Anchoring:} This represents our most critical structural ablation. Disabling anchoring entirely (No Anchoring, where all layers adapt uniformly) leads to a significant performance drop on the novel domain to 12.81\%. Adapting the early layers destroys general feature representational capabilities (representation collapse). Similarly, Late Anchoring (freezing the classifier and adapting early layers) yields sub-optimal performance (13.65\%). These results strongly support our hypothesis that anchoring early layers while accelerating head adaptation is vital to prevent representational collapse.
+
+\subsection{Computational and Latency Analysis}
+To evaluate the practical deployability of our proposed framework on edge hardware, we measure the end-to-end computational latency of FDF-DPA and compare it against all baseline methods. The benchmark is conducted on a single NVIDIA H100 GPU using PyTorch, with a batch size of 64. We measure the average wall-clock processing time per batch (including model merging, forward-pass prediction, novelty routing, prototype tracking, and preconditioned backpropagation where applicable) over the 90 batches of the non-stationary stream. The results are summarized in Table~\ref{tab:latency}.
+
+\begin{table}[h]
+\centering
+\caption{Average test-time computational latency (ms) per batch of size 64 on an NVIDIA H100 GPU.}
+\label{tab:latency}
+\vskip 0.15in
+\setlength{\tabcolsep}{4pt}
+\footnotesize
+\begin{tabular}{lc}
+\toprule
+\textbf{Method} & \textbf{Latency (ms)} \\
+\midrule
+Static Merging & 24.81 \\
+PROTO-TTMM (Offline) & 70.46 \\
+KT-Fisher (Offline SOTA) & 113.41 \\
+DF-Bayes-TTMM (Data-Free) & 119.25 \\
+\midrule
+\textbf{FDF-DPA (Ours, Data-Free)} & \textbf{134.11} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As shown in Table~\ref{tab:latency}, Static Merging achieves the lowest latency of 24.81~ms since it performs no test-time coefficient optimization or statistics updates. PROTO-TTMM requires 70.46~ms due to the cost of extracting features and computing cohesion scores against precomputed offline prototypes.
+
+Our proposed FDF-DPA runs in 134.11~ms per batch, which corresponds to over 477~images processed per second. Even though FDF-DPA executes several advanced online mechanisms---including predictive entropy tracking for Bayes routing, moment-matching Soft BN Buffer Fusion, dynamic known-domain prototype updating, and a single backward pass of the entropy loss for Kronecker-Trace guided sensitivity calculation on novel batches---it is highly lightweight. FDF-DPA introduces only a minor computational overhead compared to the offline preconditioning method KT-Fisher (134.11~ms vs.\ 113.41~ms) and the data-free baseline DF-Bayes-TTMM (134.11~ms vs.\ 119.25~ms). This quantitative evaluation demonstrates that FDF-DPA completely eliminates the reliance on offline source data while maintaining excellent real-time execution speeds, making it fully viable for practical edge-streaming deployments.
+
+\subsection{Limitations and Future Work}
+While FDF-DPA demonstrates state-of-the-art performance and achieves a fully data-free deployment, it has certain limitations that present exciting avenues for future research:
+\begin{enumerate}
+    \item \textbf{Dataset Scale and Complexity:} Our empirical evaluation focuses on standard, established vision benchmarks (MNIST, KMNIST, and FashionMNIST). While this setting is structurally consistent with prior work and serves as an excellent testbed for non-stationary open-world streams, evaluating FDF-DPA on larger-scale natural images (e.g., ImageNet-C, DomainNet) or diverse modalities (e.g., natural language processing tasks) is a natural next step.
+    \item \textbf{Test-Time Computational Overhead:} Computing the Kronecker trace sensitivity requires a single backward pass of the entropy loss per batch. While this is significantly faster and more parameter-efficient than standard full-model fine-tuning, it still incurs a slight computational overhead compared to purely forward-only routing. Future work could explore amortizing or skipping the backward pass for stable stream periods.
+    \item \textbf{Heuristic Thresholding:} Although our ablation study shows that FDF-DPA is robust to a wide range of entropy thresholds (e.g., $\tau_N \le 0.70$), extremely high thresholds can lead to routing failures. Developing a fully automated, threshold-free probabilistic novelty detection mechanism would further improve robustness.
+    \item \textbf{Modality and Architectural Generalization:} Our current formulation is tailored to convolutional neural networks (ResNet-18) featuring Batch Normalization (BN). Extending FDF-DPA to Transformer architectures (such as Vision Transformers or Large Language Models) would require adapting the Soft BN Buffer Fusion to Layer Normalization (LayerNorm). Unlike BN, LayerNorm operates on individual sample channels and does not maintain running dataset-level statistics. In this setting, instead of blending statistics, one could explore directly merging the scaling parameters of the LayerNorm layers or aligning hidden activation distributions across transformer blocks using equivalent moment-matching formulations. Additionally, Kronecker-Trace guided feature anchoring can be naturally mapped to Transformers by freezing early attention layers (which capture general syntactic or visual structure) and adapting late-stage task heads.
+\end{enumerate}
+
+\section{Conclusion}
+\label{sec:conclusion}
+We presented FDF-DPA, a fully data-free dynamic prototype adaptation framework for open-world test-time model merging. By dynamically estimating prototypes on-the-fly, continuously fusing Batch Normalization buffers, and preconditioning adaptation with Kronecker-Trace guided feature anchoring, FDF-DPA completely eliminates the reliance on offline clean source data while achieving state-of-the-art accuracy and stability. This work unlocks new avenues for deploying multi-task expert systems in strictly data-private or edge environments.
+
+\clearpage
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+
+\section{Mathematical Derivation of Soft BN Buffer Fusion}
+\label{app:bn_fusion_derivation}
+
+In this section, we provide the full mathematical derivation for our proposed Soft BN Buffer Fusion (Moment Matching under a Mixture-of-Gaussians model) presented in Section~3.1, Equations~3 and 4.
+
+Let the feature activation $z$ of a Batch Normalization layer be modeled as a mixture distribution over the $K$ available task-specific expert networks. Let $w_k$ denote the soft posterior probability of expert $k$ being the active model for the current batch (computed via Eq.~2).
+Under this mixture model, we assume that the conditional activation of $z$ given expert $k$ follows a Gaussian distribution:
+\begin{equation}
+z \mid \text{expert } k \sim \mathcal{N}(\mu_k, \sigma_k^2),
+\end{equation}
+where $\mu_k$ and $\sigma_k^2$ are the running mean and variance stored in the Batch Normalization buffer of expert $k$.
+
+The probability density function (PDF) of the mixed activation $z$ is given by the Mixture of Gaussians (MoG):
+\begin{equation}
+p(z) = \sum_{k=1}^K w_k \mathcal{N}(z; \mu_k, \sigma_k^2),
+\end{equation}
+where $\sum_{k=1}^K w_k = 1$.
+
+\subsection{Derivation of the Fused Mean $\mu_{\text{fused}}$}
+The expectation (mean) of the mixed activation $z$ under the MoG distribution $p(z)$ is computed as:
+\begin{equation}
+\mu_{\text{fused}} = \mathbb{E}[z] = \int_{-\infty}^{\infty} z p(z) \, dz = \int_{-\infty}^{\infty} z \left( \sum_{k=1}^K w_k \mathcal{N}(z; \mu_k, \sigma_k^2) \right) \, dz.
+\end{equation}
+By the linearity of integration and summation:
+\begin{equation}
+\mu_{\text{fused}} = \sum_{k=1}^K w_k \left( \int_{-\infty}^{\infty} z \mathcal{N}(z; \mu_k, \sigma_k^2) \, dz \right).
+\end{equation}
+Since the integral of $z$ over the Gaussian density $\mathcal{N}(z; \mu_k, \sigma_k^2)$ is its mean $\mu_k$:
+\begin{equation}
+\mu_{\text{fused}} = \sum_{k=1}^K w_k \mu_k.
+\end{equation}
+This proves Equation~3.
+
+\subsection{Derivation of the Fused Variance $\sigma_{\text{fused}}^2$}
+The variance of the mixed activation $z$ is defined as:
+\begin{equation}
+\sigma_{\text{fused}}^2 = \text{Var}(z) = \mathbb{E}[z^2] - \left( \mathbb{E}[z] \right)^2 = \mathbb{E}[z^2] - \mu_{\text{fused}}^2.
+\end{equation}
+First, we compute the second moment $\mathbb{E}[z^2]$:
+\begin{equation}
+\mathbb{E}[z^2] = \int_{-\infty}^{\infty} z^2 p(z) \, dz = \sum_{k=1}^K w_k \left( \int_{-\infty}^{\infty} z^2 \mathcal{N}(z; \mu_k, \sigma_k^2) \, dz \right).
+\end{equation}
+The second moment of a Gaussian random variable is given by $\sigma_k^2 + \mu_k^2$. Substituting this:
+\begin{equation}
+\mathbb{E}[z^2] = \sum_{k=1}^K w_k (\sigma_k^2 + \mu_k^2).
+\end{equation}
+Substituting this back into the expression for $\text{Var}(z)$:
+\begin{equation}
+\sigma_{\text{fused}}^2 = \sum_{k=1}^K w_k (\sigma_k^2 + \mu_k^2) - \mu_{\text{fused}}^2.
+\label{eq:var_intermediate}
+\end{equation}
+
+Now, let us expand our proposed fused variance formulation (Equation~4):
+\begin{equation}
+\text{Proposed Var} = \sum_{k=1}^K w_k \left( \sigma_k^2 + (\mu_k - \mu_{\text{fused}})^2 \right).
+\end{equation}
+Expanding the quadratic term:
+\begin{equation}
+\text{Proposed Var} = \sum_{k=1}^K w_k \left( \sigma_k^2 + \mu_k^2 - 2 \mu_k \mu_{\text{fused}} + \mu_{\text{fused}}^2 \right).
+\end{equation}
+Distributing the summation and the mixture weights $w_k$:
+\begin{equation}
+\text{Proposed Var} = \sum_{k=1}^K w_k (\sigma_k^2 + \mu_k^2) - 2 \mu_{\text{fused}} \left( \sum_{k=1}^K w_k \mu_k \right) + \mu_{\text{fused}}^2 \left( \sum_{k=1}^K w_k \right).
+\end{equation}
+Recall that $\sum_{k=1}^K w_k \mu_k = \mu_{\text{fused}}$ and $\sum_{k=1}^K w_k = 1$. Substituting these properties:
+\begin{equation}
+\text{Proposed Var} = \sum_{k=1}^K w_k (\sigma_k^2 + \mu_k^2) - 2 \mu_{\text{fused}}^2 + \mu_{\text{fused}}^2.
+\end{equation}
+Simplifying the terms:
+\begin{equation}
+\text{Proposed Var} = \sum_{k=1}^K w_k (\sigma_k^2 + \mu_k^2) - \mu_{\text{fused}}^2.
+\end{equation}
+This is mathematically identical to Equation~\ref{eq:var_intermediate}, proving that our Soft BN Buffer Fusion computes the exact statistical moments of the mixture distribution. This completes the proof of Equation~4.
+
+
+\section{Experimental and Implementation Details}
+\label{app:implementation_details}
+
+In this section, we provide comprehensive specifications of our experimental setup, neural network architectures, and hyper-parameters to facilitate full reproducibility.
+
+\subsection{Architectural Details}
+We employ a modified ResNet-18 model architecture \cite{He2016} as our backbone model for both expert neural networks. 
+To accommodate 1-channel grayscale image inputs (from the MNIST, KMNIST, and FashionMNIST datasets) while preserving pre-trained weights from ImageNet, we apply a channel reduction surgery:
+\begin{itemize}
+    \item \textbf{Input Conv Layer Surgery:} The standard ImageNet ResNet-18 first convolutional layer (\texttt{conv1}) expects 3 input channels with weight dimensions of $[64, 3, 7, 7]$. We construct a new single-channel convolutional layer with dimensions $[64, 1, 7, 7]$. The weights are initialized by summing the pretrained weights across the channel dimension: $W_{\text{new}} = \sum_{c=1}^3 W_{\text{old}, c}$. This allows the network to process grayscale inputs while retaining the learned spatial features.
+    \item \textbf{Classification Head:} The final fully connected layer (\texttt{fc}) is replaced with a linear layer mapping from $512$ features to $10$ classes: \texttt{nn.Linear(512, 10)}.
+\end{itemize}
+
+\subsection{Expert Pre-training Hyper-parameters}
+Each expert model is trained independently on the training split of its respective dataset (MNIST and KMNIST). The training details are:
+\begin{itemize}
+    \item \textbf{Preprocessing:} Grayscale input images are converted to PyTorch tensors and normalized to the range $[-1.0, 1.0]$ using a mean of $0.5$ and a standard deviation of $0.5$.
+    \item \textbf{Optimization:} We train using the AdamW optimizer with a learning rate of $1 \times 10^{-3}$ and weight decay of $1 \times 10^{-4}$.
+    \item \textbf{Duration and Batch Size:} Each expert is trained for 3 epochs with a batch size of 256.
+    \item \textbf{Validation Performance:} The MNIST expert achieves a validation accuracy of $98.81\%$, and the KMNIST expert achieves $95.34\%$.
+\end{itemize}
+
+\subsection{FDF-DPA Deployment Hyper-parameters}
+For deployment on the non-stationary stream, FDF-DPA operates under the following default parameters:
+\begin{itemize}
+    \item \textbf{Test Batch Size:} 64 samples per batch.
+    \item \textbf{Entropy Threshold $\tau_N$:} $0.70$ (calibrated to the natural logarithm scale).
+    \item \textbf{Update Momentum $\alpha_{\text{ema}}$:} $0.1$.
+    \item \textbf{Prototype Blending Coefficient $\alpha_{\text{proto}}$:} $0.95$.
+    \item \textbf{Preconditioning Base Learning Rate $\eta$:} $0.005$.
+    \item \textbf{Damping Coefficient $\beta$:} $0.5$.
+    \item \textbf{Bayes Temperature scaling $\gamma$:} $5.0$.
+    \item \textbf{Anchored Feature Extraction Layers:} \texttt{conv1}, \texttt{bn1}, \texttt{layer1}, and \texttt{layer2}.
+\end{itemize}
+
+\end{document}

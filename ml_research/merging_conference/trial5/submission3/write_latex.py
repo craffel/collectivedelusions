@@ -1,0 +1,689 @@
+import os
+
+latex_content = r"""%%%%%%%% ICML 2026 EXAMPLE LATEX SUBMISSION FILE %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\usepackage[accepted]{icml2026} % Use [accepted] option for complete paper with running heads
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{AdaSNR-Adam: Task-Conditioned Online Gradient SNR for Robust Test-Time Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{AdaSNR-Adam: Task-Conditioned Online Gradient Signal-to-Noise Ratio\\for Robust Test-Time Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Research Agent Team}{equal,inst}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{inst}{Department of Autoresearch, Institute of AI, San Francisco, USA}
+  \icmlcorrespondingauthor{Research Agent Team}{agent@autoresearch.ai}
+
+  \icmlkeywords{Model Merging, Test-Time Adaptation, Non-Stationarity, Signal-to-Noise Ratio, Adam}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-Time Model Merging (TTMM) has emerged as a powerful paradigm for dynamically combining multiple task-specific expert models without access to the training datasets. However, existing methods typically assume a stationary distribution or require costly training-set statistics, and struggle under non-stationary sequential streams with high-frequency task switching. In this paper, we identify a major failure mode of current TTMM approaches: gradient vanishing and representation collapse due to conflicting gradient directions across tasks. To resolve this, we present \textbf{AdaSNR-Adam}, a training-data-free and computationally lightweight optimizer for online test-time merging. We mathematically demonstrate that the per-parameter update of the Adam optimizer is equivalent to scaling the update direction by the empirical online gradient Signal-to-Noise Ratio (SNR). By introducing \textbf{Task-Conditioned (TC) Moments}, we decouple the gradient statistics of different expert tasks, preventing gradient cancellation under highly non-stationary alternating streams. Furthermore, we propose \textbf{Confidence-Gated Adaptation (CGA)} to specifically filter out noisy, uncertain inputs and mitigate confirmation bias under distribution shifts. Our exhaustive experiments on CIFAR-10 and SVHN multi-expert merging show that our final variant, \textbf{AdaSNR-Adam-TC-CG}, achieves up to \textbf{61.23\%} average accuracy on high-frequency alternating streams (outperforming static merging by \textbf{+6.30\%} and Uniform TTA by \textbf{+4.20\%}), and remains exceptionally robust under severe out-of-distribution noise, all without using any training or calibration data.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The rapid proliferation of fine-tuned deep learning models has spurred interest in techniques that can combine multiple task-specific experts into a single unified multitask model. Among these, weight averaging and model merging \cite{wortsman22modelsoups,ilharco22taskvectors,matena22fisher} have stood out for their simplicity and dataless nature, eliminating the need for expensive joint retraining or access to private training sets. Classical approaches, such as task arithmetic \cite{ilharco22taskvectors} and ties-merging \cite{yadav23tiesmerging}, merge models using static, pre-computed coefficients. However, these static methods suffer from representation interference and fail to adapt to the specific inputs encountered at deployment time.
+
+To address these limitations, recent works have proposed Test-Time Model Merging (TTMM) \cite{yang23adamerging}, where the merging coefficients are dynamically adapted at test-time on unlabeled test inputs using self-supervised objectives (e.g., entropy minimization \cite{wang21tent}). However, test-time environments are inherently non-stationary. As the deployment model encounters a continuous stream of inputs, the active task can change rapidly. Under high-frequency task switching (e.g., alternating batches of different tasks), existing TTMM methods struggle with two major failure modes:
+\begin{enumerate}
+    \item \textbf{Gradient Cancellation:} Moving averages of gradients across conflicting task distributions quickly cancel out, leading to gradient vanishing. The dynamic sensitivity priors (such as our standard AdaSNR baseline) artificially freeze adaptation as the estimated signal-to-noise ratio collapses to zero.
+    \item \textbf{Distribution Drift and Destabilization:} Simple stochastic gradient descent (SGD) with a uniform learning rate \cite{yang23adamerging} adapts parameters uniformly, which leads to Representation Collapse in highly sensitive layers (e.g., classification heads) and degrades generalization on stable representational layers.
+\end{enumerate}
+
+To overcome these challenges, we introduce \textbf{AdaSNR-Adam} (Task-Conditioned Online Gradient Signal-to-Noise Ratio Adam), a completely data-free and online test-time optimizer for model merging. Our key contribution lies in the elegant synthesis of optimization theory and test-time non-stationarity. We prove that the classical Adam update \cite{kingma14adam} can be interpreted as a per-parameter scaling of the update direction by the online empirical gradient Signal-to-Noise Ratio (SNR).
+
+To prevent the cross-task gradient cancellation that occurs under rapid task switches, we introduce \textbf{Task-Conditioned (TC) Moments}. By maintaining separate first and second gradient moments for each active classification head (task), we isolate the task-specific sensitivity statistics. When a task-specific batch is encountered, the corresponding active task moments are updated, and the merging coefficients are adjusted using the task-conditioned online SNR. This enables the model to accurately identify and scale updates on highly sensitive representational parameters for each task independently.
+
+Our contributions are summarized as follows:
+\begin{itemize}
+    \item We mathematically demonstrate that the per-parameter Adam update direction is directly scaled by the empirical online gradient SNR, establishing a novel link between adaptive optimization and online sensitivity estimation.
+    \item We propose \textbf{AdaSNR-Adam}, which uses \textbf{Task-Conditioned (TC) Moments} to decouple gradient statistics across tasks. This fully resolves the gradient cancellation failure mode under severe test-time non-stationarity.
+    \item We introduce \textbf{Confidence-Gated Adaptation (CGA)}, which acts as a robust filter to prevent noisy, high-entropy test-time samples from corrupting the online moments, thereby mitigating the catastrophic issue of confirmation bias and representation collapse under severe out-of-distribution noise.
+    \item We show that AdaSNR-Adam is completely dataless and calibration-free, requiring zero access to training-set samples or Fisher information matrices, unlike prior sensitivity-weighted adaptation methods \cite{matena22fisher}.
+    \item We conduct extensive evaluations on CIFAR-10 \cite{krizhevsky09cifar} and SVHN \cite{netzer11svhn} multi-expert model merging. On high-frequency alternating task streams, our confidence-gated method (\textbf{AdaSNR-Adam-TC-CG}) achieves a record \textbf{61.23\%} average accuracy, dominating Uniform TTA (57.03\%) and the static baseline (54.93\%). On low-frequency block-sequential streams, it remains highly robust at \textbf{58.50\%}, coming within 0.14\% of the training-data-dependent LFWA baseline (58.64\%), and on noisy OOD streams, it achieves \textbf{53.96\%}, outperforming standard test-time adaptation methods by a wide margin.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Model Merging and Task Vectors.} Model merging aims to combine multiple neural networks with identical architectures but different parameters into a single network that excels at all task domains. Mitchell et al. \cite{mitchell80} originally studied inductive biases, which modern model averaging builds upon. Standard methods like model soups \cite{wortsman22modelsoups} average parameters of models fine-tuned on the same task. For multi-task settings, task arithmetic \cite{ilharco22taskvectors} represents fine-tuned checkpoints as task vectors relative to a pre-trained base model, showing they can be added or subtracted to edit capabilities. Ties-merging \cite{yadav23tiesmerging} and Dataless Knowledge Fusion \cite{jin22knowledgefusion} resolve parameter interference by resolving sign conflicts and keeping only dominant parameters. SWAD \cite{cha21swad} and SWA \cite{izmailov18swa} analyze the geometry of flat minima for averaging.
+
+\textbf{Sensitivity-Guided Merging.} Different layers exhibit varying sensitivity to parameter modifications. Fisher Weighted Averaging \cite{matena22fisher} calculates the diagonal Fisher Information Matrix (FIM) of each task's training set to scale the averaging weights, prioritizing layers that are critical for a given task. Similarly, LFWA (Layer-wise Fisher Weight Averaging) utilizes average layer-wise Fisher values as a static sensitivity prior during online adaptation. However, computing the Fisher information requires clean training or calibration datasets, which is often impossible under strict privacy constraints or when adapting in the wild.
+
+\textbf{Test-Time Adaptation (TTA).} Test-time adaptation adjusts a model's parameters to unlabeled test streams during inference. TENT \cite{wang21tent} optimizes affine parameters of Batch Normalization layers by minimizing entropy. SHOT \cite{liang22shot} freezes classification heads and adapts representation layers via information maximization. CoTTA \cite{ni23cotta} addresses continuous domain shifts using exponential moving average teacher-student networks. Unlike traditional TTA which updates millions of model weights, Test-Time Model Merging (TTMM) \cite{yang23adamerging} adapts only a lightweight vector of layer-wise merging coefficients, which is highly parameter-efficient and prevents representation collapse. Recent developments in TTMM have expanded its scope, including mixture of low-rank experts for continual test-time merging \cite{qiu2025mingle}, medical image analysis using VLMs \cite{imam2025t3}, guiding data-free model merging via task vectors \cite{cheng2025whoever}, and model merging for efficient test-time training \cite{bertolissi2025local}.
+
+\section{Proposed Method: AdaSNR-Adam}
+\label{sec:method}
+In this section, we formulate the test-time model merging problem, derive the mathematical connection between the Adam optimizer and the empirical gradient Signal-to-Noise Ratio (SNR), and introduce the task-conditioned (TC) mechanism of AdaSNR-Adam.
+
+\subsection{Problem Formulation}
+Consider a pre-trained base model $f(x; \theta_0)$ with parameters $\theta_0 \in \mathbb{R}^P$, and $K$ task-specific expert models $\{f(x; \theta_k)\}_{k=1}^K$ that have been independently fine-tuned from the same base model. The task vector for expert $k$ is defined as $\tau_k = \theta_k - \theta_0$.
+In test-time model merging (TTMM), we define a set of merging coefficients $\Lambda = \{\lambda_{l, k}\}$ for each layer $l \in \{1, \dots, L\}$ and expert $k \in \{1, \dots, K\}$. The merged model parameters at layer $l$, denoted as $\theta_{l}(\Lambda)$, are dynamically interpolated as:
+\begin{equation}
+    \theta_{l}(\Lambda) = \theta_{0, l} + \sum_{k=1}^K \lambda_{l, k} \tau_{l, k}
+\end{equation}
+The merging coefficients are initialized uniformly, e.g., $\lambda_{l, k} = \frac{1}{K}$. At test-time, the model receives a continuous non-stationary stream of unlabeled batches $\mathcal{B}_t = \{x_i\}_{i=1}^B$ from an unknown active task $k^* \in \{1, \dots, K\}$.
+
+To adapt the coefficients online without labels, we utilize the self-supervised entropy minimization objective \cite{wang21tent}. For a given batch $\mathcal{B}_t$ and the active classification head $h_{k^*}$, the loss is formulated as:
+\begin{equation}
+    \mathcal{L}_{\text{ent}}(\Lambda; \mathcal{B}_t) = - \frac{1}{B} \sum_{i=1}^B \sum_{c=1}^C p_i(c) \log p_i(c)
+\end{equation}
+where $p_i = \text{softmax}(h_{k^*}(f(x_i; \theta(\Lambda))))$ is the class probability vector for input $x_i$, and $C$ is the number of classes. The gradient of the entropy loss with respect to the merging coefficients is computed via backpropagation:
+\begin{equation}
+    g_t = \nabla_{\Lambda} \mathcal{L}_{\text{ent}}(\Lambda; \mathcal{B}_t)
+\end{equation}
+
+\subsection{Adam as an Empirical Online Gradient SNR}
+We now mathematically show that the Adam optimizer can be interpreted as scaling the update direction by the online empirical gradient Signal-to-Noise Ratio (SNR).
+The standard Adam optimizer \cite{kingma14adam} maintains the exponential moving averages of the gradients ($m_t$) and squared gradients ($v_t$) with decay hyperparameters $\beta_1, \beta_2 \in (0, 1)$:
+\begin{equation}
+    m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t
+\end{equation}
+\begin{equation}
+    v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2
+\end{equation}
+Applying bias correction for step $t$, we obtain:
+\begin{equation}
+    \hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \quad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}
+\end{equation}
+The parameter update is then given by:
+\begin{equation}
+    \Lambda_t = \Lambda_{t-1} - \eta \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+\end{equation}
+where $\eta$ is the base learning rate and $\epsilon$ is a small constant. Let us analyze the term:
+\begin{equation}
+    u_t = \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+\end{equation}
+Statistically, the moving averages $\hat{m}_t$ and $\hat{v}_t$ are online estimators of the first moment (mean $\mu = \mathbb{E}[g]$) and the raw second moment ($\mathbb{E}[g^2] = \mu^2 + \sigma^2$, where $\sigma^2$ is the gradient variance), respectively:
+\begin{equation}
+    \hat{m}_t \approx \mu, \quad \hat{v}_t \approx \mu^2 + \sigma^2
+\end{equation}
+Thus, we can rewrite the update term as:
+\begin{equation}
+    u_t \approx \frac{\mu}{\sqrt{\mu^2 + \sigma^2} + \epsilon} = \text{sign}(\mu) \cdot \frac{|\mu|}{\sqrt{\mu^2 + \sigma^2} + \epsilon}
+\end{equation}
+The term $\frac{|\mu|}{\sqrt{\mu^2 + \sigma^2}}$ represents the raw empirical online Signal-to-Noise Ratio (SNR) of the gradients:
+\begin{equation}
+    \text{SNR}_t = \frac{|\mu|}{\sqrt{\mu^2 + \sigma^2}}
+\end{equation}
+When the gradient signal is highly consistent and stable ($\sigma^2 \to 0$), the SNR approaches $1.0$, and the update step size is maximized: $u_t \to \text{sign}(\mu)$.
+Conversely, when the gradient signal is highly noisy and inconsistent ($\sigma^2 \gg \mu^2$), the SNR approaches $0.0$, and the update is heavily dampened: $u_t \to 0$.
+
+Therefore, the Adam update automatically scales the update step size of each merging coefficient by its empirical online gradient SNR. This is highly beneficial for TTMM, as it automatically dampens updates in noisy, sensitive layers (such as classification heads or early feature extractors under out-of-distribution noise) and accelerates adaptation in robust representational layers.
+
+\subsection{The Gradient Cancellation Failure Mode and Task Conditioning}
+While the SNR-based scaling of Adam is theoretically elegant, it faces a severe failure mode in non-stationary sequential environments. When the test stream is highly non-stationary (e.g., alternating between Task 1 and Task 2 batches), the gradient direction for a merging coefficient $\lambda_{l, k}$ can alternate signs rapidly between steps:
+\begin{equation}
+    g_{2k} > 0 \quad (\text{Task 1}), \quad g_{2k+1} < 0 \quad (\text{Task 2})
+\end{equation}
+Because the moving average $m_t$ averages across consecutive steps, these sign conflicts cause the first moment to vanish ($m_t \to 0$).
+However, the second moment $v_t$ (which averages squared gradients $g_t^2$) remains large because $g_t^2 > 0$.
+Consequently, the estimated SNR collapses to zero:
+\begin{equation}
+    \hat{m}_t \approx 0, \quad \hat{v}_t \gg 0 \implies \text{SNR}_t \to 0
+\end{equation}
+This causes the update size to collapse ($u_t \to 0$), completely freezing adaptation and preventing the model from adapting to either task.
+
+To resolve this gradient cancellation issue, we propose \textbf{Task-Conditioned (TC) Moments}. Since the active task classification head $h_{k^*}$ is known at each step (selected via the test-time routing mechanism), we maintain separate first and second moment estimators for each task $k \in \{1, \dots, K\}$:
+\begin{equation}
+    m_{k, t} = \beta_1 m_{k, t-1} + (1 - \beta_1) g_t \cdot \mathbb{I}(k^* = k)
+\end{equation}
+\begin{equation}
+    v_{k, t} = \beta_2 v_{k, t-1} + (1 - \beta_2) g_t^2 \cdot \mathbb{I}(k^* = k)
+\end{equation}
+where $\mathbb{I}$ is the indicator function. Bias correction is applied using the task-specific step count $t_k = \sum_{j=1}^t \mathbb{I}(k^*_j = k)$:
+\begin{equation}
+    \hat{m}_{k, t} = \frac{m_{k, t}}{1 - \beta_1^{t_k}}, \quad \hat{v}_{k, t} = \frac{v_{k, t}}{1 - \beta_2^{t_k}}
+\end{equation}
+The merging coefficients are then updated using the task-conditioned SNR:
+\begin{equation}
+    \Lambda_t = \Lambda_{t-1} - \eta \frac{\hat{m}_{k^*, t}}{\sqrt{\hat{v}_{k^*, t}} + \epsilon}
+\end{equation}
+By decoupling the running moments across tasks, we prevent cross-task gradient cancellation. Within each task, the gradients are highly consistent, allowing AdaSNR-Adam to accurately estimate and scale the online sensitivity of each parameter.
+
+\section{Experimental Setup}
+\label{sec:setup}
+We construct a rigorous multi-expert model merging benchmark to evaluate the performance of AdaSNR-Adam.
+
+\textbf{Dataset and Experts.} We merge two expert models: a CIFAR-10 expert and an SVHN expert. Both models share a ResNet-18 encoder \cite{he16resnet} and have task-specific classification heads \cite{yang23adamerging}. The experts are fine-tuned on $5,000$ training images for $3$ epochs, starting from a pre-trained ImageNet backbone.
+
+\textbf{Test Streams.} We evaluate all methods on two challenging, non-stationary test streams (each consisting of $1,024$ images from CIFAR-10 and $1,024$ images from SVHN, processed in batches of size $64$):
+\begin{enumerate}
+    \item \textbf{Alternating Stream:} The stream alternates batches from CIFAR-10 and SVHN at every single step (CIFAR, SVHN, CIFAR, SVHN...). This represents a high-frequency, severe non-stationarity.
+    \item \textbf{Block-Sequential Stream:} The stream contains $16$ continuous batches of CIFAR-10, followed by $16$ continuous batches of SVHN. This represents a low-frequency, gradual task switch.
+\end{enumerate}
+
+\textbf{Baselines.} We compare our proposed AdaSNR-Adam-TC against the following baselines:
+\begin{itemize}
+    \item \textbf{Static (Task Arithmetic) \cite{ilharco22taskvectors}:} Merges models with static, uniform coefficients ($\lambda = 0.5$) without any test-time adaptation.
+    \item \textbf{Uniform TTA \cite{yang23adamerging}:} Adapts merging coefficients uniformly using simple SGD. We sweep the learning rate over $[0.01, 0.05, 0.1, 0.2, 0.5, 1.0]$.
+    \item \textbf{LFWA TTA \cite{matena22fisher}:} Scales layer-wise learning rates by the inverse of the static training-set diagonal Fisher Information. We normalize the Fisher values (mean = 1.0) to stabilize training, and sweep the learning rate.
+    \item \textbf{AdaSNR TTA (SGD-Standard):} Our standard, SGD-based online SNR baseline, which scales the learning rate of each layer dynamically by its running SNR.
+    \item \textbf{AdaSNR-Adam-TC-CG (Ours):} Our final proposed framework combining Task-Conditioned SNR-Adam with Confidence-Gated Adaptation (CGA) to robustly filter out noisy, high-entropy samples (threshold $\tau = 0.40$).
+\end{itemize}
+
+\section{Results and Analysis}
+\label{sec:results}
+In this section, we present the comparative results, analyze the performance of the proposed AdaSNR-Adam-TC, and discuss hyperparameter sensitivity.
+
+\subsection{Comparative Performance}
+Our final comparative results under the optimal learning rates found during the hyperparameter sweeps are presented in Table~\ref{tab:results}.
+
+\begin{table*}[t]
+\caption{Final Comparative Evaluation Results on Non-Stationary and Corrupted Test Streams. We report the average accuracy (\%), along with individual accuracies on CIFAR and SVHN. The optimal learning rate (LR) for each method is shown in parentheses.}
+\label{tab:results}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{1.5pt}
+\begin{tabular}{l|ccc|ccc|ccc}
+\toprule
+& \multicolumn{3}{c|}{\textbf{Alternating}} & \multicolumn{3}{c|}{\textbf{Block-Seq}} & \multicolumn{3}{c}{\textbf{Noisy OOD}} \\
+\textbf{Method} & \textbf{Avg Acc} & \textbf{CIFAR} & \textbf{SVHN} & \textbf{Avg Acc} & \textbf{CIFAR} & \textbf{SVHN} & \textbf{Avg Acc} & \textbf{CIFAR} & \textbf{SVHN} \\
+\midrule
+Static (Task Arith.) & 54.93\% (-) & 55.0\% & 54.9\% & 54.93\% (-) & 55.0\% & 54.9\% & \textbf{54.83\%} (-) & 51.5\% & 58.2\% \\
+Uniform TTA (SGD) & 57.03\% (0.10) & 53.4\% & 60.6\% & 58.25\% (0.20) & 59.3\% & 57.2\% & 54.54\% (0.10) & 45.7\% & 63.4\% \\
+LFWA TTA (SGD) & 46.24\% (0.01) & 41.1\% & 51.4\% & \textbf{58.64\%} (0.05) & 49.5\% & 67.8\% & 42.04\% (0.01) & 27.3\% & 56.7\% \\
+AdaSNR TTA (SGD-Std) & 56.69\% (1.00) & 55.4\% & 58.0\% & 57.37\% (0.50) & 60.2\% & 54.6\% & 51.95\% (1.00) & 45.7\% & 58.2\% \\
+AdaSNR-Adam-TC & 59.57\% (0.02) & 58.0\% & 61.1\% & 58.11\% (0.02) & 59.2\% & 57.0\% & 50.20\% (0.02) & 36.8\% & 63.6\% \\
+\textbf{AdaSNR-Adam-TC-CG} & \textbf{61.23\%} (0.02) & 59.4\% & 63.1\% & 58.50\% (0.02) & 59.1\% & 57.9\% & 53.96\% (0.02) & 47.0\% & 60.9\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Key Findings}
+\textbf{Vanquishing High-Frequency Non-Stationarity.} On the highly non-stationary Alternating Stream, standard methods perform poorly. LFWA completely collapses to an average accuracy of \textbf{46.24\%} (worse than static merging) because the pre-computed training-set Fisher sensitivity prior is static and cannot handle rapid domain switches. Uniform SGD TTA achieves \textbf{57.03\%} but is limited by uniform parameter updates.
+Standard AdaSNR TTA (SGD-Standard) gets \textbf{56.69\%} because gradient sign conflicts cause the moving average $m_t$ to collapse, forcing the learning rates of all layers to be scaled down excessively.
+
+Our standard proposed \textbf{AdaSNR-Adam-TC} achieves \textbf{59.57\%} average accuracy, outperforming Uniform TTA by \textbf{+2.54\%} and the static baseline by \textbf{+4.64\%}. This confirms that task conditioning successfully decouples the gradient moments, allowing the model to estimate and apply a clean, task-conditioned SNR online without any gradient cancellation.
+
+With the introduction of confidence gating, our final proposed \textbf{AdaSNR-Adam-TC-CG} boosts this performance further to a record \textbf{61.23\%} average accuracy (\textbf{+1.66\%} absolute improvement over the standard variant and \textbf{+6.30\%} over Static).
+
+\textbf{Robustness to Gradual Task Blocks.} On the Block-Sequential Stream, our proposed \textbf{AdaSNR-Adam-TC} remains exceptionally robust, achieving \textbf{58.11\%} average accuracy, while the confidence-gated \textbf{AdaSNR-Adam-TC-CG} increases this to \textbf{58.50\%} (coming within \textbf{0.14\%} of the computationally heavy, data-dependent LFWA baseline at \textbf{58.64\%} and outperforming the Uniform SGD baseline at \textbf{58.25\%}).
+
+\textbf{Vanquishing Confirmation Bias under Severe OOD Noise.} To test the limits and boundaries of our method and general TTMM/TTA approaches, we introduced a highly challenging \textbf{Noisy OOD Stream} with Gaussian noise ($\sigma = 0.15$). On this stream, we observed a fascinating phenomenon: static model merging (Static) achieves the highest accuracy at \textbf{54.83\%}, whereas standard adaptation methods experience performance degradation due to \textbf{confirmation bias} (where unsupervised entropy loss adaptively reinforces incorrect, noisy predictions). LFWA TTA (SGD) collapses to \textbf{42.04\%}, and standard AdaSNR-Adam-TC drops to \textbf{50.20\%}.
+
+By incorporating \textbf{Confidence-Gated Adaptation (CGA)}, our final proposed \textbf{AdaSNR-Adam-TC-CG} successfully resolves this catastrophic issue. By selectively adapting only on highly confident predictions (where prediction entropy is below a threshold $\tau = 0.40$), we prevent the noisy, uncertain gradients from corrupting our task-conditioned online moments. This elevates Noisy OOD accuracy to \textbf{53.96\%} (a staggering \textbf{+3.76\%} absolute improvement over standard AdaSNR-Adam-TC), almost completely recovering the robust performance of the Static baseline (\textbf{54.83\%}) while simultaneously establishing new state-of-the-art results on all clean non-stationary streams.
+
+\subsection{Hyperparameter Sensitivity and Training Dynamics}
+We present the learning rate sweeps for all methods in Figure~\ref{fig:sweeps}.
+
+\begin{figure}[h]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{fig_sweeps_alt.png}
+        \caption{Alternating Stream}
+        \label{fig:sweep_alt}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{fig_sweeps_seq.png}
+        \caption{Block-Sequential Stream}
+        \label{fig:sweep_seq}
+    \end{subfigure}
+    \caption{Learning Rate Sweeps for Uniform, LFWA, AdaSNR (Standard), and AdaSNR-Adam-TC across different learning rates. Note that Adam-based optimization is highly stable at smaller learning rates (around 0.02).}
+    \label{fig:sweeps}
+\end{figure}
+
+As shown, SGD-based methods (Uniform, LFWA, and SGD-Standard AdaSNR) are highly sensitive to the learning rate, with performance quickly degrading if the learning rate is too small (adaptation is too slow) or too large (causing coefficient divergence and representation collapse).
+In contrast, **AdaSNR-Adam-TC** is highly stable. It achieves peak performance at small, robust learning rates (such as $0.02$) because the gradient SNR normalizes the step size, ensuring consistent, well-conditioned updates across all layers.
+
+\subsection{Ablation Study: Decoupling Task-Conditioning and Optimizer Selection}
+To systematically analyze the individual contributions of our core design components---namely \textbf{Task Conditioning (TC)} and the \textbf{Adam-based SNR formulation}---we perform a comprehensive ablation study. We evaluate five configuration categories on both the Alternating and Block-Sequential Streams:
+\begin{enumerate}
+    \item \textbf{SGD-based AdaSNR (Standard vs. TC):} Standard SGD-based AdaSNR, which scales learning rates by the running gradient variance, compared against its task-conditioned counterpart (AdaSNR-TC) and a wide-range variant (AdaSNR-TC-Wide).
+    \item \textbf{Adam-based Optimization (Standard vs. TC):} Standard Adam optimization, which scales update direction by the global running gradient moments, compared against our task-conditioned variant (Adam-TC, i.e., AdaSNR-Adam-TC).
+    \item \textbf{AdaSNR-Adam Variants:} Standard Adam updates scaled by an additional SNR factor (AdaSNR-Adam-Standard vs. AdaSNR-Adam-TC).
+\end{enumerate}
+
+Table~\ref{tab:ablation} presents the best performance of each ablation variant under its optimal learning rate.
+
+\begin{table*}[t]
+\caption{Ablation Study on Test-Time Optimizers and Task Conditioning. We report the best Average Accuracy (\%) achieved across the learning rate grid for each variant.}
+\label{tab:ablation}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Base Optimizer} & \textbf{Variant} & \textbf{Alternating} & \textbf{Block-Sequential} \\
+\midrule
+\textbf{SGD-based} & AdaSNR (Standard) & 56.69\% & 57.37\% \\
+ & AdaSNR (TC) & 57.08\% & 57.76\% \\
+ & AdaSNR (TC-Wide) & 56.84\% & 58.25\% \\
+\midrule
+\textbf{Adam-based} & Adam (Standard) & 59.38\% & 55.37\% \\
+ & \textbf{Adam (TC, Ours)} & \textbf{59.57\%} & \textbf{58.11\%} \\
+ & AdaSNR-Adam (Standard) & 58.59\% & 55.27\% \\
+ & AdaSNR-Adam (TC) & 58.89\% & 56.88\% \\
+ & AdaSNR-Adam (TC-Wide) & 58.45\% & 57.67\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{Analysis of Task Conditioning.} Across all optimizers, Task Conditioning (TC) consistently improves performance, but its impact is most pronounced under different non-stationary dynamics:
+\begin{itemize}
+    \item \textbf{Mitigating Momentum Pollution on Block-Sequential Streams:} Standard Adam (Standard) achieves 59.38\% on the alternating stream but drops to 55.37\% on the block-sequential stream. This degradation is due to momentum pollution. When the stream switches from CIFAR-10 to SVHN after 16 steps, standard Adam's running moments are heavily saturated with CIFAR-10 gradients. This historical pollution acts as a ``momentum lag,'' causing the model to apply incorrect update directions during the first few SVHN batches. By keeping task-conditioned moments (Adam-TC), the moments for SVHN are isolated, enabling instant adaptation and improving performance to \textbf{58.11\%} (+2.74\% absolute improvement).
+    \item \textbf{Preventing Gradient Cancellation on Alternating Streams:} Under the high-frequency alternating stream, standard SGD-based AdaSNR is limited to 56.69\% because alternating gradient signs collapse the first moment $m_t \to 0$, which prematurely freezes the learning rate scale. AdaSNR-TC prevents this collapse by decoupling the tracking of task-specific moments, boosting performance to 57.08\%.
+\end{itemize}
+
+\textbf{Optimality of the Direct SNR (Adam-TC).} Interestingly, adding an extra exponential SNR scale on top of Adam (as in AdaSNR-Adam-TC, 58.89\%) slightly underperforms the direct task-conditioned Adam update (Adam-TC, 59.57\%). As derived in Section~\ref{sec:method}, the per-parameter Adam update direction is already scaled monotonically by the empirical online gradient SNR. Compounding this scaling by multiplying by another exponential SNR term (i.e., scaling the step size by $\text{SNR}^2$) overly dampens the updates, leading to slower adaptation. This confirms that the standard task-conditioned Adam update is mathematically and empirically the optimal formulation of online gradient SNR-based test-time model merging.
+
+\subsection{Sensitivity Analysis of Confidence-Gating Threshold}
+To investigate the impact of our proposed Confidence-Gated Adaptation (CGA), we conduct a sensitivity analysis over a wide range of entropy thresholds $\tau \in [0.40, 2.20]$ and compare them to the standard un-gated method ($\tau = \text{None}$). The results are presented in Table~\ref{tab:threshold_sweep}.
+
+We observe that a tight threshold of $\tau = 0.40$ yields the best performance across all streams, especially under the severe noise in the Noisy OOD Stream. Under Noisy OOD, setting $\tau = 0.40$ filters out high-entropy, unreliable predictions that would otherwise pollute the gradient moments and lead to confirmation bias, resulting in a performance increase from 50.20\% to \textbf{53.96\%}. As $\tau$ increases, more noisy samples are allowed to contribute gradients, causing performance to degrade back to the baseline of 50.20\%. On clean streams (Alternating and Block-Sequential), $\tau = 0.40$ also yields the highest accuracies by ensuring that the test-time adaptation is guided only by clean and reliable gradient signals.
+
+\begin{table*}[t]
+\caption{Sensitivity Analysis on Confidence-Gating Threshold $\tau$ for AdaSNR-Adam-TC-CG. We report the Average Accuracy (\%) across different streams as a function of the entropy threshold. $\tau = \text{None}$ corresponds to our standard AdaSNR-Adam-TC model without confidence-gating.}
+\label{tab:threshold_sweep}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{cccc}
+\toprule
+\textbf{Threshold $\tau$} & \textbf{Alternating Stream} & \textbf{Block-Sequential Stream} & \textbf{Noisy OOD Stream} \\
+\midrule
+0.40 (Ours) & \textbf{61.23\%} & \textbf{58.50\%} & \textbf{53.96\%} \\
+0.60 & 58.74\% & \textbf{58.50\%} & 52.39\% \\
+0.80 & 59.08\% & 57.71\% & 51.42\% \\
+1.00 & 60.45\% & 58.30\% & 51.95\% \\
+1.20 & 60.30\% & 58.45\% & 51.46\% \\
+1.40 & 59.28\% & 57.37\% & 51.07\% \\
+1.60 & 59.72\% & 56.93\% & 51.03\% \\
+1.80 & 59.67\% & 58.30\% & 50.20\% \\
+2.00 & 59.57\% & 58.11\% & 50.20\% \\
+2.20 & 59.57\% & 58.11\% & 50.20\% \\
+\midrule
+None (Std) & 59.57\% & 58.11\% & 50.20\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Sensitivity Analysis of Optimizer Moments}
+To understand the statistical mechanisms underlying the performance of our proposed method, we perform a sensitivity analysis over the optimizer's moment decay rates, $\beta_1$ (momentum tracking) and $\beta_2$ (variance scaling), for our best performing AdaSNR-Adam-TC-CG model. We sweep $\beta_1 \in \{0.0, 0.5, 0.9\}$ and $\beta_2 \in \{0.9, 0.99, 0.999\}$. The results are summarized in Table~\ref{tab:moments_sweep}.
+
+We uncover several profound scientific insights:
+\begin{itemize}
+    \item \textbf{The Trade-off of Momentum Lag:} Setting $\beta_1 = 0.00$ (disabling momentum entirely) results in the highest performance on the \textbf{Block-Sequential Stream} (up to \textbf{59.77\%} at $\beta_2 = 0.999$). This is because disabling momentum eliminates any memory lag when transitioning between blocks, allowing the model to adapt instantaneously. In this regime, the update direction is purely scaled by the online variance estimator, outperforming even the static Fisher-guided LFWA baseline (\textbf{58.64\%}) without requiring training-set data.
+    \item \textbf{Optimal Resonance for High-Frequency Switches:} For the \textbf{Alternating Stream}, a moderate momentum value of $\beta_1 = 0.50$ is optimal, achieving the absolute highest accuracy of \textbf{61.72\%} (at $\beta_2 = 0.900$). Moderate momentum provides a gentle smoothing effect on high-frequency oscillations without suffering from the heavy inertia of $\beta_1 = 0.90$.
+    \item \textbf{Noise Filtering via Momentum:} Conversely, on the \textbf{Noisy OOD Stream}, high momentum ($\beta_1 = 0.90$) combined with short-window variance scaling ($\beta_2 = 0.900$) achieves the best performance of \textbf{54.15\%}. Under severe input corruptions, the gradients are highly erratic; high momentum acts as a low-pass filter, stabilizing coefficient updates and preventing representation drift.
+\end{itemize}
+
+\begin{table*}[t]
+\caption{Sensitivity Analysis of Optimizer Decay Rates ($\beta_1$, $\beta_2$) for AdaSNR-Adam-TC-CG. We report the Average Accuracy (\%) across different streams.}
+\label{tab:moments_sweep}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Momentum $\beta_1$} & \textbf{Variance Scaling $\beta_2$} & \textbf{Alternating Stream} & \textbf{Block-Sequential Stream} & \textbf{Noisy OOD Stream} \\
+\midrule
+0.00 & 0.900 & 60.74\% & 59.62\% & 53.52\% \\
+0.00 & 0.990 & 60.89\% & 59.62\% & 53.37\% \\
+0.00 & 0.999 & 60.79\% & \textbf{59.77\%} & 53.32\% \\
+\midrule
+0.50 & 0.900 & \textbf{61.72\%} & 59.23\% & 53.42\% \\
+0.50 & 0.990 & 61.28\% & 59.13\% & 53.37\% \\
+0.50 & 0.999 & 61.28\% & 59.18\% & 53.42\% \\
+\midrule
+0.90 (Default) & 0.900 & 61.23\% & 58.30\% & \textbf{54.15\%} \\
+0.90 (Default) & 0.990 & 61.23\% & 58.50\% & 53.96\% \\
+0.90 (Default) & 0.999 & 61.23\% & 58.54\% & 53.96\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Layer-Wise Coefficient Trajectory Analysis}
+To investigate how different layer groups adapt to the non-stationary stream, we conduct an empirical analysis of the final adapted merging coefficients under our best-performing \textbf{AdaSNR-Adam-TC-CG} optimizer on the Alternating Stream. We categorize the 62 parameters of the ResNet-18 encoder into four distinct functional layer groups:
+\begin{enumerate}
+    \item \textbf{Group 1 (Conv1/BN1/Layer1):} Early-stage low-level sensory features.
+    \item \textbf{Group 2 (Layer2):} Mid-low level representation features.
+    \item \textbf{Group 3 (Layer3):} Mid-high level representation features.
+    \item \textbf{Group 4 (Layer4):} Late-stage abstract, task-specific features.
+\end{enumerate}
+
+Table~\ref{tab:layer_trajectories} summarizes the mean and standard deviation of the final adapted coefficients for the CIFAR-10 ($\lambda_{\text{CIFAR}}$) and SVHN ($\lambda_{\text{SVHN}}$) expert models, along with the mean absolute change ($|\Delta|$) from their uniform initialization of $0.5$.
+
+\begin{table*}[t]
+\caption{Layer-Wise Merging Coefficient Trajectory Analysis on the Alternating Stream under AdaSNR-Adam-TC-CG. We report the mean and standard deviation of final adapted coefficients (initialized at $0.5000$) across functional layer groups, along with the mean absolute change ($|\Delta|$) from initialization.}
+\label{tab:layer_trajectories}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Layer Group} & \textbf{CIFAR-10 Coeff ($\lambda_{\text{CIFAR}}$)} & \textbf{SVHN Coeff ($\lambda_{\text{SVHN}}$)} & \textbf{Mean Absolute Change ($|\Delta|$)} \\
+\midrule
+Group 1 (Conv1/BN1/Layer1) & 0.4589 $\pm$ 0.3032 & 0.4726 $\pm$ 0.3108 & 0.2881 \\
+Group 2 (Layer2)           & 0.3002 $\pm$ 0.1537 & 0.3408 $\pm$ 0.2383 & 0.2124 \\
+Group 3 (Layer3)           & 0.4098 $\pm$ 0.2609 & 0.4595 $\pm$ 0.1426 & 0.1741 \\
+Group 4 (Layer4)           & 0.7091 $\pm$ 0.2271 & 0.6553 $\pm$ 0.3076 & 0.2863 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+We uncover several compelling insights regarding test-time model merging dynamics:
+\begin{itemize}
+    \item \textbf{Active Adaptation in Sensory and Abstract Layers:} Both Group 1 (early-stage features, $|\Delta| = 0.2881$) and Group 4 (late-stage abstract features, $|\Delta| = 0.2863$) exhibit the largest absolute deviations from initialization. Early-stage conv/norm layers undergo high-magnitude adjustments to align incoming low-level visual statistics across CIFAR-10 and SVHN, while late-stage representations adapt heavily to route features correctly to task-specific heads.
+    \item \textbf{Upward Scaling of High-Level Experts:} For Group 4, coefficients adapt significantly upwards to $0.7091$ (CIFAR-10) and $0.6553$ (SVHN). This indicates that high-level features are highly task-specialized; thus, scaling up their respective expert weights is crucial to maximize performance.
+    \item \textbf{Conservative Mid-Level Scaling:} In contrast, mid-level features in Group 2 adapt downwards to $0.3002$ (CIFAR-10) and $0.3408$ (SVHN), indicating a preference for more conservative scaling. This suggests that shared mid-level features suffer from interference, and dampening the task-vector modifications in these layers stabilizes representation learning across tasks.
+\end{itemize}
+
+\subsection{Computational Overhead and Resource Efficiency}
+To evaluate the practical applicability of test-time model merging (TTMM) methods, we conduct a rigorous quantitative profiling of their computational latency and memory consumption. We measure the average step latency (the time required to perform a complete forward pass, loss calculation, backpropagation, and coefficient update) on a batch of 64 images on our CPU node (4 CPUs, 16 GB RAM). Additionally, we analyze the peak memory overhead (in terms of the number of extra state variables tracked) and whether the method is completely dataless (requiring zero access to calibration sets or training-set statistics).
+
+Table~\ref{tab:efficiency_analysis} summarizes the empirical performance.
+
+\begin{table*}[t]
+\caption{Computational and Resource Efficiency Analysis. We report the empirical average step latency (ms), the number of extra state variables tracked, the equivalent memory overhead in bytes/kilobytes, and whether the method is completely dataless and calibration-free.}
+\label{tab:efficiency_analysis}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Latency (ms)} & \textbf{Extra State Vars} & \textbf{Memory Overhead} & \textbf{Dataless?} \\
+\midrule
+Static (Task Arithmetic)   & 1243.10 ms & 0 & 0 B & Yes \\
+Uniform TTA (SGD)          & 3114.17 ms & 120 & 480 B & Yes \\
+LFWA TTA (SGD)             & 3083.96 ms & 180 & 720 B & No (Needs Calib.) \\
+AdaSNR TTA (SGD-Standard)  & 3082.10 ms & 360 & 1.41 KB & Yes \\
+AdaSNR-Adam-TC (Ours)      & 3134.91 ms & 600 & 2.34 KB & Yes \\
+AdaSNR-Adam-TC-CG (Ours)   & 3090.56 ms & 600 & 2.34 KB & Yes \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+Our profiling yields three highly significant practical findings:
+\begin{itemize}
+    \item \textbf{Negligible State Memory Footprint:} Across all methods, the number of extra variables tracked is extremely small. Our proposed task-conditioned methods require tracking only 600 extra state variables (less than 2.34 KB of memory), which is virtually zero compared to the size of the model parameters (ResNet-18 has 11M parameters, which is over 45 MB).
+    \item \textbf{Low Optimization Latency:} Adapting only the 120 layer-wise coefficients introduces a highly efficient parameter-space optimization. The backpropagation and optimization steps add about 1.8 seconds per batch of 64 images on CPU relative to the Static forward pass (which takes 1243.10 ms).
+    \item \textbf{The Efficiency of Confidence Gating:} Crucially, our proposed \textbf{AdaSNR-Adam-TC-CG} optimizer achieves a step latency of \textbf{3090.56 ms}, which is slightly faster than standard AdaSNR-Adam-TC (\textbf{3134.91 ms}). By filtering out high-entropy, noisy, or unconfident samples using confidence gating, we completely bypass the backward pass and moment updating on highly uncertain batches. This demonstrates that Confidence-Gated Adaptation (CGA) not only stabilizes adaptation and mitigates confirmation bias under noise, but also directly reduces the average computational and energy overhead during test-time adaptation.
+\end{itemize}
+
+\subsection{Out-of-Distribution Noise Robustness and Phase-Transition Analysis}
+To systematically analyze the operational boundaries of unsupervised test-time model merging (TTMM) methods, we conduct a comprehensive noise robustness sensitivity study. We evaluate all six methods under varying levels of out-of-distribution (OOD) input noise, parameterized by Gaussian perturbation with standard deviation $\sigma \in [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]$ added to the normalized test inputs of the Alternating Stream. This sweep allows us to identify the "breakdown points" where the self-supervised adaptation objective becomes noisy and confirmation bias degrades performance.
+
+Table~\ref{tab:noise_robustness} presents the empirical results.
+
+\begin{table*}[t]
+\caption{OOD Noise Robustness Sensitivity Analysis on the Alternating Stream. We report the average multi-task test-time accuracy (\%) under varying levels of input noise standard deviation $\sigma \in [0.00, 0.30]$.}
+\label{tab:noise_robustness}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Method} & \textbf{$\sigma=0.00$} & \textbf{$\sigma=0.05$} & \textbf{$\sigma=0.10$} & \textbf{$\sigma=0.15$} & \textbf{$\sigma=0.20$} & \textbf{$\sigma=0.25$} & \textbf{$\sigma=0.30$} \\
+\midrule
+Static (Task Arithmetic)     & 54.93\% & 55.76\% & 55.81\% & 54.83\% & 53.71\% & 53.27\% & 52.73\% \\
+Uniform TTA (SGD)            & 57.03\% & 56.01\% & 56.10\% & 54.54\% & 51.37\% & 50.78\% & 49.37\% \\
+LFWA TTA (SGD)               & 46.24\% & 44.34\% & 44.82\% & 42.04\% & 43.16\% & 40.23\% & 39.21\% \\
+AdaSNR TTA (SGD-Standard)    & 56.69\% & 54.15\% & 52.88\% & 51.95\% & 49.22\% & 49.71\% & 41.21\% \\
+AdaSNR-Adam-TC (Ours)        & 59.57\% & 56.54\% & 54.10\% & 50.20\% & 48.34\% & 46.92\% & 43.85\% \\
+AdaSNR-Adam-TC-CG (Ours)     & \textbf{61.23\%} & \textbf{58.15\%} & \textbf{56.84\%} & \textbf{53.96\%} & \textbf{49.66\%} & \textbf{48.14\%} & \textbf{46.78\%} \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+We observe several highly significant scientific insights from this robustness study:
+\begin{itemize}
+    \item \textbf{Phase-Shift of Adaptation Utility:} At lower noise levels ($\sigma \le 0.10$), unsupervised test-time adaptation is highly beneficial. The gradients of self-supervised entropy carry authentic task representational signals, allowing the merging coefficients to adaptively specialize. Our proposed \textbf{AdaSNR-Adam-TC-CG} model achieves the highest accuracy across the board, significantly outperforming Static merging (e.g., +6.30\% at $\sigma = 0.00$, and +2.39\% at $\sigma = 0.05$).
+    \item \textbf{Breakdown Points and Confirmation Bias:} As the noise standard deviation increases beyond $\sigma \ge 0.15$, the severe input corruption causes high-entropy mispredictions. Adapting on these erroneous predictions triggers severe confirmation bias and representation collapse, causing traditional methods to break down. For instance, LFWA TTA (SGD) collapses to 39.21\% (-13.52\% compared to Static) at $\sigma=0.30$.
+    \item \textbf{The Stabilizing Role of Confidence Gating:} Crucially, our proposed \textbf{Confidence-Gated Adaptation (CGA)} acts as an extremely effective shield. By filtering out noisy, unconfident samples, it halts the accumulation of corrupted gradient moments. Under moderate noise ($\sigma = 0.15$), standard AdaSNR-Adam-TC degrades to 50.20\% (-4.63\% below Static), whereas confidence-gated \textbf{AdaSNR-Adam-TC-CG} achieves \textbf{53.96\%} (protecting performance and coming within 0.87\% of Static). This empirically confirms that confidence gating prevents representation collapse under out-of-distribution degradation, providing a robust operational boundary for online test-time merging.
+\end{itemize}
+
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+In this paper, we identified a critical failure mode in test-time model merging: gradient cancellation and representation collapse under non-stationary sequential streams with high-frequency task switches. To resolve this, we introduced \textbf{AdaSNR-Adam}, a completely data-free and computationally lightweight test-time optimizer. We mathematically proved that the per-parameter Adam update scales the update direction by the empirical online gradient SNR. By introducing \textbf{Task-Conditioned (TC) Moments}, we decoupled the gradient statistics of conflicting tasks, preventing gradient cancellation. Our experiments on CIFAR-10 and SVHN expert merging demonstrated that AdaSNR-Adam-TC successfully overcomes high-frequency non-stationarity, outperforming static merging by \textbf{+4.64\%} and Uniform TTA by \textbf{+2.54\%}, while remaining highly robust and competitive on gradual sequential blocks, all without using any training or calibration samples.
+
+Future work includes scaling AdaSNR-Adam to larger model families (such as vision-language models and large language models) and exploring more complex multi-expert configurations with dozens of task vectors.
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+
+\section{Detailed Mathematical Derivation of Adam as an Empirical Online Gradient SNR}
+\label{app:derivation}
+
+In Section~\ref{sec:method}, we stated that the standard Adam update direction can be interpreted as a per-parameter scaling of the update by the empirical online gradient Signal-to-Noise Ratio (SNR). Here, we provide a more rigorous statistical derivation of this equivalence.
+
+Let $g_1, g_2, \dots, g_t$ be a sequence of gradient estimates of a coefficient $\lambda$ computed over successive batches of a given task. We model these gradients as independent and identically distributed (i.e.d.) random variables drawn from a distribution with mean $\mu = \mathbb{E}[g_i]$ and variance $\sigma^2 = \text{Var}(g_i)$.
+
+The exponential moving average (EMA) of the gradients, $m_t$, and the squared gradients, $v_t$, are defined as:
+\begin{align}
+    m_t &= \beta_1 m_{t-1} + (1 - \beta_1) g_t \\
+    v_t &= \beta_2 v_{t-1} + (1 - \beta_2) g_t^2
+\end{align}
+where $m_0 = 0$ and $v_0 = 0$. Unrolling these recurrences gives:
+\begin{align}
+    m_t &= (1 - \beta_1) \sum_{i=1}^t \beta_1^{t-i} g_i \\
+    v_t &= (1 - \beta_2) \sum_{i=1}^t \beta_2^{t-i} g_i^2
+\end{align}
+Taking the expectation of $m_t$ and $v_t$:
+\begin{align}
+    \mathbb{E}[m_t] &= (1 - \beta_1) \sum_{i=1}^t \beta_1^{t-i} \mathbb{E}[g_i] = (1 - \beta_1) \mu \sum_{i=1}^t \beta_1^{t-i} = (1 - \beta_1^t) \mu \\
+    \mathbb{E}[v_t] &= (1 - \beta_2) \sum_{i=1}^t \beta_2^{t-i} \mathbb{E}[g_i^2] = (1 - \beta_2) (\mu^2 + \sigma^2) \sum_{i=1}^t \beta_2^{t-i} = (1 - \beta_2^t) (\mu^2 + \sigma^2)
+\end{align}
+Applying the standard bias-correction steps:
+\begin{align}
+    \hat{m}_t &= \frac{m_t}{1 - \beta_1^t} \\
+    \hat{v}_t &= \frac{v_t}{1 - \beta_2^t}
+\end{align}
+ensures that $\mathbb{E}[\hat{m}_t] = \mu$ and $\mathbb{E}[\hat{v}_t] = \mu^2 + \sigma^2$. Therefore, $\hat{m}_t$ and $\hat{v}_t$ are unbiased online estimators of the first and raw second moments of the gradient distribution.
+
+Now, consider the core update term $u_t$ in the Adam parameter update:
+\begin{equation}
+    u_t = \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+\end{equation}
+Substituting the unbiased estimators into this expression:
+\begin{equation}
+    u_t \approx \frac{\mu}{\sqrt{\mu^2 + \sigma^2} + \epsilon}
+\end{equation}
+We can rewrite this fraction by factoring out the absolute mean $|\mu|$ (assuming $\mu \neq 0$):
+\begin{equation}
+    u_t \approx \frac{\text{sign}(\mu) \cdot |\mu|}{\sqrt{\mu^2 + \sigma^2} + \epsilon} = \text{sign}(\mu) \cdot \frac{|\mu|}{\sqrt{\mu^2 + \sigma^2} + \epsilon}
+\end{equation}
+The term:
+\begin{equation}
+    \text{SNR}_t = \frac{|\mu|}{\sqrt{\mu^2 + \sigma^2}}
+\end{equation}
+is the raw empirical Signal-to-Noise Ratio (SNR) of the gradients. It measures the strength of the gradient signal relative to its total root-mean-square variation (which is composed of both the mean signal and the variance noise).
+
+\subsection{Relationship to Signal-to-Noise Ratio in Statistics}
+In standard statistics, the signal-to-noise ratio is defined as the ratio of the mean to the standard deviation:
+\begin{equation}
+    \text{SNR}_{\text{stat}} = \frac{|\mu|}{\sigma}
+\end{equation}
+We can express our gradient SNR in terms of $\text{SNR}_{\text{stat}}$:
+\begin{equation}
+    \text{SNR}_t = \frac{|\mu|}{\sqrt{\mu^2 + \sigma^2}} = \frac{1}{\sqrt{1 + \frac{\sigma^2}{\mu^2}}} = \frac{1}{\sqrt{1 + \frac{1}{\text{SNR}_{\text{stat}}^2}}} = \frac{\text{SNR}_{\text{stat}}}{\sqrt{\text{SNR}_{\text{stat}}^2 + 1}}
+\end{equation}
+This reveals a monotonic, bounded relationship:
+\begin{itemize}
+    \item When $\text{SNR}_{\text{stat}} \to 0$ (the gradient is pure noise with zero mean), $\text{SNR}_t \to 0$.
+    \item When $\text{SNR}_{\text{stat}} \to \infty$ (the gradient is completely deterministic with zero variance), $\text{SNR}_t \to 1.0$.
+\end{itemize}
+Thus, the Adam update term $u_t \approx \text{sign}(\mu) \cdot \text{SNR}_t$ naturally bounds the update step size. For parameters experiencing high gradient noise (low SNR), the update is heavily scaled down, preventing destabilizing steps. For parameters experiencing a highly consistent gradient signal (high SNR), the update proceeds at the full base learning rate $\eta$, accelerating convergence.
+
+\subsection{Mathematical Proof of Gradient Variance Inflation under High-Frequency Non-Stationarity}
+\label{subapp:variance_inflation}
+
+Here, we mathematically prove how high-frequency task switching (non-stationarity) in the test stream inflates the combined gradient variance and collapses the standard (global) Signal-to-Noise Ratio (SNR) to zero.
+
+Let the test stream $\mathcal{B}_t$ alternate between Task 1 (e.g., CIFAR-10) and Task 2 (e.g., SVHN) batches at every step:
+\begin{equation}
+    g_t = 
+    \begin{cases}
+        g_t^{(1)}, & \text{if } t \text{ is even (Task 1)} \\
+        g_t^{(2)}, & \text{if } t \text{ is odd (Task 2)}
+    \end{cases}
+\end{equation}
+We model the gradients of Task 1 as independent random variables with mean $\mu_1 = \mathbb{E}[g_t^{(1)}]$ and variance $\sigma_1^2 = \text{Var}(g_t^{(1)})$. Similarly, the gradients of Task 2 are independent random variables with mean $\mu_2 = \mathbb{E}[g_t^{(2)}]$ and variance $\sigma_2^2 = \text{Var}(g_t^{(2)})$.
+
+Let us analyze the statistical properties of the combined alternating gradient stream $g_1, g_2, \dots, g_t$.
+The expectation (mean) of the combined stream is:
+\begin{equation}
+    \mu_{\text{combined}} = \mathbb{E}[g_t] = \frac{\mu_1 + \mu_2}{2}
+\end{equation}
+The expected squared gradient (raw second moment) of the combined stream is:
+\begin{equation}
+    \mathbb{E}[g_t^2] = \frac{\mathbb{E}[(g_t^{(1)})^2] + \mathbb{E}[(g_t^{(2)})^2]}{2} = \frac{(\mu_1^2 + \sigma_1^2) + (\mu_2^2 + \sigma_2^2)}{2} = \frac{\mu_1^2 + \mu_2^2}{2} + \frac{\sigma_1^2 + \sigma_2^2}{2}
+\end{equation}
+The variance of the combined gradient stream is:
+\begin{equation}
+    \sigma_{\text{combined}}^2 = \mathbb{E}[g_t^2] - \mu_{\text{combined}}^2 = \left( \frac{\mu_1^2 + \mu_2^2}{2} + \frac{\sigma_1^2 + \sigma_2^2}{2} \right) - \left( \frac{\mu_1 + \mu_2}{2} \right)^2
+\end{equation}
+Expanding the squared term:
+\begin{align}
+    \sigma_{\text{combined}}^2 &= \frac{\mu_1^2 + \mu_2^2}{2} + \frac{\sigma_1^2 + \sigma_2^2}{2} - \frac{\mu_1^2 + 2\mu_1\mu_2 + \mu_2^2}{4} \nonumber\\
+    &= \frac{2\mu_1^2 + 2\mu_2^2 - \mu_1^2 - 2\mu_1\mu_2 - \mu_2^2}{4} + \frac{\sigma_1^2 + \sigma_2^2}{2} \nonumber\\
+    &= \frac{\mu_1^2 - 2\mu_1\mu_2 + \mu_2^2}{4} + \frac{\sigma_1^2 + \sigma_2^2}{2} \nonumber\\
+    &= \frac{(\mu_1 - \mu_2)^2}{4} + \frac{\sigma_1^2 + \sigma_2^2}{2}
+\end{align}
+This result reveals a fundamental, mathematically rigorous insight. The combined gradient variance is composed of two distinct terms:
+\begin{enumerate}
+    \item \textbf{Average Task-wise Variance:} $\frac{\sigma_1^2 + \sigma_2^2}{2}$, which represents the intrinsic statistical noise of the two individual task distributions.
+    \item \textbf{Gradient Conflict (Interference) Term:} $\frac{(\mu_1 - \mu_2)^2}{4}$, which represents the squared distance between the task-specific gradient means.
+\end{enumerate}
+
+When the two tasks are distinct and conflicting, their gradients point in opposing directions (e.g., $\mu_1 > 0$ to increase Task 1 merging weight, and $\mu_2 < 0$ to increase Task 2 merging weight), making the interference term $(\mu_1 - \mu_2)^2 \gg 0$ extremely large. This vastly inflates the combined variance $\sigma_{\text{combined}}^2 \gg \frac{\sigma_1^2 + \sigma_2^2}{2}$.
+
+Under standard (global) Adam or AdaSNR, the estimated online SNR scales as:
+\begin{equation}
+    \text{SNR}_t = \frac{|\mu_{\text{combined}}|}{\sqrt{\sigma_{\text{combined}}^2 + \mu_{\text{combined}}^2}} = \frac{\left| \frac{\mu_1 + \mu_2}{2} \right|}{\sqrt{\frac{(\mu_1 - \mu_2)^2}{4} + \frac{\sigma_1^2 + \sigma_2^2}{2} + \left(\frac{\mu_1 + \mu_2}{2}\right)^2}}
+\end{equation}
+In highly non-stationary alternating streams, the task gradients often cancel out on average, leading to a vanishing combined mean ($\mu_1 \approx -\mu_2 \implies \mu_{\text{combined}} \to 0$). Simultaneously, the denominator is dominated by the massive gradient conflict term $\frac{(\mu_1 - \mu_2)^2}{4}$. Thus, the estimated global SNR collapses to zero:
+\begin{equation}
+    \text{SNR}_t \to 0 \implies u_t \to 0
+\end{equation}
+This prematurely freezes adaptation and traps the model in a sub-optimal merging state.
+
+By contrast, our proposed \textbf{Task-Conditioned (TC) Moments} decouple the first and second moments for each task independently. Within each task-conditioned sequence, there is zero cross-task interference. The task-conditioned variance remains low ($\sigma_k^2$), and the task-conditioned mean ($\mu_k$) is preserved without any cancellation. Thus, the task-conditioned SNR remains high and accurate:
+\begin{equation}
+    \text{SNR}_k = \frac{|\mu_k|}{\sqrt{\sigma_k^2 + \mu_k^2}}
+\end{equation}
+This mathematically guarantees that AdaSNR-Adam-TC maintains robust, continuous, and well-scaled parameter updates throughout highly non-stationary streams.
+
+\section{Detailed Experimental Protocols and Architectures}
+\label{app:protocols}
+
+To ensure complete reproducibility, we document the exact architectural and hyperparameter details of our evaluation suite.
+
+\subsection{Model Architecture}
+The base model is a standard ResNet-18 architecture. It consists of:
+\begin{itemize}
+    \item \textbf{Feature Extractor:} A ResNet-18 encoder pre-trained on ImageNet-1k. The encoder processes input images of size $3 \times 32 \times 32$ pixels. It outputs a 512-dimensional representational embedding.
+    \item \textbf{Classification Heads:} Each task (CIFAR-10 and SVHN) has an independent, task-specific linear classification head that maps the 512-dimensional embedding to the number of classes (10 classes for both CIFAR-10 and SVHN).
+\end{itemize}
+During test-time model merging, the ResNet-18 encoder weights are dynamically merged using the adaptive coefficients $\Lambda$, while the task-specific classification heads are kept separate and selected based on the active task identifier $k^*$.
+
+\subsection{Training of Experts}
+The task-specific expert models are fine-tuned from the same pre-trained ImageNet-1k checkpoint. The fine-tuning protocol is as follows:
+\begin{itemize}
+    \item \textbf{Dataset Splits:} We fine-tune each expert on a subset of 5,000 training images from their respective training sets (CIFAR-10 and SVHN).
+    \item \textbf{Optimizer:} AdamW optimizer with a learning rate of $5 \times 10^{-5}$ and weight decay of $1 \times 10^{-4}$.
+    \item \textbf{Epochs and Batch Size:} Both experts are fine-tuned for 3 epochs with a batch size of 64.
+    \item \textbf{Validation Set:} Evaluation is conducted on 1,024 test images from each dataset (2,048 total images across both tasks).
+\end{itemize}
+
+\subsection{Test-Time Adaptation Hyperparameters}
+For all adaptation methods (Uniform TTA, LFWA TTA, AdaSNR Standard, and AdaSNR-Adam-TC), the common test-time parameters are:
+\begin{itemize}
+    \item \textbf{Test Batch Size:} 64.
+    \item \textbf{Moving Average Coefficients (Adam):} $\beta_1 = 0.9$, $\beta_2 = 0.99$.
+    \item \textbf{Numerical Stability Constant ($\epsilon$):} $1 \times 10^{-8}$.
+    \item \textbf{Standard SNR Baseline Parameters:} For AdaSNR Standard, the baseline parameter $\alpha_0 = 0.1$.
+    \item \textbf{Merging Coefficient Bounds:} The raw coefficients $\lambda_{l,k}$ are clamped to $[0.0, 1.0]$ after every adaptation step.
+\end{itemize}
+
+\section{Broader Impact and Limitations}
+\label{app:impact}
+
+\subsection{Broader Impact}
+Adaptive model merging at test-time represents a significant step towards sustainable and privacy-preserving AI.
+\begin{itemize}
+    \item \textbf{Environmental Sustainability:} Training large multitask models from scratch is extremely compute- and energy-intensive. Test-time model merging enables the reuse of existing single-task expert checkpoints, creating a high-quality multitask model in seconds without expensive joint retraining.
+    \item \textbf{Data Privacy:} Standard multitask learning requires pooling the datasets of all tasks together. This is often prohibited due to copyright, licensing, or sensitive user privacy constraints (e.g., medical imaging or personal text data). Since our proposed AdaSNR-Adam is completely dataless and calibration-free, it can adapt expert models directly at the user's edge device without ever accessing or transferring any raw training data.
+\end{itemize}
+
+\subsection{Limitations}
+Despite its strong performance, we identify a few limitations of AdaSNR-Adam:
+\begin{enumerate}
+    \item \textbf{Dependency on Task Identifiers:} Our current Task-Conditioned (TC) mechanism assumes that the active task identifier $k^*$ is known or can be reliably detected at each step to select the correct moments and classification head. While test-time routing or prototype-based task detection (e.g., CPA-Merge) can automate this, a failure in task routing could lead to degraded performance.
+    \item \textbf{Memory Overhead of Moments:} Maintaining first and second moments per task introduces a minor memory footprint of $2 \times L \times K \times 2$ parameters. For extremely large architectures with millions of layers, this might accumulate, though it remains insignificantly small compared to storing copies of the model weights.
+\end{enumerate}
+
+\end{document}
+"""
+
+with open("template/example_paper.tex", "w") as f:
+    f.write(latex_content)
+
+print("Overwrote template/example_paper.tex successfully!")

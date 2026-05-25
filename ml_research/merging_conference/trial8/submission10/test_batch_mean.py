@@ -1,0 +1,110 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Same architecture
+class SharedBackbone(nn.Module):
+    def __init__(self):
+        super(SharedBackbone, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.fc = nn.Linear(32 * 7 * 7, 128)
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+class ExpertHead(nn.Module):
+    def __init__(self):
+        super(ExpertHead, self).__init__()
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, 10)
+        
+    def forward(self, feats):
+        return self.fc2(self.relu(feats))
+
+def train_shared_moe(mnist_dataset, kmnist_dataset, epochs=2):
+    backbone = SharedBackbone()
+    mnist_head = ExpertHead()
+    kmnist_head = ExpertHead()
+    optimizer = optim.Adam(
+        list(backbone.parameters()) + list(mnist_head.parameters()) + list(kmnist_head.parameters()),
+        lr=0.003
+    )
+    criterion = nn.CrossEntropyLoss()
+    indices = list(range(12000))
+    mnist_loader = DataLoader(Subset(mnist_dataset, indices), batch_size=256, shuffle=True)
+    kmnist_loader = DataLoader(Subset(kmnist_dataset, indices), batch_size=256, shuffle=True)
+    backbone.train()
+    mnist_head.train()
+    kmnist_head.train()
+    for epoch in range(epochs):
+        for (x_m, y_m), (x_k, y_k) in zip(mnist_loader, kmnist_loader):
+            optimizer.zero_grad()
+            feats_m = backbone(x_m)
+            out_m = mnist_head(feats_m)
+            loss_m = criterion(out_m, y_m)
+            feats_k = backbone(x_k)
+            out_k = kmnist_head(feats_k)
+            loss_k = criterion(out_k, y_k)
+            loss = loss_m + loss_k
+            loss.backward()
+            optimizer.step()
+    return backbone, mnist_head, kmnist_head
+
+if __name__ == "__main__":
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    mnist_train = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    kmnist_train = datasets.KMNIST(root='./data', train=True, download=True, transform=transform)
+    fmnist_test = datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
+    mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    kmnist_test = datasets.KMNIST(root='./data', train=False, download=True, transform=transform)
+    
+    backbone, mnist_head, kmnist_head = train_shared_moe(mnist_train, kmnist_train, epochs=2)
+    backbone.eval()
+    mnist_head.eval()
+    kmnist_head.eval()
+    
+    # Compute initial prototypes and calibration distances for both methods
+    mnist_cal_loader = DataLoader(Subset(mnist_train, list(range(500))), batch_size=500, shuffle=False)
+    kmnist_cal_loader = DataLoader(Subset(kmnist_train, list(range(500))), batch_size=500, shuffle=False)
+    with torch.no_grad():
+        for x, _ in mnist_cal_loader:
+            mnist_feats = backbone(x)
+            proto_mnist = mnist_feats.mean(dim=0)
+            # Individual sample distance
+            indiv_cal_mnist = torch.mean(torch.norm(mnist_feats - proto_mnist, dim=1)).item()
+            # Batch mean distance (using subsets of size 128 to simulate stream batch size)
+            batch_means = []
+            for start_idx in range(0, 500-128, 50):
+                batch_means.append(mnist_feats[start_idx:start_idx+128].mean(dim=0))
+            mean_cal_mnist = torch.mean(torch.stack([torch.norm(bm - proto_mnist) for bm in batch_means])).item()
+            
+        for x, _ in kmnist_cal_loader:
+            kmnist_feats = backbone(x)
+            proto_kmnist = kmnist_feats.mean(dim=0)
+            indiv_cal_kmnist = torch.mean(torch.norm(kmnist_feats - proto_kmnist, dim=1)).item()
+            batch_means = []
+            for start_idx in range(0, 500-128, 50):
+                batch_means.append(kmnist_feats[start_idx:start_idx+128].mean(dim=0))
+            mean_cal_kmnist = torch.mean(torch.stack([torch.norm(bm - proto_kmnist) for bm in batch_means])).item()
+            
+    print(f"MNIST Proto Norm: {torch.norm(proto_mnist).item():.4f} | KMNIST Proto Norm: {torch.norm(proto_kmnist).item():.4f}")
+    print(f"Indiv Calibration Dist - MNIST: {indiv_cal_mnist:.4f} | KMNIST: {indiv_cal_kmnist:.4f}")
+    print(f"Mean Calibration Dist  - MNIST: {mean_cal_mnist:.4f} | KMNIST: {mean_cal_kmnist:.4f}")

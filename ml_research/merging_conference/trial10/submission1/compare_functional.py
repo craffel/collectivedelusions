@@ -1,0 +1,395 @@
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from run_experiments import SimpleCNN, clone_model, fuse_bn_stats, compute_hoyer_sparsity, compute_prototypes
+from torch.func import functional_call
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running compare_functional on device: {device}")
+    
+    # Load datasets
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+    mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    fashion_test = datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
+    kmnist_test = datasets.KMNIST(root='./data', train=False, download=True, transform=transform)
+    
+    # Load expert models
+    expert_mnist_std = SimpleCNN(use_cosface=False)
+    expert_fashion_std = SimpleCNN(use_cosface=False)
+    expert_mnist_cos = SimpleCNN(use_cosface=True)
+    expert_fashion_cos = SimpleCNN(use_cosface=True)
+    
+    expert_mnist_std.load_state_dict(torch.load("mnist_std.pth", map_location=device))
+    expert_fashion_std.load_state_dict(torch.load("fashion_std.pth", map_location=device))
+    expert_mnist_cos.load_state_dict(torch.load("mnist_cos.pth", map_location=device))
+    expert_fashion_cos.load_state_dict(torch.load("fashion_cos.pth", map_location=device))
+    
+    expert_mnist_std.eval().to(device)
+    expert_fashion_std.eval().to(device)
+    expert_mnist_cos.eval().to(device)
+    expert_fashion_cos.eval().to(device)
+    
+    # Precompute prototypes
+    test_loader_mnist_init = torch.utils.data.DataLoader(mnist_test, batch_size=128, shuffle=False)
+    test_loader_fashion_init = torch.utils.data.DataLoader(fashion_test, batch_size=128, shuffle=False)
+    
+    proto_mnist_std = compute_prototypes(expert_mnist_std, test_loader_mnist_init, device)
+    proto_fashion_std = compute_prototypes(expert_fashion_std, test_loader_fashion_init, device)
+    proto_mnist_cos = compute_prototypes(expert_mnist_cos, test_loader_mnist_init, device)
+    proto_fashion_cos = compute_prototypes(expert_fashion_cos, test_loader_fashion_init, device)
+    
+    # Construct stream
+    stream_batches = []
+    test_loader_mnist = torch.utils.data.DataLoader(mnist_test, batch_size=64, shuffle=True, generator=torch.Generator().manual_seed(101))
+    test_loader_fashion = torch.utils.data.DataLoader(fashion_test, batch_size=64, shuffle=True, generator=torch.Generator().manual_seed(102))
+    test_loader_kmnist = torch.utils.data.DataLoader(kmnist_test, batch_size=64, shuffle=True, generator=torch.Generator().manual_seed(103))
+    
+    mnist_iter = iter(test_loader_mnist)
+    fashion_iter = iter(test_loader_fashion)
+    kmnist_iter = iter(test_loader_kmnist)
+    
+    for _ in range(10):
+        images, labels = next(mnist_iter)
+        stream_batches.append(("Clean MNIST", images, labels))
+    for _ in range(10):
+        images, labels = next(mnist_iter)
+        noise = torch.randn_like(images) * 0.6
+        images_noisy = torch.clamp(images + noise, -1.0, 1.0)
+        stream_batches.append(("Noisy MNIST", images_noisy, labels))
+    for _ in range(10):
+        images, labels = next(fashion_iter)
+        stream_batches.append(("Clean FashionMNIST", images, labels))
+    for _ in range(10):
+        images, labels = next(fashion_iter)
+        noise = torch.randn_like(images) * 0.6
+        images_noisy = torch.clamp(images + noise, -1.0, 1.0)
+        stream_batches.append(("Noisy FashionMNIST", images_noisy, labels))
+    for _ in range(10):
+        images, labels = next(kmnist_iter)
+        stream_batches.append(("Novel KMNIST", images, labels))
+
+    def entropy_loss_fn(outputs):
+        probs = F.softmax(outputs, dim=1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-7), dim=1)
+        return torch.mean(entropy)
+
+    methods = ["Method E (Corrected SOTA)", "Method F (Corrected Ours)"]
+    method_accuracies = {m: [] for m in methods}
+
+    # Running Method E with corrected backprop
+    print("\n--- Running Method E (Corrected BK-AHR SOTA) ---")
+    for b_idx, (phase, images, labels) in enumerate(stream_batches):
+        images, labels = images.to(device), labels.to(device)
+        
+        # Sparsity estimation & Hybrid routing
+        images_pos = (images + 1.0) / 2.0
+        images_denoised = torch.where(images_pos > 0.35, images_pos, torch.tensor(0.0, device=device))
+        h_sparsity = compute_hoyer_sparsity(images_denoised)
+        
+        is_sparse = h_sparsity >= 0.50
+        if is_sparse:
+            exp0, exp1 = expert_mnist_std, expert_fashion_std
+            p0, p1 = proto_mnist_std, proto_fashion_std
+            eps_base = 0.08
+        else:
+            exp0, exp1 = expert_mnist_cos, expert_fashion_cos
+            p0, p1 = proto_mnist_cos, proto_fashion_cos
+            eps_base = 0.04
+            
+        feat0 = exp0(images, return_features=True)
+        feat1 = exp1(images, return_features=True)
+        if not is_sparse:
+            feat0 = F.normalize(feat0, p=2, dim=1)
+            feat1 = F.normalize(feat1, p=2, dim=1)
+            
+        d0 = torch.mean(torch.stack([torch.min(torch.norm(f - p0, dim=1)) for f in feat0])).item()
+        d1 = torch.mean(torch.stack([torch.min(torch.norm(f - p1, dim=1)) for f in feat1])).item()
+        gap = abs(d0 - d1)
+        
+        with torch.no_grad():
+            ent0 = entropy_loss_fn(exp0(images)).item()
+            ent1 = entropy_loss_fn(exp1(images)).item()
+            h_avg = (ent0 + ent1) / 2.0
+            
+        eps_stab = eps_base / (1.0 + 2.0 * h_avg)
+        tau = gap / 3.0 + eps_stab
+        
+        w0 = np.exp(-d0 / tau)
+        w1 = np.exp(-d1 / tau)
+        w0, w1 = w0 / (w0 + w1), w1 / (w0 + w1)
+        
+        merged = clone_model(exp0)
+        state_merged = merged.state_dict()
+        state0 = exp0.state_dict()
+        state1 = exp1.state_dict()
+        for key in state_merged:
+            if "weight" in key or "bias" in key:
+                state_merged[key] = (1.0 - w1) * state0[key] + w1 * state1[key]
+        merged.load_state_dict(state_merged)
+        fuse_bn_stats(exp0, exp1, merged, w1)
+        
+        # Sensitivity estimation
+        merged.zero_grad()
+        out_init = merged(images)
+        loss_init = entropy_loss_fn(out_init)
+        loss_init.backward()
+        
+        F_sens = {}
+        total_F = 0.0
+        for name, param in merged.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                F_sens[name] = torch.mean(param.grad ** 2).item()
+                total_F += F_sens[name]
+            else:
+                F_sens[name] = 1e-5
+        F_tilde = {name: F_sens[name] / (total_F + 1e-7) for name in F_sens}
+        
+        global_w = torch.tensor(np.log(w1 / (w0 + 1e-7)), requires_grad=True, device=device)
+        offsets = {name: torch.zeros(1, requires_grad=True, device=device) for name, _ in merged.named_parameters() if _.requires_grad}
+        
+        # 5 step standard TTA with correct functional_call
+        for step in range(5):
+            if global_w.grad is not None:
+                global_w.grad.zero_()
+            for name in offsets:
+                if offsets[name].grad is not None:
+                    offsets[name].grad.zero_()
+                    
+            lam_global = torch.sigmoid(global_w)
+            params_dict = {}
+            for name, param in merged.named_parameters():
+                if name in offsets:
+                    lam_j = torch.sigmoid(global_w + offsets[name])
+                    params_dict[name] = (1.0 - lam_j) * state0[name] + lam_j * state1[name]
+                    
+            fuse_bn_stats(exp0, exp1, merged, lam_global.item())
+            
+            out = functional_call(merged, params_dict, (images,))
+            l_ent = entropy_loss_fn(out)
+            l_prior = 0.1 * (lam_global * torch.log(lam_global / w1) + (1.0 - lam_global) * torch.log((1.0 - lam_global) / w0))
+            l_coherence = sum([0.05 * F_tilde[name] * torch.sum(offsets[name] ** 2) for name in offsets])
+            total_loss = l_ent + l_prior + l_coherence
+            total_loss.backward()
+            
+            with torch.no_grad():
+                global_w -= 0.05 * global_w.grad
+                for name in offsets:
+                    precond_lr = 0.05 / (F_tilde[name] + 0.02)
+                    offsets[name] -= precond_lr * offsets[name].grad
+                    
+        # Final optimal merged model
+        with torch.no_grad():
+            lam_global = torch.sigmoid(global_w)
+            state_m = merged.state_dict()
+            for name in state_m:
+                if name in offsets:
+                    lam_j = torch.sigmoid(global_w + offsets[name])
+                    state_m[name] = (1.0 - lam_j) * state0[name] + lam_j * state1[name]
+            merged.load_state_dict(state_m)
+            fuse_bn_stats(exp0, exp1, merged, lam_global.item())
+            
+        merged.eval()
+        with torch.no_grad():
+            out = merged(images)
+            _, pred = out.max(1)
+            acc = pred.eq(labels).sum().item() / labels.size(0) * 100.0
+            method_accuracies["Method E (Corrected SOTA)"].append(acc)
+
+
+    # Running Method F (Corrected Ours) with hparams: eta=0.03, rho=0.02, alpha_type='orig'
+    print("\n--- Running Method F (Corrected Ours) ---")
+    for b_idx, (phase, images, labels) in enumerate(stream_batches):
+        images, labels = images.to(device), labels.to(device)
+        
+        # Sparsity estimation & Hybrid routing
+        images_pos = (images + 1.0) / 2.0
+        images_denoised = torch.where(images_pos > 0.35, images_pos, torch.tensor(0.0, device=device))
+        h_sparsity = compute_hoyer_sparsity(images_denoised)
+        
+        is_sparse = h_sparsity >= 0.50
+        if is_sparse:
+            exp0, exp1 = expert_mnist_std, expert_fashion_std
+            p0, p1 = proto_mnist_std, proto_fashion_std
+            eps_base = 0.08
+        else:
+            exp0, exp1 = expert_mnist_cos, expert_fashion_cos
+            p0, p1 = proto_mnist_cos, proto_fashion_cos
+            eps_base = 0.04
+            
+        feat0 = exp0(images, return_features=True)
+        feat1 = exp1(images, return_features=True)
+        if not is_sparse:
+            feat0 = F.normalize(feat0, p=2, dim=1)
+            feat1 = F.normalize(feat1, p=2, dim=1)
+            
+        d0 = torch.mean(torch.stack([torch.min(torch.norm(f - p0, dim=1)) for f in feat0])).item()
+        d1 = torch.mean(torch.stack([torch.min(torch.norm(f - p1, dim=1)) for f in feat1])).item()
+        gap = abs(d0 - d1)
+        
+        with torch.no_grad():
+            ent0 = entropy_loss_fn(exp0(images)).item()
+            ent1 = entropy_loss_fn(exp1(images)).item()
+            h_avg = (ent0 + ent1) / 2.0
+            
+        eps_stab = eps_base / (1.0 + 2.0 * h_avg)
+        tau = gap / 3.0 + eps_stab
+        
+        w0 = np.exp(-d0 / tau)
+        w1 = np.exp(-d1 / tau)
+        w0, w1 = w0 / (w0 + w1), w1 / (w0 + w1)
+        
+        # Hyperparameters for SAM
+        eta_base = 0.05
+        rho_base = 0.02
+        alpha_t = max(0.05, 1.0 - 0.5 * h_avg)
+        eta_t = eta_base * alpha_t
+        rho_t = rho_base * alpha_t
+        
+        merged = clone_model(exp0)
+        state_merged = merged.state_dict()
+        state0 = exp0.state_dict()
+        state1 = exp1.state_dict()
+        for key in state_merged:
+            if "weight" in key or "bias" in key:
+                state_merged[key] = (1.0 - w1) * state0[key] + w1 * state1[key]
+        merged.load_state_dict(state_merged)
+        fuse_bn_stats(exp0, exp1, merged, w1)
+        
+        # Sensitivity estimation
+        merged.zero_grad()
+        out_init = merged(images)
+        loss_init = entropy_loss_fn(out_init)
+        loss_init.backward()
+        
+        F_sens = {}
+        total_F = 0.0
+        for name, param in merged.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                F_sens[name] = torch.mean(param.grad ** 2).item()
+                total_F += F_sens[name]
+            else:
+                F_sens[name] = 1e-5
+        F_tilde = {name: F_sens[name] / (total_F + 1e-7) for name in F_sens}
+        
+        w_global = torch.tensor(np.log(w1 / (w0 + 1e-7)), requires_grad=True, device=device)
+        offsets = {name: torch.zeros(1, requires_grad=True, device=device) for name, _ in merged.named_parameters() if _.requires_grad}
+        
+        # SAM steps
+        for step in range(5):
+            if w_global.grad is not None:
+                w_global.grad.zero_()
+            for name in offsets:
+                if offsets[name].grad is not None:
+                    offsets[name].grad.zero_()
+            
+            lam_global = torch.sigmoid(w_global)
+            params_dict = {}
+            for name, param in merged.named_parameters():
+                if name in offsets:
+                    lam_j = torch.sigmoid(w_global + offsets[name])
+                    params_dict[name] = (1.0 - lam_j) * state0[name] + lam_j * state1[name]
+                    
+            fuse_bn_stats(exp0, exp1, merged, lam_global.item())
+            out = functional_call(merged, params_dict, (images,))
+            
+            l_ent = entropy_loss_fn(out)
+            l_prior = 0.1 * (lam_global * torch.log(lam_global / w1) + (1.0 - lam_global) * torch.log((1.0 - lam_global) / w0))
+            l_coherence = sum([0.05 * F_tilde[name] * torch.sum(offsets[name] ** 2) for name in offsets])
+            total_loss = l_ent + l_prior + l_coherence
+            total_loss.backward()
+            
+            g_w = w_global.grad.clone()
+            g_offsets = {name: offsets[name].grad.clone() for name in offsets}
+            
+            if rho_t > 0:
+                d_w = g_w
+                d_offsets = {name: g_offsets[name] / (F_tilde[name] + 0.02) for name in offsets}
+                norm_sq = d_w.item()**2 + sum([torch.sum(d_offsets[name]**2).item() for name in offsets]) + 0.02
+                norm_D = np.sqrt(norm_sq)
+                
+                eps_w = rho_t * d_w / norm_D
+                eps_offsets = {name: rho_t * d_offsets[name] / norm_D for name in offsets}
+                
+                w_global_pert = w_global + eps_w
+                offsets_pert = {name: offsets[name] + eps_offsets[name] for name in offsets}
+                
+                lam_global_pert = torch.sigmoid(w_global_pert)
+                params_dict_pert = {}
+                for name, param in merged.named_parameters():
+                    if name in offsets:
+                        lam_j = torch.sigmoid(w_global_pert + offsets_pert[name])
+                        params_dict_pert[name] = (1.0 - lam_j) * state0[name] + lam_j * state1[name]
+                
+                fuse_bn_stats(exp0, exp1, merged, lam_global_pert.item())
+                out_pert = functional_call(merged, params_dict_pert, (images,))
+                
+                l_ent_pert = entropy_loss_fn(out_pert)
+                l_prior_pert = 0.1 * (lam_global_pert * torch.log(lam_global_pert / w1) + (1.0 - lam_global_pert) * torch.log((1.0 - lam_global_pert) / w0))
+                l_coherence_pert = sum([0.05 * F_tilde[name] * torch.sum(offsets_pert[name] ** 2) for name in offsets])
+                pert_loss = l_ent_pert + l_prior_pert + l_coherence_pert
+                
+                if w_global.grad is not None:
+                    w_global.grad.zero_()
+                for name in offsets:
+                    if offsets[name].grad is not None:
+                        offsets[name].grad.zero_()
+                        
+                pert_loss.backward()
+                g_w_final = w_global.grad.clone()
+                g_offsets_final = {name: offsets[name].grad.clone() for name in offsets}
+            else:
+                g_w_final = g_w
+                g_offsets_final = g_offsets
+                
+            with torch.no_grad():
+                w_global -= eta_t * g_w_final
+                for name in offsets:
+                    precond_lr = eta_t / (F_tilde[name] + 0.02)
+                    offsets[name] -= precond_lr * g_offsets_final[name]
+                    
+        with torch.no_grad():
+            lam_global = torch.sigmoid(w_global)
+            state_m = merged.state_dict()
+            for name in state_m:
+                if name in offsets:
+                    lam_j = torch.sigmoid(w_global + offsets[name])
+                    state_m[name] = (1.0 - lam_j) * state0[name] + lam_j * state1[name]
+            merged.load_state_dict(state_m)
+            fuse_bn_stats(exp0, exp1, merged, lam_global.item())
+            
+        merged.eval()
+        with torch.no_grad():
+            out = merged(images)
+            _, pred = out.max(1)
+            acc = pred.eq(labels).sum().item() / labels.size(0) * 100.0
+            method_accuracies["Method F (Corrected Ours)"].append(acc)
+
+    # Summary
+    print("\nSUMMARY OF CORRECTED GRADIENT FLOW METHODS:\n")
+    for m in methods:
+        accs = method_accuracies[m]
+        c_mnist = np.mean(accs[0:10])
+        n_mnist = np.mean(accs[10:20])
+        c_fashion = np.mean(accs[20:30])
+        n_fashion = np.mean(accs[30:40])
+        novel_k = np.mean(accs[40:50])
+        overall = np.mean(accs)
+        print(f"{m:<30} | CM: {c_mnist:.2f}% | NM: {n_mnist:.2f}% | CF: {c_fashion:.2f}% | NF: {n_fashion:.2f}% | NK: {novel_k:.2f}% | OVERALL: {overall:.4f}%")
+
+if __name__ == "__main__":
+    main()

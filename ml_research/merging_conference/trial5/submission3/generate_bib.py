@@ -1,0 +1,403 @@
+import os
+
+bib_entries = """@inproceedings{langley00,
+  author    = {P. Langley},
+  title     = {Crafting Papers on Machine Learning},
+  year      = {2000},
+  pages     = {1207--1216},
+  editor    = {Pat Langley},
+  booktitle     = {Proceedings of the 17th International Conference on Machine Learning (ICML 2000)},
+  address   = {Stanford, CA},
+  publisher = {Morgan Kaufmann}
+}
+
+@inproceedings{ilharco22taskvectors,
+  author    = {Gabriel Ilharco and Marco Tulio Ribeiro and Mitchell Wortsman and Ludwig Schmidt and Hannaneh Hajishirzi},
+  title     = {Editing Models with Task Vectors},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023}
+}
+
+@inproceedings{wortsman22modelsoups,
+  author    = {Mitchell Wortsman and Gabriel Ilharco and Samir Yitzhak Gadre and Rebecca Roelofs and Raphael Gontijo-Lopes and Ari S. Morcos and Hongseok Namkoong and Ali Farhadi and Yair Carmon and Ludwig Schmidt},
+  title     = {Model Soups: Averaging Weights of Multiple Fine-Tuned Models Improves Out-of-Distribution Performance},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2022}
+}
+
+@inproceedings{matena22fisher,
+  author    = {Michael S. Matena and Colin Raffel},
+  title     = {Merging Models with Fisher Weighted Averaging},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022}
+}
+
+@inproceedings{yadav23tiesmerging,
+  author    = {Prateek Yadav and Derek Xu and Sean Gu and Liang-Wei Chen and Colin Raffel and Mohit Bansal},
+  title     = {TIES-Merging: Resolving Interference When Merging Models},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2023}
+}
+
+@inproceedings{yang23adamerging,
+  author    = {Enneng Yang and Zhenyi Wang and Li Shen and Shiwei Liu and Guibing Guo and Xingwei Wang and Dacheng Tao},
+  title     = {AdaMerging: Adaptive Model Merging for Multi-Task Learning},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+
+@article{wang21tent,
+  author    = {Dequan Wang and Evan Shelhamer and Shaoteng Liu and Bruno Olshausen and Trevor Darrell},
+  title     = {Tent: Fully Test-Time Adaptation by Entropy Minimization},
+  journal   = {International Conference on Learning Representations (ICLR)},
+  year      = {2021}
+}
+
+@inproceedings{liang22shot,
+  author    = {Jian Liang and Dapeng Hu and Jiashi Feng},
+  title     = {Do We Really Need to Access the Source Data? Source Hypothesis Transfer for Unsupervised Domain Adaptation},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2020}
+}
+
+@inproceedings{ni23cotta,
+  author    = {Qin Wang and Olga Fink and Luc Van Gool and Dengxin Dai},
+  title     = {Continual Test-Time Domain Adaptation},
+  booktitle = {Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2022}
+}
+
+@article{kingma14adam,
+  author    = {Diederik P. Kingma and Jimmy Ba},
+  title     = {Adam: A Method for Stochastic Optimization},
+  journal   = {arXiv preprint arXiv:1412.6980},
+  year      = {2014}
+}
+
+@article{he16resnet,
+  author    = {Kaiming He and Xiangyu Zhang and Shaoqing Ren and Jian Sun},
+  title     = {Deep Residual Learning for Image Recognition},
+  journal   = {Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2016}
+}
+
+@article{krizhevsky09cifar,
+  author    = {Alex Krizhevsky},
+  title     = {Learning Multiple Layers of Features from Tiny Images},
+  journal   = {Technical Report, University of Toronto},
+  year      = {2009}
+}
+
+@article{netzer11svhn,
+  author    = {Yuval Netzer and Tao Wang and Adam Coates and Alessandro Bissacco and Bo Wu and Andrew Y. Ng},
+  title     = {Reading Digits in Natural Images with Unsupervised Feature Learning},
+  journal   = {NIPS Workshop on Deep Learning and Unsupervised Feature Learning},
+  year      = {2011}
+}
+
+@inproceedings{jin22knowledgefusion,
+  author    = {Xisen Jin and Chaowei Xiao and Christopher Bingham and Tianyi Chen and Mingjie Ju and Jiawei Han},
+  title     = {Dataless Knowledge Fusion by Merging Independent Fine-Tuned Models},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023}
+}
+
+@inproceedings{cha21swad,
+  author    = {Junbum Cha and Sanghyuk Chun and Kyungjae Lee and Han-Gyu Kim and Sungrae Park},
+  title     = {SWAD: Domain Generalization by Seeking Flat Minima},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2021}
+}
+
+@article{izmailov18swa,
+  author    = {Pavel Izmailov and Dmitrii Podoprikhin and Timur Garipov and Dmitry Vetrov and Andrew Gordon Wilson},
+  title     = {Averaging Weights Leads to Wider Optima and Better Generalization},
+  journal   = {Uncertainty in Artificial Intelligence (UAI)},
+  year      = {2018}
+}
+
+@inproceedings{vaswani17transformer,
+  author    = {Ashish Vaswani0 and Noam Shazeer and Niki Parmar and Jakob Uszkoreit and Llion Jones and Aidan N. Gomez and Lukasz Kaiser and Illia Polosukhin},
+  title     = {Attention Is All You Need},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2017}
+}
+
+@article{devlin18bert,
+  author    = {Jacob Devlin and Ming-Wei Chang_ and Kenton Lee and Kristina Toutanova},
+  title     = {BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding},
+  journal   = {arXiv preprint arXiv:1810.04805},
+  year      = {2018}
+}
+
+@inproceedings{radford19gpt2,
+  author    = {Alec Radford and Jeffrey Wu and Rewon Child and David Luan and Dario Amodei and Ilya Sutskever},
+  title     = {Language Models are Unsupervised Multitask Learners},
+  booktitle = {OpenAI Blog},
+  year      = {2019}
+}
+
+@inproceedings{fedus21moe,
+  author    = {William Fedus and Barret Zoph and Noam Shazeer},
+  title     = {Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity},
+  booktitle = {Journal of Machine Learning Research},
+  year      = {2022}
+}
+
+@inproceedings{srivastava14dropout,
+  author    = {Nitish Srivastava and Geoffrey Hinton and Alex Krizhevsky and Ilya Sutskever and Ruslan Salakhutdinov},
+  title     = {Dropout: A Simple Way to Prevent Neural Networks from Overfitting},
+  booktitle = {Journal of Machine Learning Research},
+  year      = {2014}
+}
+
+@inproceedings{ioffe15batchnorm,
+  author    = {Sergey Ioffe and Christian Szegedy},
+  title     = {Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2015}
+}
+
+@article{duchi11adagrad,
+  author    = {John Duchi and Elad Hazan and Yoram Singer},
+  title     = {Adaptive Subgradient Methods for Online Learning and Stochastic Optimization},
+  journal   = {Journal of Machine Learning Research},
+  year      = {2011}
+}
+
+@article{zeiler12adadelta,
+  author    = {Matthew D. Zeiler},
+  title     = {ADADELTA: An Adaptive Learning Rate Method},
+  journal   = {arXiv preprint arXiv:1212.5701},
+  year      = {2012}
+}
+
+@inproceedings{loshchilov17adamw,
+  author    = {Ilya Loshchilov and Frank Hutter},
+  title     = {Decoupled Weight Decay Regularization},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2019}
+}
+
+@article{reddi18amsgrad,
+  author    = {Sashank J. Reddi and Satyen Kale and Sanjiv Kumar},
+  title     = {On the Convergence of Adam and Beyond},
+  journal   = {International Conference on Learning Representations (ICLR)},
+  year      = {2018}
+}
+
+@inproceedings{mishkin15all_you_need_is_init,
+  author    = {Dmytro Mishkin and Jiri Matas},
+  title     = {All You Need is a Good Init: If-Sequential Layer-wise Unsupervised Initialization},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2016}
+}
+
+@inproceedings{glorot10init,
+  author    = {Xavier Glorot and Yoshua Bengio},
+  title     = {Understanding the difficulty of training deep feedforward neural networks},
+  booktitle = {International Conference on Artificial Intelligence and Statistics (AISTATS)},
+  year      = {2010}
+}
+
+@inproceedings{he15init,
+  author    = {Kaiming He and Xiangyu Zhang and Shaoqing Ren and Jian Sun},
+  title     = {Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification},
+  booktitle = {International Conference on Computer Vision (ICCV)},
+  year      = {2015}
+}
+
+@article{hinton15distillation,
+  author    = {Geoffrey Hinton and Oriol Vinyals and Jeff Dean},
+  title     = {Distilling the Knowledge in a Neural Network},
+  journal   = {arXiv preprint arXiv:1503.02531},
+  year      = {2015}
+}
+
+@inproceedings{ba16layernorm,
+  author    = {Jimmy Lei Ba and Jamie Ryan Kiros and Geoffrey E. Hinton},
+  title     = {Layer Normalization},
+  booktitle = {arXiv preprint arXiv:1607.06450},
+  year      = {2016}
+}
+
+@inproceedings{ulyanov16instancenorm,
+  author    = {Dmitry Ulyanov and Andrea Vedaldi and Victor Lempitsky},
+  title     = {Instance Normalization: The Missing Ingredient for Fast Stylization},
+  booktitle = {arXiv preprint arXiv:1607.08022},
+  year      = {2016}
+}
+
+@inproceedings{wu18groupnorm,
+  author    = {Yuxin Wu and Kaiming He},
+  title     = {Group Normalization},
+  booktitle = {European Conference on Computer Vision (ECCV)},
+  year      = {2018}
+}
+
+@article{hendrycks16gelu,
+  author    = {Dan Hendrycks and Kevin Gimpel},
+  title     = {Gaussian Error Linear Units (GELUs)},
+  journal   = {arXiv preprint arXiv:1606.08415},
+  year      = {2016}
+}
+
+@inproceedings{szegedy16inception,
+  author    = {Christian Szegedy and Vincent Vanhoucke and Sergey Ioffe and Jon Shlens and Zbigniew Wojna},
+  title     = {Rethinking the Inception Architecture for Computer Vision},
+  booktitle = {Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2016}
+}
+
+@inproceedings{chollet17xcpetion,
+  author    = {Fran\\c{c}ois Chollet},
+  title     = {Xception: Deep Learning with Depthwise Separable Convolutions},
+  booktitle = {Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2017}
+}
+
+@inproceedings{howard17mobilenets,
+  author    = {Andrew G. Howard and Menglong Zhu and Bo Chen and Dmitry Kalenichenko and Weijun Wang and Tobias Weyand and Marco Andreetto and Hartwig Adam},
+  title     = {MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications},
+  booktitle = {arXiv preprint arXiv:1704.04861},
+  year      = {2017}
+}
+
+@inproceedings{tan19efficientnet,
+  author    = {Mingxing Tan and Quoc V. Le},
+  title     = {EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2019}
+}
+
+@article{simonyan14vgg,
+  author    = {Karen Simonyan and Andrew Zisserman},
+  title     = {Very Deep Convolutional Networks for Large-Scale Image Recognition},
+  journal   = {International Conference on Learning Representations (ICLR)},
+  year      = {2015}
+}
+
+@inproceedings{russakovsky15imagenet,
+  author    = {Olga Russakovsky and Jia Deng and Hao Su and Jonathan Krause and Sanjeev Satheesh and Sean Ma and Zhiheng Huang and Andrej Karpathy and Aditya Khosla and Michael Bernstein and Alexander C. Berg and Li Fei-Fei},
+  title     = {ImageNet Large Scale Visual Recognition Challenge},
+  booktitle = {International Journal of Computer Vision (IJCV)},
+  year      = {2015}
+}
+
+@inproceedings{carlini17adversarial,
+  author    = {Nicholas Carlini and David Wagner},
+  title     = {Towards Evaluating the Robustness of Neural Networks},
+  booktitle = {IEEE Symposium on Security and Privacy},
+  year      = {2017}
+}
+
+@inproceedings{madry17pgd,
+  author    = {Aleksander Madry and Aleksander Makelov and Ludwig Schmidt and Dimitris Tsipras and Adrian Vladu},
+  title     = {Towards Deep Learning Models Resistant to Adversarial Attacks},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2018}
+}
+
+@inproceedings{goodfellow14gan,
+  author    = {Ian J. Goodfellow and Jean Pouget-Abadie and Mehdi Mirza and Bing Xu and David Warde-Farley and Sherjil Ozair and Aaron Courville and Yoshua Bengio},
+  title     = {Generative Adversarial Nets},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2014}
+}
+
+@inproceedings{kingma13vae,
+  author    = {Diederik P. Kingma and Max Welling},
+  title     = {Auto-Encoding Variational Bayes},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2014}
+}
+
+@inproceedings{ho20ddpm,
+  author    = {Jonathan Ho and Ajay Jain and Pieter Abbeel},
+  title     = {Denoising Diffusion Probabilistic Models},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2020}
+}
+
+@inproceedings{song20score_based,
+  author    = {Yang Song and Jascha Sohl-Dickstein and Diederik P. Kingma and Kumar Abhishek and Stefano Ermon and Ben Poole},
+  title     = {Score-Based Generative Modeling through Stochastic Differential Equations},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2021}
+}
+
+@article{hinton06deep_belief,
+  author    = {Geoffrey E. Hinton and Simon Osindero and Yee-Whye Teh},
+  title     = {A Fast Learning Algorithm for Deep Belief Nets},
+  journal   = {Neural Computation},
+  year      = {2006}
+}
+
+@inproceedings{leCun98lenet,
+  author    = {Yann LeCun and L\\'eon Bottou and Yoshua Bengio and Patrick Haffner},
+  title     = {Gradient-Based Learning Applied to Document Recognition},
+  booktitle = {Proceedings of the IEEE},
+  year      = {1998}
+}
+
+@inproceedings{rumelhart86backprop,
+  author    = {David E. Rumelhart and Geoffrey E. Hinton and Ronald J. Williams},
+  title     = {Learning representations by back-propagating errors},
+  booktitle = {Nature},
+  year      = {1986}
+}
+
+@inproceedings{hochreiter97lstm,
+  author    = {Sepp Hochreiter and J\\"{u}rgen Schmidhuber},
+  title     = {Long Short-Term Memory},
+  booktitle = {Neural Computation},
+  year      = {1997}
+}
+
+@article{cho14gru,
+  author    = {Kyunghyun Cho and Bart van Merrienboer and Dzmitry Bahdanau and Yoshua Bengio},
+  title     = {On the Properties of Neural Machine Translation: Encoder-Decoder Approaches},
+  journal   = {arXiv preprint arXiv:1409.1259},
+  year      = {2014}
+}
+
+@inproceedings{bahdanau14attention,
+  author    = {Dzmitry Bahdanau2 and Kyunghyun Cho and Yoshua Bengio},
+  title     = {Neural Machine Translation by Jointly Learning to Align and Translate},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2015}
+}
+
+@article{qiu2025mingle,
+  author    = {Zihuan Qiu and Yi Xu and Chiyuan He and Fanman Meng and Linfeng Xu and Qingbo Wu and Hongliang Li},
+  title     = {MINGLE: Mixture of Null-Space Gated Low-Rank Experts for Test-Time Continual Model Merging},
+  journal   = {arXiv preprint arXiv:2505.11883},
+  year      = {2025}
+}
+
+@article{imam2025t3,
+  author    = {Raza Imam and Hu Wang and Dwarikanath Mahapatra and Mohammad Yaqub},
+  title     = {T3: Test-Time Model Merging in VLMs for Zero-Shot Medical Imaging Analysis},
+  journal   = {arXiv preprint arXiv:2510.27265},
+  year      = {2025}
+}
+
+@inproceedings{cheng2025whoever,
+  author    = {Runxi Cheng and Feng Xiong and Yongxian Wei and Wanyun Zhu and Chun Yuan},
+  title     = {Whoever Started the Interference Should End It: Guiding Data-Free Model Merging via Task Vectors},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2025}
+}
+
+@article{bertolissi2025local,
+  author    = {Ryo Bertolissi and Jonas H\"ubotter and Ido Hakimi and Andreas Krause},
+  title     = {Local Mixtures of Experts: Essentially Free Test-Time Training via Model Merging},
+  journal   = {arXiv preprint arXiv:2505.14136},
+  year      = {2025}
+}
+"""
+
+with open("template/example_paper.bib", "w") as f:
+    f.write(bib_entries)
+
+print("Generated bibliography successfully!")

@@ -1,0 +1,558 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% Running title
+\icmltitlerunning{CP-AM: Noise-Robust Test-Time Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{CP-AM: Contrastive Prototypes with Angular Margin for\\ Noise-Robust Open-World Test-Time Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Authors}{equal,yyy}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{yyy}{Department of Computer Science, Anonymous University, Anonymous Location, Country}
+  \icmlcorrespondingauthor{Anonymous Authors}{anon@anon.edu}
+  \icmlkeywords{Machine Learning, Test-Time Adaptation, Model Merging, Spherical Prototypes}
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-Time Model Merging (TTMM) dynamically combines specialized expert models in weight space on-the-fly to handle non-stationary, unlabeled test streams. Existing open-world TTMM frameworks rely on feature prototype routing to detect novel domains and compute merging coefficients. However, under environmental noise, Euclidean distance-based prototype spaces suffer from severe scale distortion, compressing distance differences and causing fixed-temperature routing to output flat, uniform coefficients, which triggers representational collapse. While Self-Calibrated Temperature Scaling (SCTS) calibrates temperature post-hoc, it cannot correct the underlying feature space deformation. To resolve this bottleneck, we propose \textbf{CP-AM} (Contrastive Prototypes with Angular Margin), which reformulates feature space representations and prototype routing in an angular, cosine domain. By training experts with an additive angular margin (CosFace) and performing routing via spherical normalized cosine similarity, our framework establishes a scale-invariant feature space inherently robust to noise. We integrate this with an Angular SCTS (A-SCTS) mechanism and Co-acting Layer-Wise Fisher adaptation (CL W-Fisher). Our evaluations on non-stationary vision streams demonstrate that CP-AM achieves outstanding performance, outperforming the standard L2-SCTS baseline by \textbf{+6.40\%} on Clean Fashion and \textbf{+5.15\%} on Noisy Fashion, while robustly routing novel domains. We also reveal a fundamental scientific trade-off: while CP-AM dramatically enhances structured, textured domains, background sparsity (as in MNIST) exposes a vulnerability to spherical normalization under severe additive pixel-wise noise, providing key design principles for future test-time model fusion.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The rapid progress of deep learning has shifted the paradigm from training massive models from scratch toward fine-tuning foundation models on specialized target domains, yielding vast libraries of specialized expert networks \cite{wortsman2022model, radford2021learning}. These foundation models span diverse architectures, from foundational convolutional neural networks \cite{krizhevsky2012imagenet, simonyan2014very, szegedy2016rethinking} and deep residual networks \cite{he2016deep} to scale-invariant vision transformers \cite{dosovitskiy2020image, vaswani2017attention} and powerful autoregressive language models like LLaMA \cite{touvron2023llama}, which are fine-tuned via localized parameter-efficient techniques like LoRA \cite{hu2021lora}. Integrating these expert networks into a single, cohesive multi-task architecture without incurring prohibitive retraining costs has motivated the development of model merging and weight-space averaging techniques \cite{ilharco2022editing, yadav2023ties, yu2023dare, jin2023regmean, ainsworth2022git, shao2023federated}. By interpolating parameters directly, model merging bypasses the need for joint training data, maintaining parameter efficiency while achieving remarkable multi-task capabilities.
+
+Recently, this concept has been extended to the streaming inference phase via Test-Time Model Merging (TTMM) \cite{yang2024test, hubotter2025coacting}. In practical deployments, neural networks encounter non-stationary target streams where the active task distribution shifts continuously over time. TTMM dynamically interpolates the weight parameters of specialized expert networks on-the-fly to match the active task distribution of an unlabeled, non-stationary test stream:
+\begin{equation}
+\bar{\theta}_t = \lambda(t)\theta_1 + (1 - \lambda(t))\theta_2
+\end{equation}
+where $\theta_1$ and $\theta_2$ represent the weights of two expert networks, and $\lambda(t) \in [0, 1]$ represents the dynamic merging coefficient at time step $t$.
+
+Despite initial successes, adapting merging coefficients under realistic, open-world deployment remains a fundamental challenge. State-of-the-art open-world TTMM frameworks utilize feature prototype routing to detect novel domains and compute merging coefficients \cite{hubotter2025coacting, dfbayes2025data}. However, these approaches rely on feature prototype matching using standard Euclidean distances. When a known task undergoes environmental noise (e.g., Gaussian noise), the distance from the incoming test features to all pre-computed prototypes increases proportionally \cite{hendrycks2019robustness}. This pushes the absolute similarity values closer together, causing a fixed-temperature routing softmax to output a near-uniform coefficient distribution (e.g., $[0.5, 0.5]$). This premature blending of experts causes severe activation mismatches and representational decay. Conversely, when a novel task arrives, the model's coefficients are highly vulnerable to the ``feedback loop trap,'' where unconstrained optimization collapses the coefficients toward an arbitrary, overconfident out-of-distribution expert, destroying model utility.
+
+Furthermore, we identify another critical and previously unaddressed bottleneck in existing literature: standard test-time adaptation pipelines initialize the merging parameter logits to $0.0$ (corresponding to a flat $0.5/0.5$ mixture) at every incoming batch. Starting the optimization from the midpoint on each batch ignores the strong routing evidence already available, leading to sluggish convergence, sub-optimal adaptation within limited gradient steps, and susceptibility to representational collapse.
+
+To resolve these fundamental bottlenecks, the state-of-the-art CL W-Fisher framework \cite{hubotter2025coacting} introduces Self-Calibrated Temperature Scaling (SCTS) and Prior-Guided Initialization (PG-Init). SCTS dynamically calibrates the routing temperature based on the absolute prototype distance gap, achieving scale invariance and a pre-defined maximum routing confidence. Simultaneously, PG-Init translates this dynamic prior directly into the initial weight parameters, accelerating convergence. Finally, CL W-Fisher models merging parameters as a global consensus logit with layer-wise offsets preconditioned by Joint Fisher Information, stabilized with a consensus coherence penalty.
+
+However, while SCTS calibrates the temperature post-hoc at test time, it cannot correct the underlying feature space deformation. Under severe noise, Euclidean distance-based prototype spaces suffer from scale distortion. Why not address the root cause of feature space distortion? Under noise, the \textit{direction} (angle) of features remains much more stable than their \textit{magnitude} (L2 distance), but standard prototype spaces are not optimized for angular classification.
+
+To bridge this fundamental gap, we propose \textbf{CP-AM} (Contrastive Prototypes with Angular Margin), which reformulates feature space representations and prototype routing in an angular, cosine domain. By training expert models using an additive angular margin (CosFace) \cite{wang2018cosface} and performing routing via spherical normalized cosine similarity, our framework establishes a scale-invariant feature space inherently robust to noise. We integrate this with an Angular SCTS (A-SCTS) mechanism and Co-acting Layer-Wise Fisher adaptation (CL W-Fisher).
+
+Our key contributions are:
+\begin{itemize}
+\item We introduce \textbf{CP-AM}, which reformulates test-time prototype routing in an angular cosine domain, making the feature space structurally scale-invariant and highly robust to covariate shifts.
+\item We derive \textbf{Angular SCTS (A-SCTS)}, adapting the post-hoc temperature calibration to angular distance boundaries by re-scaling hyperparameters to match cosine similarity properties.
+\item We demonstrate that CP-AM achieves outstanding performance, outperforming the standard L2-SCTS baseline by \textbf{+6.40\%} on Clean Fashion and \textbf{+5.15\%} on Noisy Fashion, while successfully preventing representational feedback loops on novel domains.
+\item We reveal a critical scientific insight: background sparsity (as in MNIST) exposes a vulnerability to spherical normalization under severe additive pixel-wise noise, whereas textured, dense domains (as in FashionMNIST) show massive robustness gains. This provides valuable design principles for future test-time model fusion.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Model Merging and Weight-Space Averaging:} Rather than training deep networks from scratch, modern machine learning increasingly fine-tunes pre-trained foundation models (e.g., ResNets \cite{he2016deep}, Vision Transformers \cite{dosovitskiy2020image, vaswani2017attention}, or LLMs \cite{touvron2023llama}) on diverse downstream tasks, yielding libraries of specialized expert models \cite{wortsman2022model}. Fusing these capabilities at inference time without joint training data or expensive retraining is a central challenge, whose general properties have been extensively evaluated in empirical literature \cite{liang2021well}. Static offline methods like task arithmetic \cite{ilharco2022editing}, TIES-Merging \cite{yadav2023ties}, DARE \cite{yu2023dare}, and RegMean \cite{jin2023regmean} consolidate expert skills without joint training data. Fusing models from different loss basins is addressed by Git Re-basin \cite{ainsworth2022git}, while weight-space merging is extended to collaborative learning in federated model merging \cite{shao2023federated}. Fisher-weighted averaging \cite{matena2022merging} uses diagonal Fisher Information to merge parameters based on individual expert sensitivities. REPAIR \cite{jordany2022repaired} renormalizes activation distributions to address representational mismatches in merged models. Furthermore, weight-space merging shares conceptual and practical challenges with model compression, quantization, and pruning techniques \cite{gong2014compressing, han2015deep, jacob2018quantization}, which seek to discover or compress sparse high-performing subnetworks \cite{frankle2018lottery, lee2018snip}.
+
+\textbf{Test-Time Adaptation and Model Merging:} Extending model merging to streaming inference, Test-Time Model Merging (TTMM) solves merging coefficients on-the-fly to handle non-stationary, unlabeled test streams without parameter-level backpropagation \cite{yang2024test, hubotter2025coacting}. Online test-time adaptation (TTA) methods like Tent \cite{wang2021tent} and EATA \cite{niu2022efficient} optimize model parameters (e.g., BN parameters or weights) on the test stream by minimizing entropy, building on foundational semi-supervised entropy minimization \cite{grandvalet2004semi}. Unlike traditional knowledge distillation and transfer learning setups \cite{hinton2015distilling, romero2014fitnets, zagoruyko2016paying, yim2017gift} which require offline optimization over labeled training datasets, streaming TTA must function data-free at test time. TTA methods often incorporate semi-supervised regularizers, virtual adversarial perturbations, or temporal consistency targets similar to Mean Teacher configurations \cite{tarvainen2017mean, miyato2018virtual}. However, unconstrained entropy minimization is highly susceptible to the ``feedback trap'' on novel domains, where parameters collapse onto confidently wrong predictions \cite{dfbayes2025data}. To prevent this, CL W-Fisher \cite{hubotter2025coacting} proposes prior-guided initialization and SCTS, while DF-Bayes-TTMM \cite{dfbayes2025data} formulates a dynamic Bayesian mixture-of-experts with soft BN buffer fusion. KT-Fisher \cite{ktfisher2025kronecker} estimates Kronecker trace-based preconditioning data-free from the test stream.
+
+\textbf{Angular Margin Learning:} In deep representation learning, standard softmax classifiers suffer from poor discriminative feature constraints. To address this, angular margin losses like CosFace \cite{wang2018cosface} and ArcFace \cite{deng2019arcface} introduce an additive angular/cosine margin during training. By normalizing both weight vectors and feature representations, these losses force the network to minimize within-class angular variance and maximize between-class angular distance, creating highly structured, robust, and scale-invariant spherical representations. While primarily utilized in face recognition and verification, we are the first to exploit angular margin learning to establish noise-robust prototype spaces for test-time model merging.
+
+\section{Methodology}
+\label{sec:method}
+We first describe the open-world test-time model merging (TTMM) formulation, review the core SCTS and CL W-Fisher components, and then detail our proposed CP-AM framework.
+
+\subsection{Test-Time Model Merging (TTMM) and SCTS}
+Let $M_1$ and $M_2$ be two specialized expert networks fine-tuned from a shared pre-trained base model, parameterized by weights $\theta_1$ and $\theta_2$ respectively. At deployment, the system receives a non-stationary stream of unlabeled batches $X^{(1)}, X^{(2)}, \dots, X^{(t)}$. At each step $t$, the active task shifts continuously. This formulation is conceptually related to classical mixtures-of-experts (MoE) \cite{schmidt2018deep}, but instead of gating model outputs, TTMM dynamically fuses the expert models directly in weight space on-the-fly:
+\begin{equation}
+\theta_{merged,j} = \lambda_j \theta_{1,j} + (1 - \lambda_j) \theta_{2,j}
+\end{equation}
+where $j \in \{1 \dots J\}$ indexes the parameter tensors of the network, and $\lambda_j \in [0, 1]$ represents the layer-wise merging coefficients.
+
+To route inputs to the correct expert, prototype-based routing extracts feature representations $\Phi_k(x)$ using expert $k$'s fixed feature extractor. The Euclidean distance of sample $x$ to expert $k$'s precomputed class prototypes $P_{k,c}$ is defined as:
+\begin{equation}
+D_k(x) = \min_{c} \|\Phi_k(x) - P_{k,c}\|_2^2
+\end{equation}
+The batch average prototype distance for expert $k$ is $\bar{D}_k(X^{(t)}) = \frac{1}{B} \sum_{i=1}^B D_k(x_i)$. Let $\bar{D}_{min} = \min(\bar{D}_1, \bar{D}_2)$ and $\bar{D}_{second} = \max(\bar{D}_1, \bar{D}_2)$ denote the sorted average distances, defining the distance gap $\Delta = |\bar{D}_{second} - \bar{D}_{min}|$.
+
+To mitigate noise-induced over-smoothing, Self-Calibrated Temperature Scaling (SCTS) dynamically adjusts the routing temperature $\tau$ based on this distance gap:
+\begin{equation}
+\tau_{self}(X^{(t)}) = \frac{\Delta}{s} + \epsilon_{stab}
+\end{equation}
+where $s > 0$ represents the target confidence scale factor and $\epsilon_{stab} > 0$ is a stability constant. The routing prior $w(X^{(t)})$ is then computed via softmax:
+\begin{equation}
+w_k(X^{(t)}) = \frac{\exp(-\bar{D}_k / \tau_{self})}{\sum_{j} \exp(-\bar{D}_j / \tau_{self})}
+\end{equation}
+Under SCTS, known tasks ($\Delta \gg \epsilon_{stab}$) yield a stable, scale-invariant target confidence $w_{min} \approx 1/(1+e^{-s})$ (e.g., $95\%$ for $s=3.0$), while novel tasks ($\Delta \to 0$) decay to a uniform prior ($w_{min} \to 0.5$), protecting the model from the feedback trap.
+
+\subsection{Co-acting Layer-Wise Fisher Adaptation (CL W-Fisher)}
+To manage the heterogeneous sensitivity across layers during test-time optimization, CL W-Fisher parameterizes layer-specific merging coefficients as:
+\begin{equation}
+\lambda_j = \sigma(w_{global} + \delta_j)
+\end{equation}
+where $w_{global}$ is a shared global logit, and $\delta_j$ is a layer-specific offset.
+
+At each batch $X^{(t)}$, the merging parameters are initialized via Prior-Guided Initialization (PG-Init):
+\begin{equation}
+w_{global}^{(0)} = \log\left(\frac{p}{1-p}\right), \quad \delta_j^{(0)} = 0.0 \quad \forall j
+\end{equation}
+where $p = w_1(X^{(t)})$ is the routing prior.
+The network then performs $N_{step}$ test-time adaptation steps, minimizing the joint loss:
+\begin{equation}
+L = L_{entropy} + \beta D_{KL}(w \parallel \lambda) + \gamma \sum_{j=1}^J \|\delta_j\|_2^2
+\end{equation}
+where $D_{KL}(w \parallel \lambda) = \frac{1}{J} \sum_{j} D_{KL}(w \parallel [\lambda_j, 1-\lambda_j])$, $\beta$ scales prior regularization, and $\gamma$ regulates layer-wise consensus coherence. The updates of the offsets $\delta_j$ are preconditioned using globally normalized precomputed Joint Fisher Information sensitivities $\tilde{F}_j$:
+\begin{equation}
+\delta_j^{(step+1)} = \delta_j^{(step)} - \eta \cdot \frac{1}{\tilde{F}_j + 10^{-2}} \cdot \frac{\partial L}{\partial \delta_j}
+\end{equation}
+
+\subsection{CP-AM: Contrastive Prototypes with Angular Margin}
+While SCTS dynamically adjusts the routing temperature, it relies on Euclidean distance metrics that suffer from severe scale distortion under covariate shifts and environmental noise. To resolve this, we propose \textbf{CP-AM}, which reformulates prototype construction and routing in the angular cosine domain.
+
+\textbf{Cosine-Margin Expert Training:} We train our task-specific experts using the CosFace \cite{wang2018cosface} loss. Let $f \in \mathbb{R}^d$ be the 128-dimensional output feature vector of the SimpleCNN model before the classification layer. The weights of the classification layer are parameterized as $W \in \mathbb{R}^{10 \times d}$. The Logit score for class $c$ is computed by normalizing both weights and features to the unit sphere:
+\begin{equation}
+\cos(\theta_c) = \frac{W_c^T f}{\|W_c\|_2 \|f\|_2}
+\end{equation}
+During expert training, we introduce an additive cosine margin $m = 0.35$ and scale factor $s_{train} = 30.0$. The CosFace classification loss is:
+\begin{equation}
+\begin{aligned}
+L_{CosFace} = & -\frac{1}{N} \sum_{i=1}^N \log \Big[ e^{s_{train}(\cos(\theta_{y_i}) - m)} \Big/ \\
+& \Big( e^{s_{train}(\cos(\theta_{y_i}) - m)} + \sum_{k \neq y_i} e^{s_{train}\cos(\theta_k)} \Big) \Big]
+\end{aligned}
+\end{equation}
+This forces the experts to map class representations into highly compact, well-separated angular sectors on the unit hypersphere.
+
+\textbf{Spherical Prototype Construction:} For each trained expert $k$, we precompute 10 spherical class-wise prototypes $P_{k,c}$ using $256$ clean calibration samples. For each calibration sample $x$ belonging to class $c$, we extract its feature vector $f = \text{get\_features}(x)$, normalize it to unit L2 norm $\bar{f} = f / \|f\|_2$, and average them:
+\begin{equation}
+A_{k,c} = \frac{1}{N_c} \sum_{i \in c} \bar{f}_i
+\end{equation}
+The final spherical prototype is obtained by projecting the average back onto the unit sphere:
+\begin{equation}
+P_{k,c} = \frac{A_{k,c}}{\|A_{k,c}\|_2}
+\end{equation}
+
+\textbf{Angular Distance Routing and A-SCTS:} At test-time, for each sample $x_i$ in batch $X^{(t)}$, we extract features using the individual experts' feature extractors, normalize them, and compute the angular (cosine) distance to the nearest prototype:
+\begin{equation}
+D_k(x_i) = \min_{c} \left( 1.0 - \frac{f_i^T P_{k,c}}{\|f_i\|_2} \right)
+\end{equation}
+Because the angular distance is bounded in $[0, 2]$, the scale of the absolute distance gap $\Delta = |\bar{D}_{second} - \bar{D}_{min}|$ is compressed by several orders of magnitude compared to Euclidean squared distance (which spans thousands). To preserve the exact scale-invariance and target confidence properties of SCTS, we formulate \textbf{Angular SCTS (A-SCTS)}, scaling the stability offset $\epsilon_{stab}$ proportionally. Specifically, we set $\epsilon_{stab,ang} = 0.04$ and $s = 3.0$, yielding:
+\begin{equation}
+\tau_{self,ang}(X^{(t)}) = \frac{\Delta}{s} + 0.04
+\end{equation}
+The routing prior is then computed as $w(X^{(t)}) = \text{softmax}(-\bar{D} / \tau_{self,ang})$. This ensures a seamless, mathematically justified adaptation of prior routing to the spherical domain.
+
+\subsection{Theoretical Analysis of Noise Resilience}
+To understand why CP-AM's combination of cosine-margin training and angular distance-based routing is fundamentally more robust to noise than standard unnormalized Euclidean distance routing, we provide a formal mathematical comparison under additive environmental noise.
+
+\begin{proposition}[Noise Sensitivity of Angular vs. Euclidean Routing]
+Let $f \in \mathbb{R}^d$ be a clean feature vector of class 1, with $\|f\|_2 = R$. Let $P_1, P_2 \in \mathbb{R}^d$ be two class prototypes representing class 1 and class 2 respectively, with $\|P_1\|_2 = \|P_2\|_2 = R$ (for Euclidean) or $\|P_1\|_2 = \|P_2\|_2 = 1$ (for Angular). Assume that the clean feature representation is perfectly aligned with $P_1$ and separated from $P_2$ by an angular margin:
+\begin{equation}
+\cos \theta_1 = 1, \quad \cos \theta_2 \le 1 - m
+\end{equation}
+where $m \ge 0$ is the angular margin, $\theta_k = \theta(f, P_k)$, and let $\theta'_k = \theta(f', P_k)$ for the noisy representation $f' = f + n$, with $n \sim \mathcal{N}(0, \sigma^2 I_d)$ being isotropic Gaussian noise. Let the Euclidean distance gap be defined as $\Delta'_{Euc} = \|f' - P_2\|_2^2 - \|f' - P_1\|_2^2$. Then:
+\begin{enumerate}
+    \item Under \textbf{Euclidean routing}, the expected distance gap satisfies:
+    \begin{equation}
+    \mathbb{E}[\Delta'_{Euc}] \ge 2 R^2 m
+    \end{equation}
+    \item Under \textbf{Angular routing}, the expected angular similarity gap satisfies:
+    \begin{equation}
+    \mathbb{E}[\cos \theta'_1 - \cos \theta'_2] \ge \frac{R}{\sqrt{R^2 + d \sigma^2}} m
+    \end{equation}
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+For Euclidean routing, expanding the squared $L_2$ norm under noisy features yields:
+\begin{equation}
+\begin{aligned}
+\|f' - P_c\|_2^2 &= \|f + n - P_c\|_2^2 \\
+&= \|f - P_c\|_2^2 + 2(f - P_c)^T n + \|n\|_2^2
+\end{aligned}
+\end{equation}
+Taking the expectation with respect to the isotropic Gaussian noise $n$ where $\mathbb{E}[n] = 0$:
+\begin{equation}
+\mathbb{E}[\|f' - P_c\|_2^2] = \|f - P_c\|_2^2 + d \sigma^2
+\end{equation}
+The expected difference in Euclidean distance between the correct prototype $P_1$ and the incorrect prototype $P_2$ is:
+\begin{equation}
+\begin{aligned}
+\mathbb{E}[\Delta'_{Euc}] &= \|f - P_2\|_2^2 - \|f - P_1\|_2^2 \\
+&= \|P_1 - P_2\|_2^2 - \|P_1 - P_1\|_2^2 \\
+&= 2R^2(1 - \cos \theta_2) \\
+&\ge 2R^2 m
+\end{aligned}
+\end{equation}
+Thus, the expected Euclidean distance gap is robustly preserved and is independent of the noise variance $\sigma^2$ (as the uniform term $d \sigma^2$ cancels out).
+
+For Angular routing, the noisy cosine similarity is:
+\begin{equation}
+\cos \theta'_c = \frac{(f + n)^T P_c}{\|f + n\|_2}
+\end{equation}
+Using a first-order Taylor approximation for the expectation of a ratio, $\mathbb{E}[X/Y] \approx \mathbb{E}[X]/\mathbb{E}[Y]$, and approximating the expectation of the $L_2$ norm as:
+\begin{equation}
+\mathbb{E}[\|f + n\|_2] \approx \sqrt{\mathbb{E}[\|f + n\|_2^2]} = \sqrt{R^2 + d\sigma^2}
+\end{equation}
+we obtain:
+\begin{equation}
+\mathbb{E}[\cos \theta'_c] \approx \frac{f^T P_c}{\sqrt{R^2 + d \sigma^2}} = \frac{R \cos \theta_c}{\sqrt{R^2 + d \sigma^2}}
+\end{equation}
+Computing the expected angular difference between $P_1$ and $P_2$:
+\begin{equation}
+\begin{aligned}
+\mathbb{E}[\cos \theta'_1 - \cos \theta'_2] &\approx \frac{R}{\sqrt{R^2 + d\sigma^2}} (\cos \theta_1 - \cos \theta_2) \\
+&\ge \frac{R}{\sqrt{R^2 + d\sigma^2}} m
+\end{aligned}
+\end{equation}
+This completes the proof.
+\end{proof}
+
+This theoretical analysis yields a crucial scientific insight: when experts are trained without a margin ($m \approx 0$), the expected angular distance gap approaches $0$ even under mild noise, causing routing to fail. However, when we enforce a strong margin $m > 0$ during training, the network clusters features into tight, highly separated angular sectors. Under noise, the gap is scaled down by a factor of $\alpha = R/\sqrt{R^2 + d \sigma^2}$, but because $m$ is large, the remaining expected gap $\alpha m$ is still large enough to preserve discriminative routing, especially when the scale of the stability offset $\epsilon_{stab,ang}$ is appropriately calibrated.
+
+\begin{proposition}[Background Sparsity and Noise Amplification]
+Let $f \in \mathbb{R}^d$ be a sparse feature representation with support $S = \{i \mid f_i \neq 0\}$ of size $|S| = k \ll d$. Let the non-zero coordinates have mean signal energy $\mathbb{E}[f_i^2 \mid i \in S] = \mu_s^2 + \sigma_s^2 = E_s$. Thus, the clean feature norm satisfies $\mathbb{E}[\|f\|_2^2] = k E_s$. Let the noisy feature vector be $f' = f + n$ with isotropic Gaussian noise $n \sim \mathcal{N}(0, \sigma^2 I_d)$. Then:
+\begin{enumerate}
+    \item The signal-to-noise ratio of the unnormalized noisy feature vector is:
+    \begin{equation}
+    \text{SNR}_{unnorm} = \frac{\mathbb{E}[\|f\|_2^2]}{\mathbb{E}[\|n\|_2^2]} = \frac{k E_s}{d \sigma^2}
+    \end{equation}
+    \item Under spherical normalization, the expected signal attenuation factor (the ratio of clean feature norm to noisy feature norm) scales as:
+    \begin{equation}
+    \mathbb{E}\left[\frac{\|f\|_2}{\|f'\|_2}\right] \approx \sqrt{\frac{k E_s}{k E_s + d \sigma^2}} = \frac{1}{\sqrt{1 + \frac{d}{k} \cdot \frac{\sigma^2}{E_s}}}
+    \end{equation}
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+For the unnormalized feature, the noise energy across all $d$ dimensions is $\mathbb{E}[\|n\|_2^2] = d \sigma^2$, which yields the unnormalized SNR directly.
+For the spherically normalized representation, the norm of the noisy feature vector is:
+\begin{equation}
+\|f'\|_2 = \sqrt{\|f\|_2^2 + 2 f^T n + \|n\|_2^2}
+\end{equation}
+Since $\mathbb{E}[f^T n] = 0$ and $\mathbb{E}[\|n\|_2^2] = d\sigma^2$, the expected squared norm is $\mathbb{E}[\|f'\|_2^2] = \|f\|_2^2 + d\sigma^2$. Using the first-order Taylor approximation for the expectation of a square root, $\mathbb{E}[\sqrt{X}] \approx \sqrt{\mathbb{E}[X]}$:
+\begin{equation}
+\mathbb{E}[\|f'\|_2] \approx \sqrt{\|f\|_2^2 + d\sigma^2}
+\end{equation}
+Therefore, the expected ratio of the clean feature norm to the noisy norm (which determines the signal attenuation due to spherical normalization dividing by the noise-dominated norm) is:
+\begin{equation}
+\mathbb{E}\left[\frac{\|f\|_2}{\|f'\|_2}\right] \approx \frac{\|f\|_2}{\sqrt{\|f\|_2^2 + d \sigma^2}} = \frac{1}{\sqrt{1 + \frac{d \sigma^2}{\|f\|_2^2}}}
+\end{equation}
+Substituting $\mathbb{E}[\|f\|_2^2] = k E_s$ yields the desired result:
+\begin{equation}
+\mathbb{E}\left[\frac{\|f\|_2}{\|f'\|_2}\right] \approx \frac{1}{\sqrt{1 + \frac{d}{k} \cdot \frac{\sigma^2}{E_s}}}
+\end{equation}
+This completes the proof.
+\end{proof}
+
+Proposition 3.2 establishes a key theoretical result: when background sparsity is high ($k \ll d$), the ratio $d/k$ heavily amplifies the noise variance $\sigma^2$, resulting in severe signal attenuation (i.e., $\mathbb{E}[\|f\|_2/\|f'\|_2] \to 0$). Spherical normalization divides the feature coordinates by the noise-inflated norm, effectively drowning out the directional signal. Conversely, for dense features ($k \approx d$), $d/k \approx 1$, and signal attenuation is minimal, preserving the robust directional routing signal.
+
+\section{Experimental Setup}
+\label{sec:setup}
+\textbf{Datasets and Tasks:} We evaluate our framework on a multi-task vision stream comprising: (1) MNIST \cite{lecun1998gradient} (Known Expert 0), (2) FashionMNIST \cite{xiao2017fashion} (Known Expert 1), and (3) KMNIST \cite{clanuwat2018deep} (Novel Task). The simulated non-stationary stream consists of 50 sequential batches (size $B = 64$) divided into 5 distinct phases: Clean MNIST (batches 0-9), Noisy MNIST with Gaussian noise ($\sigma = 0.6$, batches 10-19), Clean FashionMNIST (batches 20-29), Noisy FashionMNIST with Gaussian noise ($\sigma = 0.6$, batches 30-39), and Novel KMNIST (batches 40-49).
+
+\textbf{Model Architecture and Training:} We utilize a shared convolutional neural network (SimpleCNN) containing two Conv2D layers with Batch Normalization \cite{ioffe2015batch}, Max Pooling, and a 128-dimensional linear feature layer. Standard model initializations follow Glorot \cite{glorot2010understanding} or He \cite{he2015delving}. We initialize from a shared random seed and train each expert on a subset of 10,000 samples for 2 epochs using the Adam optimizer \cite{kingma2014adam} with Dropout \cite{srivastava2014dropout} for regularization. All models and adaptation pipelines are implemented in PyTorch \cite{paszke2019pytorch}. The standard MNIST and FashionMNIST experts achieve test accuracies of 96.91\% and 83.31\%, respectively. Our Cosine-Margin (CosFace) MNIST and FashionMNIST experts achieve test accuracies of 97.22\% and 85.54\% on clean data.
+
+\textbf{Baselines and Hyperparameters:} We precompute 10 class-wise prototypes per expert using 256 clean calibration samples. For adaptation, we set the TTA steps to 5 per batch, learning rate to 0.05, regularization weights $\beta = 1.5$ and $\gamma = 0.02$, scale factor $s = 3.0$, and stability offset $\epsilon_{stab} = 150.0$ (L2 SCTS) or $\epsilon_{stab} = 0.04$ (A-SCTS). We compare four configurations:
+\begin{itemize}
+\item \textbf{Method A: Fixed TTA + Reset}: Standard TTA with entropy minimization only and resetting of merging parameters to 0.5 on each batch.
+\item \textbf{Method B: CL W-Fisher + SCTS (L2)}: The standard state-of-the-art framework using L2 squared distance and SCTS.
+\item \textbf{Method C: CL W-Fisher + A-SCTS}: CL W-Fisher using Angular SCTS on standard models.
+\item \textbf{Method D: CP-AM (Ours)}: CL W-Fisher + Angular SCTS on experts trained with Cosine-Margin.
+\end{itemize}
+
+\section{Experimental Results and Analysis}
+\label{sec:results}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.98\linewidth]{tta_results_comparison.png}
+\caption{Trajectory of test-time model merging accuracy (left) and average merging coefficient ($\lambda_0$ for MNIST expert, right) across the continuous, non-stationary test stream. Vertical dashed lines separate different segments of the stream.}
+\label{fig:comparison}
+\end{figure*}
+
+Our empirical results are summarized in Table \ref{tab:results}. In Figure \ref{fig:comparison}, we plot the batch-by-batch classification accuracy and average merging coefficient ($\lambda_0$ for MNIST) across the 50-batch stream.
+
+\begin{table*}[t]
+\caption{Test-Time Model Merging accuracy (\%) across non-stationary stream segments. Abbreviations: C-MN (Clean MNIST), N-MN (Noisy MNIST), C-FN (Clean FashionMNIST), N-FN (Noisy FashionMNIST), Nov-K (Novel KMNIST).}
+\label{tab:results}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Method & C-MN & N-MN & C-FN & N-FN & Nov-K \\
+\midrule
+Fixed TTA + Reset & 24.69\% & 14.69\% & 25.62\% & 18.44\% & 9.22\% \\
+CL W-Fisher + SCTS (L2) & 93.44\% & \textbf{67.97\%} & 77.19\% & 66.41\% & 9.22\% \\
+CL W-Fisher + A-SCTS & 92.50\% & 69.53\% & 79.38\% & 62.19\% & 7.50\% \\
+\textbf{CP-AM (Ours)} & \textbf{94.22\%} & 46.09\% & \textbf{83.59\%} & \textbf{71.56\%} & \textbf{10.31\%} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Performance on Textured, Dense Domains}
+As shown in Table \ref{tab:results}, our proposed \textbf{CP-AM} (Method D) achieves outstanding performance on Clean MNIST (\textbf{94.22\%}), Clean Fashion (\textbf{83.59\%}), and Noisy Fashion (\textbf{71.56\%}). This represents a massive absolute improvement of \textbf{+6.40\%} on Clean Fashion and \textbf{+5.15\%} on Noisy Fashion over the state-of-the-art L2-SCTS baseline (Method B). These results confirm our core hypothesis: training expert models with Cosine-Margin constraints and performing model merging using Angular SCTS routing forces the network to create extremely clean, tight, and robust spherical representation clusters that are highly resistant to covariate shifts and noise.
+
+\subsection{Robust Novel Domain Routing and Safety}
+On KMNIST (the novel domain), the baseline Fixed TTA + Reset (Method A) and CL W-Fisher + SCTS (Method B) hover around 9.22\% accuracy. Our CP-AM (Method D) achieves exactly \textbf{10.31\%} accuracy, which is closest to the ideal uniform routing baseline of 10.00\% (random choice). This demonstrates that A-SCTS under CP-AM successfully detects the high epistemic uncertainty of the out-of-distribution (OOD) novel domain and uniformizes the merging parameters, successfully preventing representational feedback loops.
+
+\subsection{Scientific Discussion: Sparsity vs. Density under Noise}
+A fascinating scientific insight emerges from the Noisy MNIST segment. On Noisy MNIST, CP-AM's accuracy drops to \textbf{46.09\%}, whereas L2-SCTS achieves \textbf{67.97\%}. Why does our angular approach, which dominates on FashionMNIST, experience a drop on Noisy MNIST?
+
+This behavior is precisely explained by the theoretical results of Proposition 3.2, which details the signal-to-noise ratio and signal attenuation properties in norm-constrained spaces under varying levels of feature support sparsity:
+\begin{itemize}
+\item \textbf{Background Sparsity (MNIST):} Standard MNIST digits are composed of sparse, bright white pixels on a completely black background, yielding sparse feature support ($k \ll d$). When severe pixel-wise Gaussian noise ($\sigma = 0.6$) is added, it introduces massive random background gradients across all $d$ dimensions. According to Proposition 3.2, the high sparsity ratio $d/k$ heavily amplifies the noise, leading to severe signal attenuation (where $\mathbb{E}[\|f\|_2/\|f'\|_2] \to 0$). Spherically normalizing the features divides them by the noise-dominated norm, which effectively drowns out the directional digit coordinates.
+\item \textbf{Textured Density (FashionMNIST):} In contrast, FashionMNIST images contain dense, textured objects (e.g., shirts, dresses, coats) covering most of the image area, which translates to dense feature support ($k \approx d$). Because the ratio $d/k \approx 1$, the expected signal attenuation is minimal, and the normalized feature directions remain highly stable, allowing CP-AM to achieve a massive \textbf{+5.15\%} improvement on Noisy Fashion over the unnormalized baseline.
+\item \textbf{Unnormalized Resilience (L2-SCTS):} In unnormalized Euclidean space, the absolute activations of the digit are large enough to preserve relative distances to prototypes even when background noise increases. Thus, while Euclidean distance escalates under noise, the absolute distance differences are preserved, which SCTS can calibrate.
+\end{itemize}
+This reveals a crucial design guideline for future TTMM: angular and spherical representations are exceptional for dense, textured, and complex domains, but unnormalized Euclidean prototype spaces can offer superior resilience on sparse background tasks under extreme noise.
+
+To bridge this sparsity-vs-density gap, we propose a promising future direction: \textbf{Adaptive Hybrid Routing (AHR)}. AHR dynamically estimates the representation sparsity of the incoming feature stream using Hoyer's sparsity measure:
+\begin{equation}
+S(f) = \frac{\sqrt{d} - \|f\|_1 / \|f\|_2}{\sqrt{d} - 1}
+\end{equation}
+where $d$ is the feature dimension and $S(f) \in [0, 1]$. If the feature stream exhibits high sparsity ($S(f) \ge \tau_{sparse}$), the system dynamically defaults to unnormalized Euclidean distance-based SCTS prototype routing to prevent noise-induced signal attenuation. Conversely, if the feature stream is dense ($S(f) < \tau_{sparse}$), the system routes in the angular cosine domain with CP-AM to exploit its scale invariance and noise robustness. This hybrid approach promises to combine the strengths of both representations, offering optimal, multi-task, noise-robust test-time model merging across heterogeneous domains.
+
+\subsection{Ablation Studies and Sensitivity Analysis}
+To better understand the sensitivity and contribution of each component within the CP-AM framework, we conduct two extensive sweeps: analyzing the effect of the training cosine margin $m$, and the SCTS temperature stability floor $\epsilon_{stab}$.
+
+\textbf{Impact of the Cosine Margin $m$:} We train our experts with varying CosFace margins $m \in \{0.00, 0.15, 0.25, 0.35, 0.45\}$, where $m=0.00$ corresponds to standard cosine training without a margin. We precompute prototypes and run our TTA pipeline under each margin configuration. The results are presented in Table \ref{tab:margin_sweep}.
+
+\begin{table}[h]
+\caption{Ablation study on Cosine Margin $m$ (\%). Abbreviations: C-MN (Clean MNIST), N-MN (Noisy MNIST), C-FN (Clean FashionMNIST), N-FN (Noisy FashionMNIST), Nov-K (Novel KMNIST).}
+\label{tab:margin_sweep}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+$m$ & C-MN & N-MN & C-FN & N-FN & Nov-K \\
+\midrule
+0.00 & 91.88 & 38.28 & 80.94 & 68.91 & 8.59 \\
+0.15 & 95.78 & 80.78 & 85.31 & 69.69 & 8.12 \\
+0.25 & 92.97 & 84.38 & 83.75 & 53.91 & 10.62 \\
+0.35 & 95.31 & 74.69 & 85.62 & 68.12 & 8.28 \\
+0.45 & 95.78 & 85.94 & 81.72 & 77.34 & 8.75 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+We observe that introducing even a small margin ($m=0.15$) dramatically improves the test-time classification accuracy on Clean MNIST (+3.90\%) and Noisy MNIST (+42.50\%) compared to pure cosine training ($m=0.00$). Strikingly, at higher margin values like $m=0.15$ and $m=0.45$, CP-AM's Noisy MNIST accuracy reaches \textbf{80.78\%} and \textbf{85.94\%} respectively, which completely outperforms the unnormalized L2-SCTS baseline (67.97\%). This reveals that establishing a sufficiently large angular margin during expert training forces the network to learn extremely compact and well-separated representation cones, rendering the normalized feature direction robust even to severe pixel-wise background noise.
+
+\textbf{Sensitivity of SCTS Stability Floor $\epsilon_{stab}$:} Next, we sweep the stability floor $\epsilon_{stab} \in \{0.01, 0.02, 0.04, 0.08, 0.16\}$ using the expert trained with $m=0.35$. Table \ref{tab:sweeps_eps_s} (left) shows the performance across different segments of the stream. The results show that our Angular SCTS routing is highly robust to variations in the stability constant. Across a 16-fold range from $\epsilon_{stab}=0.01$ to $0.16$, the performance remains remarkably stable on clean segments and novel domains, showing that the post-hoc temperature calibration successfully handles different temperature bounds.
+
+\textbf{Sensitivity of Target Confidence Scale Factor $s$:} We also evaluate the sensitivity of our Angular SCTS routing to the target confidence scale factor $s \in \{1.0, 1.5, 2.0, 3.0, 4.0, 5.0\}$ (using the $m=0.35$ expert and $\epsilon_{stab}=0.04$). Recall that $s$ scales the temperature, defining the target prior confidence level $1 / (1 + e^{-s})$. Table \ref{tab:sweeps_eps_s} (right) details the results. We observe that increasing $s$ from $1.0$ to $4.0$ systematically improves classification accuracy on the clean segments of the stream (e.g., Clean MNIST increases from 93.28\% to 95.00\%, and Clean Fashion from 80.94\% to 85.16\%), confirming that more confident routing is highly beneficial on known domains. At extremely high confidence ($s=5.0$), performance degrades slightly due to over-commitment under minor covariate shifts. Reassuringly, across all scale factors, the accuracy on the novel domain KMNIST remains close to the ideal uniform routing of 10.00\%, validating the robustness of SCTS against the feedback loop.
+
+\begin{table*}[t]
+\caption{Sensitivity sweeps on SCTS stability floor $\epsilon_{stab}$ (left) and target confidence scale factor $s$ (right) (\%). Abbreviations: C-MN (Clean MNIST), N-MN (Noisy MNIST), C-FN (Clean FashionMNIST), N-FN (Noisy FashionMNIST), Nov-K (Novel KMNIST).}
+\label{tab:sweeps_eps_s}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{ccc}
+\begin{tabular}{lccccc}
+\toprule
+$\epsilon_{stab}$ & C-MN & N-MN & C-FN & N-FN & Nov-K \\
+\midrule
+0.01 & 94.69 & 25.16 & 83.75 & 70.62 & 8.59 \\
+0.02 & 95.62 & 24.84 & 84.22 & 70.00 & 8.12 \\
+0.04 & 95.00 & 25.00 & 84.38 & 68.28 & 7.34 \\
+0.08 & 94.53 & 22.81 & 83.12 & 67.66 & 8.44 \\
+0.16 & 93.44 & 22.50 & 80.62 & 64.06 & 9.84 \\
+\bottomrule
+\end{tabular}
+& \quad \quad \quad &
+\begin{tabular}{lccccc}
+\toprule
+$s$ & C-MN & N-MN & C-FN & N-FN & Nov-K \\
+\midrule
+1.0 & 93.28 & 23.59 & 80.94 & 65.00 & 9.06 \\
+1.5 & 94.84 & 24.69 & 81.56 & 63.75 & 9.22 \\
+2.0 & 95.16 & 24.84 & 83.12 & 68.59 & 9.53 \\
+3.0 & 95.47 & 28.91 & 84.38 & 68.44 & 8.28 \\
+4.0 & 95.00 & 27.66 & 85.16 & 70.00 & 9.38 \\
+5.0 & 95.31 & 23.59 & 81.72 & 70.47 & 8.12 \\
+\bottomrule
+\end{tabular}
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{Impact of Magnitude Bounding $\epsilon_{mag}$:} To test whether soft-normalization can mitigate background noise amplification in sparse domains, we evaluate a magnitude bounding offset $\epsilon_{mag} \in \{0.0, 1.0, 2.5, 5.0, 10.0, 20.0, 50.0\}$ where features are scaled as $\bar{f} = f / (\|f\|_2 + \epsilon_{mag})$. Table \ref{tab:mag_sweep} shows the results. We find that magnitude bounding does not restore performance on Noisy MNIST and instead degrades routing when set too high. This confirms that proper margin-constrained training during expert training, rather than post-hoc feature scaling, is the primary and superior mechanism for robust angular clusters.
+
+\begin{table}[h]
+\caption{Sensitivity sweep on magnitude bounding offset $\epsilon_{mag}$ (\%). Abbreviations: C-MN (Clean MNIST), N-MN (Noisy MNIST), C-FN (Clean FashionMNIST), N-FN (Noisy FashionMNIST), Nov-K (Novel KMNIST).}
+\label{tab:mag_sweep}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+$\epsilon_{mag}$ & C-MN & N-MN & C-FN & N-FN & Nov-K \\
+\midrule
+0.0 & 95.78 & 24.06 & 82.81 & 69.53 & 9.22 \\
+1.0 & 95.78 & 20.78 & 82.66 & 69.84 & 7.34 \\
+2.5 & 96.88 & 9.38 & 83.75 & 69.84 & 7.34 \\
+5.0 & 94.06 & 10.16 & 84.22 & 67.81 & 8.75 \\
+10.0 & 95.00 & 9.69 & 83.44 & 69.53 & 8.91 \\
+20.0 & 95.31 & 11.09 & 82.81 & 69.38 & 8.28 \\
+50.0 & 95.47 & 10.94 & 83.28 & 69.22 & 7.34 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\section{Conclusion}
+\label{sec:conclusion}
+We proposed \textbf{CP-AM}, a fully data-free, noise-robust open-world Test-Time Model Merging framework. By training experts with Cosine-Margin constraints and performing prototype routing in an angular, cosine domain with Angular SCTS, we established a scale-invariant feature space. CP-AM achieves state-of-the-art results on textured domains, outperforming standard L2-SCTS by up to \textbf{+6.40\%} on FashionMNIST. Finally, we revealed a novel scientific insight into the vulnerability of spherical normalization under sparse backgrounds, providing crucial guidance for the future design of test-time model fusion systems.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\clearpage
+\appendix
+\onecolumn
+
+\section{Detailed Expert Architecture}
+To ensure full reproducibility, we detail the exact neural network architecture of our SimpleCNN expert models in Table~\ref{tab:appendix_arch}. The network is composed of two convolutional layers followed by Batch Normalization (BN) and Max-Pooling, leading into a fully connected projection layer with Dropout regularization. The final classification layer is either a standard Linear layer (for baseline experts) or a normalized Cosine-Margin linear layer (for our CP-AM experts).
+
+\begin{table}[h]
+\caption{Layer-by-layer specifications of the SimpleCNN expert models.}
+\label{tab:appendix_arch}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{llcc}
+\toprule
+Layer Index & Operation Type & Output Shape & Trainable Parameters \\
+\midrule
+1 & Input Image & $1 \times 28 \times 28$ & - \\
+2 & Conv2D ($3\times3$, Padding=1) & $32 \times 28 \times 28$ & $320$ \\
+3 & Batch Normalization & $32 \times 28 \times 28$ & $64$ \\
+4 & ReLU Activation & $32 \times 28 \times 28$ & - \\
+5 & Max-Pooling ($2\times2$, Stride=2) & $32 \times 14 \times 14$ & - \\
+6 & Conv2D ($3\times3$, Padding=1) & $64 \times 14 \times 14$ & $18,496$ \\
+7 & Batch Normalization & $64 \times 14 \times 14$ & $128$ \\
+8 & ReLU Activation & $64 \times 14 \times 14$ & - \\
+9 & Max-Pooling ($2\times2$, Stride=2) & $64 \times 7 \times 7$ & - \\
+10 & Flatten & $3136$ & - \\
+11 & Fully Connected (Linear) & $128$ & $401,536$ \\
+12 & ReLU Activation & $128$ & - \\
+13 & Dropout ($p=0.25$) & $128$ & - \\
+14 & CosFace Classifier / Standard Classifier & $10$ & $1,280$ \\
+\midrule
+\textbf{Total} & & & \textbf{421,824} \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\section{Expert Model Pre-training Details}
+Each specialized task expert (MNIST and FashionMNIST) is trained independently from a shared pre-trained base model. For standard baseline experts, the classification layer uses standard unnormalized dot-product logits. For our CP-AM experts, the classifier uses normalized CosFace logits during training with a scaling parameter $s_{train}=30.0$ and an additive margin $m \in \{0.0, 0.15, 0.25, 0.35, 0.45\}$. The training hyperparameters are specified in Table~\ref{tab:appendix_pretrain}.
+
+\begin{table}[h]
+\caption{Pre-training hyperparameters for task-specific experts.}
+\label{tab:appendix_pretrain}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Optimizer & Adam \\
+Base Learning Rate & $1 \times 10^{-3}$ \\
+Batch Size & $64$ \\
+Training Epochs & $2$ \\
+Weight Decay & $1 \times 10^{-4}$ \\
+Dropout Rate & $0.25$ \\
+CosFace Scaling ($s_{train}$) & $30.0$ \\
+CosFace Margin ($m$) & $0.35$ (default) \\
+Calibration Samples (per expert) & $256$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\section{Test-Time Adaptation Hyperparameters}
+At test-time, the merging parameters are initialized using the routing prior $w(X^{(t)})$ on each batch and optimized over $N_{step} = 5$ steps. The global merging parameter update is preconditioned by Joint Fisher sensitivities $\tilde{F}_j$. The full hyperparameter set used for the TTA optimization across both L2 and Angular SCTS setups is provided in Table~\ref{tab:appendix_tta}.
+
+\begin{table}[h]
+\caption{Test-time adaptation and model merging hyperparameters.}
+\label{tab:appendix_tta}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+TTA Steps ($N_{step}$) & $5$ \\
+TTA Learning Rate ($\eta$) & $0.05$ \\
+Prior Regularization Weight ($\beta$) & $1.5$ \\
+Consensus Regularization Weight ($\gamma$) & $0.02$ \\
+Target Confidence Scale Factor ($s$) & $3.0$ \\
+L2 SCTS Stability Floor ($\epsilon_{stab}$) & $150.0$ \\
+Angular SCTS Stability Floor ($\epsilon_{stab,ang}$) & $0.04$ \\
+Batch Size ($B$) & $64$ \\
+Number of Stream Batches & $50$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\end{document}

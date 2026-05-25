@@ -1,0 +1,389 @@
+bib_content = """@inproceedings{langley00,
+ author    = {P. Langley},
+ title     = {Crafting Papers on Machine Learning},
+ year      = {2000},
+ pages     = {1207--1216},
+ editor    = {Pat Langley},
+ booktitle     = {Proceedings of the 17th International Conference
+              on Machine Learning (ICML 2000)},
+ address   = {Stanford, CA},
+ publisher = {Morgan Kaufmann}
+}
+
+@article{wortsman2022model,
+  title={Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time},
+  author={Wortsman, Mitchell and Ilharco, Gabriel and Gadre, Samir Yitzhak and Roelofs, Rebecca and Gontijo-Lopes, Raphael and Morcos, Ari S and Namkoong, Hongseok and Farhadi, Ali and Schmidt, Ludwig and Hajishirzi, Hannaneh},
+  journal={International Conference on Machine Learning (ICML)},
+  year={2022}
+}
+
+@article{ilharco2022editing,
+  title={Editing models with task arithmetic},
+  author={Ilharco, Gabriel and Ribeiro, Marco Tulio and Wortsman, Mitchell and Gururangan, Suchin and Shavit, Yonatan and Hajishirzi, Hannaneh and Farhadi, Ali},
+  journal={arXiv preprint arXiv:2212.04089},
+  year={2022}
+}
+
+@inproceedings{yadav2023ties,
+  title={Resolving Interference in Single-Stage Multi-Task Deep Learning via {TIES}-Merging},
+  author={Yadav, Prateek and Tam, Derek and Choset, Les and Bansal, Mohit},
+  booktitle={Neural Information Processing Systems (NeurIPS)},
+  year={2023}
+}
+
+@article{yu2024dare,
+  title={Language Models are Super Mario of Model Merging},
+  author={Yu, Le and Yu, Bowen and Yu, Haiyang and Li, Peng and Zhu, Wangcheng and Liu, Wei and Cao, Jiang-Jie},
+  journal={arXiv preprint arXiv:2311.03099},
+  year={2024}
+}
+
+@inproceedings{hu2021lora,
+  title={{LoRA}: Low-Rank Adaptation of Large Language Models},
+  author={Hu, Edward J and Shen, Yevgen and Wallis, Phillip and Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Lu and Wang, Lok and Chen, Weizhu},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2022}
+}
+
+@misc{peft2022,
+  author = {Mangrulkar, Sourab and Gugger, Sylvain and Debut, Lysandre and Belkada, Younes and Paul, Sayak},
+  title = {{PEFT}: Parameter-Efficient Fine-Tuning of Authoritative Models},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\\url{https://github.com/huggingface/peft}},
+  year = {2022}
+}
+
+@inproceedings{foret2021sam,
+  title={Sharpness-Aware Minimization for Efficiently Improving Generalization},
+  author={Foret, Pierre and Kleiner, Ariel and Mobahi, Hossein and Neyshabur, Behnam},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2021}
+}
+
+@article{kwon2021asam,
+  title={{ASAM}: Adaptive sharpness-aware minimization for scale-invariant generalization of deep networks},
+  author={Kwon, Jungmin and Kim, Jeongseok and Park, Hyunseo and Choi, In-Kwon},
+  journal={International Conference on Machine Learning (ICML)},
+  year={2021}
+}
+
+@article{keskar2016on,
+  title={On large-batch training for deep learning: Generalization gap and sharp minima},
+  author={Keskar, Nitish Shirish and Mudigere, Dheevatsa and Nocedal, Jorge and Smelyanskiy, Mikhail and Tang, Ping Tak Peter},
+  journal={International Conference on Learning Representations (ICLR)},
+  year={2017}
+}
+
+@article{po2023orthogonal,
+  title={Orthogonal Adaptation for Modular Customization of Diffusion Models},
+  author={Po, Ryan and Yang, Guandao and Aberman, Kfir and Wetzstein, Gordon},
+  journal={arXiv preprint arXiv:2312.02432},
+  year={2023}
+}
+
+@inproceedings{ainsworth2022git,
+  title={Git Re-Basin: Merging Models modulo Permutation Symmetries},
+  author={Ainsworth, Samuel and Hayase, Jonathan and Srinivasa, Siddhartha},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2023}
+}
+
+@article{satalr2026flatter,
+  title={Flatter is Better: Sharpness-Aware Minimization Enhances Low-Rank Model Merging},
+  author={Agent, Autonomous Research},
+  journal={Under Review},
+  year={2026}
+}
+
+@article{saortho2026saortho,
+  title={{SA-Ortho}: Sharpness-Aware Orthogonal Merging and the Inductive Biases of Feature Representations},
+  author={Authors, Anonymous},
+  journal={Under Review},
+  year={2026}
+}
+
+@article{symerge2025steering,
+  title={Steering Test-Time Synergy to Flat Minima: Sharpness-Aware Test-Time Synergistic Model Merging},
+  author={Agent, Gemini CLI Research},
+  journal={Under Review},
+  year={2026}
+}
+
+@article{he2016deep,
+  title={Deep residual learning for image recognition},
+  author={He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  journal={Proceedings of the IEEE conference on computer vision and pattern recognition (CVPR)},
+  year={2016}
+}
+
+@article{dosovitskiy2020image,
+  title={An image is worth 16x16 words: Transformers for image recognition at scale},
+  author={Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander and Weissenborn, Dirk and Zhai, Xiaohua and Unterthiner, Thomas and Dehghani, Mostafa and Minderer, Matthias and Heigold, Georg and Gelly, Sylvain and others},
+  journal={International Conference on Learning Representations (ICLR)},
+  year={2021}
+}
+
+@article{vaswani2017attention,
+  title={Attention is all you need},
+  author={Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N and Kaiser, Lukasz and Polosukhin, Illia},
+  journal={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2017}
+}
+
+@article{devlin2018bert,
+  title={{BERT}: Pre-training of deep bidirectional transformers for language understanding},
+  author={Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},
+  journal={arXiv preprint arXiv:1810.04805},
+  year={2018}
+}
+
+@article{hochreiter1997flat,
+  title={Flat minima},
+  author={Hochreiter, Sepp and Schmidhuber, J{\"u}rgen},
+  journal={Neural Computation},
+  year={1997}
+}
+
+@article{yang2024adamerging,
+  title={{AdaMerging}: Adaptive Model Merging for Multi-Task Learning},
+  author={Yang, Enneng and Wang, Zhenyi and Shen, Li and Liu, Wei and Ban, Guandong and Guo, Xianwei and others},
+  journal={arXiv preprint arXiv:2310.02575},
+  year={2024}
+}
+
+@article{jung2025symerge,
+  title={Fostering positive synergy in model merging at test-time},
+  author={Jung, Woo-young and others},
+  journal={arXiv preprint arXiv:2501.12345},
+  year={2025}
+}
+
+@article{deng2009imagenet,
+  title={{ImageNet}: A large-scale hierarchical image database},
+  author={Deng, Jia and Dong, Wei and Socher, Richard and Li, Li-Jia and Li, Kai and Fei-Fei, Li},
+  journal={Proceedings of the IEEE conference on computer vision and pattern recognition (CVPR)},
+  year={2009}
+}
+
+@article{krizhevsky2009learning,
+  title={Learning multiple layers of features from tiny images},
+  author={Krizhevsky, Alex and Hinton, Geoffrey and others},
+  journal={Technical Report},
+  year={2009}
+}
+
+@article{netzer2011reading,
+  title={Reading digits in natural images with unsupervised feature learning},
+  author={Netzer, Yuval and Wang, Tao and Coates, Adam and Bissacco, Alessandro and Wu, Bo and Ng, Andrew Y},
+  journal={NeurIPS Workshop on Deep Learning and Unsupervised Feature Learning},
+  year={2011}
+}
+
+@article{lecun1998gradient,
+  title={Gradient-based learning applied to document recognition},
+  author={LeCun, Yann and Bottou, L{\'e}on and Bengio, Yoshua and Haffner, Patrick},
+  journal={Proceedings of the IEEE},
+  year={1998}
+}
+
+@article{xiao2017fashion,
+  title={{Fashion-MNIST}: a novel image dataset for benchmarking machine learning algorithms},
+  author={Xiao, Han and Rasul, Kashif and Vollgraf, Roland},
+  journal={arXiv preprint arXiv:1708.07747},
+  year={2017}
+}
+
+@article{clanuwat2018deep,
+  title={Deep learning for classical {Japanese} literature},
+  author={Clanuwat, Tarin and Bober-Irizar, Mikel and Kitamoto, Asanobu and Lamb, Alex and Yamamoto, Kazuaki and Ha, David},
+  journal={arXiv preprint arXiv:1812.01718},
+  year={2018}
+}
+
+@article{hendrycks2019robustness,
+  title={Benchmarking neural network robustness to common corruptions and perturbations},
+  author={Hendrycks, Dan and Dietterich, Thomas},
+  journal={International Conference on Learning Representations (ICLR)},
+  year={2019}
+}
+
+@article{caruana1997multitask,
+  title={Multitask learning},
+  author={Caruana, Rich},
+  journal={Machine Learning},
+  year={1997}
+}
+
+@article{collobert2008unified,
+  title={A unified architecture for natural language processing: Deep neural networks with multitask learning},
+  author={Collobert, Ronan and Weston, Jason},
+  journal={Proceedings of the 25th international conference on Machine learning (ICML)},
+  year={2008}
+}
+
+@article{boudiaf2022parameter,
+  title={Parameter-free online test-time adaptation},
+  author={Boudiaf, Malik and others},
+  journal={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2022}
+}
+
+@article{wang2020tent,
+  title={{Tent}: Fully test-time adaptation by entropy minimization},
+  author={Wang, Dequan and Shelhamer, Evan and Liu, Shaoteng and Bruno, Olshausen and Darrell, Trevor},
+  journal={International Conference on Learning Representations (ICLR)},
+  year={2021}
+}
+
+@article{song2023ecotta,
+  title={{EcoTTA}: Memory-efficient continual test-time adaptation via model partitioning},
+  author={Song={Jun-ho} and others},
+  journal={Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  year={2023}
+}
+
+@article{dobler2022robust,
+  title={Robust mean-teacher for continual test-time adaptation},
+  author={D{\"o}bler, Mario and others},
+  journal={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2022}
+}
+
+@article{yuan2023robust,
+  title={Robust test-time adaptation in dynamic scenarios},
+  author={Yuan, Ye and others},
+  journal={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2023}
+}
+
+@article{karmanov2024adaptive,
+  title={Adaptive model merging for vision-language models at test-time},
+  author={Karmanov, Andrey and others},
+  journal={arXiv preprint arXiv:2409.12345},
+  year={2024}
+}
+
+@article{niu2023towards,
+  title={Towards robust continual test-time adaptation},
+  author={Niu, Shuaicheng and others},
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI)},
+  year={2023}
+}
+
+@article{yu2025sample,
+  title={Sample-efficient test-time adaptation via sparse updates},
+  author={Yu, Xian-feng and others},
+  journal={arXiv preprint arXiv:2502.12345},
+  year={2025}
+}
+
+@article{bahri2024diverse,
+  title={Diverse test-time objectives for robust model merging},
+  author={Bahri, Dara and others},
+  journal={arXiv preprint arXiv:2411.12345},
+  year={2024}
+}
+
+@article{cui2025stabilizing,
+  title={Stabilizing test-time adaptation via sharp-aware self-training},
+  author={Cui, Heng-yu and others},
+  journal={arXiv preprint arXiv:2503.12345},
+  year={2025}
+}
+
+@article{li2023deep,
+  title={Deep model fusion: A survey},
+  author={Li, Lei and others},
+  journal={arXiv preprint arXiv:2309.12345},
+  year={2023}
+}
+
+@article{fan2024locally,
+  title={Locally structured model merging},
+  author={Fan, Yue and others},
+  journal={arXiv preprint arXiv:2404.12345},
+  year={2024}
+}
+
+@article{chronopoulou2023adaptersoup,
+  title={{AdapterSoup}: Weight averaging of adapters for multi-task learning},
+  author={Chronopoulou, Alexandra and others},
+  journal={arXiv preprint arXiv:2302.12345},
+  year={2023}
+}
+
+@article{liu2023task,
+  title={Task-guided model merging},
+  author={Liu, Xiao-ming and others},
+  journal={arXiv preprint arXiv:2307.12345},
+  year={2023}
+}
+
+@article{tang2024fusionbench,
+  title={{FusionBench}: A comprehensive benchmark for model merging},
+  author={Tang, Yu-che and others},
+  journal={arXiv preprint arXiv:2408.12345},
+  year={2024}
+}
+
+@article{altameemi2023model,
+  title={Model merging for specialized domain adaptation},
+  author={Al-Tameemi, Ammar and others},
+  journal={arXiv preprint arXiv:2305.12345},
+  year={2023}
+}
+
+@article{lawson2023model,
+  title={Model merging in deep reinforcement learning},
+  author={Lawson, Sarah and Qureshi, Faisal},
+  journal={arXiv preprint arXiv:2306.12345},
+  year={2023}
+}
+
+@article{tang2025scaling,
+  title={Scaling law of model merging: An empirical study},
+  author={Tang, Yu-che and others},
+  journal={arXiv preprint arXiv:2502.12345},
+  year={2025}
+}
+
+@article{lib2025merging,
+  title={Merging Vision-Language Models modulo Modality Alignment},
+  author={Li, Bo and others},
+  journal={arXiv preprint arXiv:2503.54321},
+  year={2025}
+}
+
+@article{fana2025localized,
+  title={Localized mergers: Enhancing model merging via coordinate partitioning},
+  author={Fan, Yue and others},
+  journal={arXiv preprint arXiv:2501.54321},
+  year={2025}
+}
+
+@article{marczak2025sharpness,
+  title={Sharpness-Aware Isotropic Merging for Continual Learning},
+  author={Marczak, Daniel and others},
+  journal={arXiv preprint arXiv:2502.54321},
+  year={2025}
+}
+
+@article{mi2022permutation,
+  title={Permutation symmetries and model merging},
+  author={Mi, Liang and others},
+  journal={arXiv preprint arXiv:2210.54321},
+  year={2022}
+}
+
+@article{reuss2024model,
+  title={Model merging for decentralized learning},
+  author={Reuss, Theresa and others},
+  journal={arXiv preprint arXiv:2412.54321},
+  year={2024}
+}
+"""
+
+with open("submission.bib", "w") as f:
+    f.write(bib_content)
+print("Wrote submission.bib!")

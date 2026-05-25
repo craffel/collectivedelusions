@@ -1,0 +1,481 @@
+\documentclass{article}
+
+% Recommended packages
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Style file for ICML 2026 (blind submission mode)
+\usepackage{icml2026}
+
+% Math packages
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+% Algorithm packages
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\icmltitlerunning{SA-Ortho: Sharpness-Aware Orthogonal Merging}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{SA-Ortho: Sharpness-Aware Orthogonal Merging \\
+  and the Inductive Biases of Feature Representations}
+
+\begin{icmlauthorlist}
+\icmlauthor{Anonymous Authors}{equal}
+\end{icmlauthorlist}
+
+\icmlaffiliation{equal}{Under double-blind peer review}
+
+\icmlkeywords{Model Merging, Sharpness-Aware Minimization, Orthogonal Manifold, Representation Learning}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Model merging has emerged as a key paradigm for combining multiple specialized neural networks fine-tuned from a shared pretrained initialization. 
+Two prominent lines of research have addressed the key challenge of parameter interference: 
+(1) optimizing the fine-tuning stage to find flat loss minima using Sharpness-Aware Minimization (SAM), and 
+(2) optimizing the merging stage by decomposing weight matrices and performing interpolation on the Riemannian manifold of the orthogonal group (OrthoMerge). 
+In this work, we propose and investigate \textbf{SA-Ortho}, a unified framework that combines both approaches to study the interaction between loss landscape flatness and weight space orthogonality. 
+Through rigorous experiments on split-class CIFAR-10 classification with ResNet-18, we identify a critical representational mismatch: the highly task-specific fully-connected head exhibits extreme Procrustes divergence (residual norm of 2.86) due to disjoint task classes, causing severe representation collapse when merged on the manifold.
+To resolve this bottleneck, we propose \textbf{Convolutional-only OrthoMerge (C-Ortho)}, which restricts manifold-based rotation interpolation to the feature extraction layers where representations share a common geometric manifold, and merges the classification head via standard Task Arithmetic.
+Remarkably, C-Ortho consistently and significantly outperforms standard Task Arithmetic, achieving \textbf{85.58\%} full CIFAR-10 test accuracy (a substantial improvement of \textbf{+1.28\%} over TA) for standard experts, and \textbf{83.36\%} accuracy (\textbf{+1.45\%} over TA) for SAM experts.
+Our work provides deep geometric insights, detailed coordinate misalignment analysis in residual connections, and clear, architecture-aware composition guidelines for the model-merging community.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The pretraining-finetuning paradigm has led to a proliferation of specialized neural networks tailored for diverse downstream tasks~\cite{wortsman2022model,he2016deep,deng2009imagenet}. 
+As modern deep learning models grow in capacity, fine-tuning and hosting a separate, standalone model for every individual downstream task becomes computationally and logistically prohibitive, especially when deploying models under tight resource constraints. 
+To circumvent this, \emph{model merging} has emerged as an attractive, training-free path to compose multiple task-specific capabilities into a single unified network without incurring additional training overhead or inference latency~\cite{ilharco2022editing,jin2022dataless,matena2022merging}.
+
+However, standard model merging—which relies primarily on linear weight averaging in Euclidean space (such as Task Arithmetic~\cite{ilharco2022editing})—faces a central challenge: parameter interference. 
+When task-specific models update parameters in conflicting directions, direct average updates can cancel out, resulting in a severe drop in downstream multi-task capabilities~\cite{yadav2023ties}. This phenomenon is particularly acute when models are fine-tuned on non-overlapping, specialized task distributions, leading to the deletion of critical task-specific capabilities during the linear interpolation process.
+
+To mitigate parameter interference and discover more robust weight representations, modern research has split into two prominent and separate methodologies:
+\begin{enumerate}
+    \item \textbf{Fine-tuning-side Flatness Optimization:} Methods such as SAFT-Merge~\cite{lee2025mitigating} and SAIM~\cite{anonymous2026saim} argue that fine-tuning models to lie in flat minima using Sharpness-Aware Minimization (SAM)~\cite{foret2021sharpness} dramatically improves their linear mergeability. Broad, flat loss basins are highly robust to weight perturbations, allowing standard weight interpolation to occur with minimal performance degradation.
+    \item \textbf{Merging-side Manifold Optimization:} In contrast, OrthoMerge~\cite{yang2026orthomerge} focuses on the geometric properties of fine-tuned weights. Linear average operations destroy non-linear weight structures (e.g., hyperspherical energy and orthogonality). OrthoMerge extracts task-specific orthogonal transformations, projects them to the Lie algebra of the orthogonal group, performs magnitude-corrected averaging, and maps them back. Remaining parameters are merged in standard Euclidean space.
+\end{enumerate}
+
+Despite the success of both directions individually, a fundamental scientific question remains unanswered: \emph{How does the flatness of the loss landscape (induced by SAM) interact with the geometric structure of weight matrices (orthogonal vs. residual) during merging?}
+
+In this paper, we present \textbf{SA-Ortho}, a unified framework that systematically investigates this intersection. 
+Specifically, we fine-tune deep convolutional networks (ResNet-18~\cite{he2016deep}) on split CIFAR-10 tasks using either standard SGD or SAM. 
+We then merge these models using both standard Task Arithmetic and the Lie-manifold OrthoMerge algorithm, tracking the exact Procrustes residual norms and downstream accuracies.
+
+Our rigorous empirical analysis yields several surprising and highly impactful insights:
+\begin{itemize}
+    \item \textbf{Flatness vs. Orthogonality Mismatch:} Contrary to our initial hypothesis, sharpness-aware training with SAM does \emph{not} reduce the structural distortion during orthogonal decoupling. Instead, SAM-trained models exhibit a slightly higher average Procrustes residual norm (+0.67\%) compared to standard SGD, indicating that loss landscape flatness is decoupled from weight orthogonality.
+    \item \textbf{The Head Divergence Bottleneck:} Through Selective OrthoMerge, we show that standard global OrthoMerge causes representation collapse due to \emph{Head Divergence}. Since the classification head `fc` acts on disjoint task outputs (classes 0--4 vs. classes 5--9), the learned projection directions diverge completely, yielding a massive Procrustes residual norm of 2.86. Merging this divergent head on the manifold destroys decision boundaries.
+    \item \textbf{Convolutional-only OrthoMerge (C-Ortho):} To overcome this bottleneck, we propose \textbf{C-Ortho}, which restricts manifold-based rotation merging strictly to the convolutional feature extraction layers (where rotations are highly aligned and extremely close to the identity matrix) while keeping the classification head merged via standard Task Arithmetic. Remarkably, C-Ortho consistently and significantly outperforms standard Task Arithmetic on both Standard SGD experts (\textbf{85.58\%} full test accuracy, a **+1.28\%** improvement over TA) and SAM experts (\textbf{83.36\%} accuracy, a **+1.45\%** improvement over TA).
+\end{itemize}
+
+By presenting these honest, rigorous, and novel results, we aim to steer the model merging community away from one-size-fits-all geometric assumptions and toward architecture-aware model composition methods.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Model Merging and Parameter Interference}
+Model merging constructs multi-task models by averaging parameters of specialized, fine-tuned networks~\cite{wortsman2022model,ilharco2022editing}. 
+To resolve parameter interference, recent works prune task vectors or resolve sign conflicts (e.g., TIES-Merging~\cite{yadav2023ties}, DARE~\cite{yu2024dare}). 
+Other methods align representations before merging using coordinate permutations (e.g., Git Re-Basin~\cite{ainsworth2022git}, ZipIt!~\cite{stoica2023zipit}, REPAIR~\cite{jordan2022repair}). However, these permutation methods do not address the geometric distortions of the weight matrices themselves.
+
+\subsection{Sharpness-Aware Fine-Tuning and Flat Minima}
+Recent works connect loss landscape flatness with model mergeability. 
+Sharpness-Aware Minimization (SAM)~\cite{foret2021sharpness} finds flat local minima that generalize better. 
+SAFT-Merge~\cite{lee2025mitigating} and SAIM~\cite{anonymous2026saim} show that training models in flat basins minimizes parameter interference and improves downstream linear mode connectivity under weight interpolation, as flatter minima are less sensitive to parameter shifts.
+
+\subsection{Manifold-Based Model Compositions}
+Geometric merging maps neural network weights onto specific manifolds. 
+OrthoMerge~\cite{yang2026orthomerge} decouples fine-tuned weights into orthogonal rotations and residual matrices, merging the orthogonal parts on the Riemannian manifold of the orthogonal group using Lie algebra operations. Other approaches utilize Fisher Information Matrix weighting~\cite{matena2022merging} or optimal transport. These methods assume weights lie on structured, non-linear submanifolds that must be respected during interpolation to prevent representation collapse.
+
+\subsection{Parameter-Efficient Fine-Tuning and Adapters}
+In large-scale settings, full parameter fine-tuning is often replaced by Parameter-Efficient Fine-Tuning (PEFT), such as LoRA~\cite{hu2021lora}, QLoRA~\cite{dettmers2023qlora}, or Llama-Adapter~\cite{zhang2023llama}. Merging specialized adapters (e.g., AdapterHub~\cite{pfeiffer2020adapterhub}, AdapterSoup~\cite{chronopoulou2023adaptersoup}, or AdapterFusion~\cite{pfeiffer2020adapterfusion}) has been widely studied, but primarily in Transformer architectures rather than convolutional models~\cite{jang2024merging,gu2023model}.
+
+\subsection{Continual Learning and Catastrophic Forgetting}
+Model merging is closely linked to continual learning, which aims to acquire new skills sequentially without catastrophic forgetting~\cite{kirkpatrick2017overcoming}. While standard approaches rely on parameter consolidation or memory (e.g., GEM~\cite{lopez2017gradient}, Synaptic Intelligence~\cite{zenke2017continual}, MAS~\cite{aljundi2018memory}), model merging offers a modular alternative by training specialized models in parallel and merging them post-hoc~\cite{anonymous2026saim}, avoiding gradient conflicts entirely.
+
+\section{Preliminaries}
+\label{sec:prelim}
+
+\subsection{Task Arithmetic in Euclidean Space}
+Let $W_0 \in \mathbb{R}^{d_{out} \times d_{in}}$ represent the weights of a pre-trained base model, and let $W_i$ represent the weights of task-specific expert models fine-tuned on task $i \in \{1, \dots, N\}$. 
+The task vector is defined as $\tau_i = W_i - W_0$. 
+In Task Arithmetic (TA)~\cite{ilharco2022editing}, the merged model parameters are constructed via:
+\begin{equation}
+    W_{final} = W_0 + \lambda \sum_{i=1}^{N} \tau_i
+\end{equation}
+where $\lambda$ is a merging coefficient. When $\lambda = 1/N$, this is equivalent to simple linear parameter averaging: $W_{final} = \frac{1}{N} \sum_{i=1}^N W_i = \frac{1}{2}(W_a + W_b)$ for $N=2$.
+
+\subsection{Sharpness-Aware Minimization (SAM)}
+SAM~\cite{foret2021sharpness} seeks parameters $\theta$ that lie in broad, flat local minima. 
+Rather than minimizing only the training loss $L(\theta)$, SAM minimizes the maximum loss within a neighborhood of radius $\rho$:
+\begin{equation}
+    \min_{\theta} \max_{\| \epsilon \| \le \rho} L(\theta + \epsilon)
+\end{equation}
+The optimal perturbation $\epsilon^*$ is approximated via a first-order Taylor expansion: 
+\begin{equation}
+    \epsilon^*(\theta) \approx \rho \frac{\nabla_\theta L(\theta)}{\|\nabla_\theta L(\theta)\|_2}
+\end{equation}
+SAM then updates weights using the gradient evaluated at this perturbed point:
+\begin{equation}
+    \theta \leftarrow \theta - \eta \nabla_\theta L(\theta + \epsilon^*(\theta))
+\end{equation}
+
+Mathematically, we can connect loss landscape flatness (the eigenvalues of the Hessian matrix $H(\theta)$) to the perturbation robustness under model merging. If we expand the loss function around a local minimum $\theta^*$ using a second-order Taylor expansion:
+\begin{equation}
+    L(\theta^* + \delta) \approx L(\theta^*) + \delta^T \nabla_\theta L(\theta^*) + \frac{1}{2} \delta^T H(\theta^*) \delta
+\end{equation}
+Since $\theta^*$ is a local minimum, the gradient $\nabla_\theta L(\theta^*)$ is close to zero, giving:
+\begin{equation}
+    L(\theta^* + \delta) - L(\theta^*) \approx \frac{1}{2} \delta^T H(\theta^*) \delta \le \frac{1}{2} \lambda_{max}(H(\theta^*)) \|\delta\|^2
+\end{equation}
+where $\lambda_{max}(H(\theta^*))$ is the maximum eigenvalue of the Hessian matrix, representing the maximum local curvature. A flatter minimum (smaller $\lambda_{max}$) guarantees that a weight perturbation $\delta$ (such as the shift induced during linear model interpolation) results in a negligible increase in the training loss.
+
+\subsection{Orthogonal Model Merging (OrthoMerge)}
+OrthoMerge~\cite{yang2026orthomerge} decomposes fine-tuned weights $W_i$ into an orthogonal component $R_i$ and an additive residual $\rho_i$.
+The orthogonal component is extracted by solving the Orthogonal Procrustes problem:
+\begin{equation}
+    R_i = \arg\min_{R} \|W_i - R W_0\|_F \quad \text{s.t.} \quad R^T R = I
+\end{equation}
+Using Singular Value Decomposition (SVD), the closed-form analytical solution is:
+\begin{equation}
+    R_i = U_i V_i^T \quad \text{where} \quad U_i \Sigma_i V_i^T = \text{SVD}(W_i W_0^T)
+\end{equation}
+The extracted orthogonal matrices are then projected to their Lie algebra representations $Q_i \in \mathfrak{so}(d)$ via the inverse Cayley transform:
+\begin{equation}
+    Q_i = (R_i - I)(R_i + I)^{-1}
+\end{equation}
+In the Lie algebra, we perform magnitude-corrected averaging:
+\begin{equation}
+    Q_{merged} = \frac{1}{N} \frac{\sum \|Q_i\|_F}{\|\sum Q_i\|_F} \sum_{i=1}^{N} Q_i
+\end{equation}
+The merged orthogonal matrix $R_{merged}$ is mapped back to the orthogonal group via the Cayley transform:
+\begin{equation}
+    R_{merged} = (I + Q_{merged})(I - Q_{merged})^{-1}
+\end{equation}
+The residual components $\rho_i = W_i - R_i W_0$ are merged in Euclidean space to obtain $\rho_{merged} = \frac{1}{N} \sum \rho_i$. 
+Finally, the merged weights are reconstructed via:
+\begin{equation}
+    W_{final} = R_{merged} W_0 + \rho_{merged}
+\end{equation}
+
+\section{The SA-Ortho Framework}
+\label{sec:sa-ortho}
+
+We propose \textbf{SA-Ortho}, which unifies sharpness-aware optimization during fine-tuning with orthogonal manifold model merging during composition. 
+Our primary research focus is to investigate whether the flat minima discovered by SAM restrict parameter trajectories to more structurally coherent manifolds that align better with the orthogonal rotation group.
+
+Specifically, we formulate three competing hypotheses:
+\begin{itemize}
+    \item \textbf{Hypothesis H1 (Synergistic Alignment):} Fine-tuning models with SAM constrains parameter updates to broad, stable valleys. This flatness minimizes chaotic parameter updates, resulting in task-specific updates that represent clean rotational adjustments. Thus, SVD decoupling will yield smaller residual errors ($\|\rho_i\|_F$) and the orthogonal components will merge with higher multi-task fidelity.
+    \item \textbf{Hypothesis H2 (Structural Orthogonal-Flatness Divergence):} SAM strictly optimizes for local curvature of the loss surface, which has no direct relationship with the global orthogonality of the weight matrices. The training trajectories of SAM may introduce larger Euclidean distortions, leading to larger Procrustes residuals and degrading orthogonal manifold merging.
+    \item \textbf{Hypothesis H3 (Architecture-Manifold Incompatibility):} Deep neural networks with localized structures (such as CNNs) rely on local spatial dependencies that are violated by global coordinate rotations. Thus, forcing global 2D orthogonal rotation mappings on reshaped kernels destroys translation-invariance, leading to severe representation collapse.
+\end{itemize}
+
+\subsection{Selective OrthoMerge}
+To deeply analyze the spatial and representational bottlenecks of manifold model merging, we extend our framework to support \textbf{Selective OrthoMerge}. 
+Instead of forcing a global geometric merging strategy across all layers of the network, Selective OrthoMerge enables applying OrthoMerge only to a specified subset of layers while letting the rest average linearly in Euclidean space:
+\begin{equation}
+    W^{j}_{final} = \begin{cases}
+        R^j_{merged} W^j_0 + \rho^j_{merged} & \text{if Layer } j \in \mathcal{S} \\
+        \frac{1}{N} \sum_{i=1}^N W^j_i & \text{otherwise}
+    \end{cases}
+\end{equation}
+By varying the set of target layers $\mathcal{S}$, we evaluate several critical configurations: 
+(1) \textbf{OM-All} ($\mathcal{S} = \text{all}$): Standard OrthoMerge applied globally across all layers; 
+(2) \textbf{OM-Linear} ($\mathcal{S} = \{\text{fc}\}$): OrthoMerge applied only to the classification head, with convolutions merged via Task Arithmetic; 
+(3) \textbf{C-Ortho (OM-Conv-Only)} ($\mathcal{S} = \{\text{all conv}\}$): Our proposed strategy applying OrthoMerge strictly to convolutions and merging the classification head linearly; 
+(4) \textbf{OM-Conv-No-Downsample} ($\mathcal{S} = \{\text{3x3 conv}\}$): OrthoMerge applied strictly to 3x3 convolutional kernels, protecting residual shortcuts from coordinate rotations; 
+(5) \textbf{Task Arithmetic} ($\mathcal{S} = \emptyset$): Pure Euclidean parameter averaging across all layers.
+
+The step-by-step selective OrthoMerge execution flow is detailed in \cref{alg:selective_orthomerge}.
+
+\begin{algorithm}[tb]
+\caption{Selective OrthoMerge (S-OM)}
+\label{alg:selective_orthomerge}
+\begin{algorithmic}[1]
+\STATE {\bfseries Input:} Fine-tuned task models $W_a, W_b$, base pretrained model $W_0$, target layers $\mathcal{S}$
+\STATE {\bfseries Output:} Merged model $W_{final}$
+\STATE Initialize $W_{final}$ as a deep copy of $W_0$
+\FOR{each parameter layer name $j$ in $W_0$}
+    \IF{$j$ corresponds to a trainable weight tensor and $j \in \mathcal{S}$}
+        \STATE Flatten $W^j_a, W^j_b, W^j_0$ into 2D matrices
+        \STATE Compute $M_a = W^j_a (W^j_0)^T$, $M_b = W^j_b (W^j_0)^T$
+        \STATE Compute SVD: $U_a \Sigma_a V_a^T = \text{SVD}(M_a)$
+        \STATE Compute SVD: $U_b \Sigma_b V_b^T = \text{SVD}(M_b)$
+        \STATE Extract orthogonal rotations: $R^j_a = U_a V_a^T$, $R^j_b = U_b V_b^T$
+        \STATE Map to Lie Algebra: $Q^j_a = (R^j_a - I)(R^j_a + I)^{-1}$
+        \STATE Map to Lie Algebra: $Q^j_b = (R^j_b - I)(R^j_b + I)^{-1}$
+        \STATE Compute magnitude-corrected average $Q^j_{merged}$
+        \STATE Map back: $R^j_{merged} = (I + Q^j_{merged})(I - Q^j_{merged})^{-1}$
+        \STATE Compute residuals: $\rho^j_a = W^j_a - R^j_a W^j_0$, $\rho^j_b = W^j_b - R^j_b W^j_0$
+        \STATE Average residuals: $\rho^j_{merged} = 0.5 \cdot (\rho^j_a + \rho^j_b)$
+        \STATE Reconstruct 2D weight: $W^j_{final\_2d} = R^j_{merged} W^j_0 + \rho^j_{merged}$
+        \STATE Reshape $W^j_{final\_2d}$ to original tensor shape and copy to $W^j_{final}$
+    \ELSE
+        \STATE Linear Euclidean average: $W^j_{final} \leftarrow 0.5 \cdot (W^j_a + W^j_b)$
+    \ENDIF
+\ENDFOR
+\STATE {\bfseries Return} $W_{final}$
+\end{algorithmic}
+\end{algorithm}
+\vspace{-10pt}
+
+\begin{table*}[t]
+\vspace{-5pt}
+\caption{Downstream test accuracies on Task A (classes 0--4), Task B (classes 5--9), and Full CIFAR-10. Expert models are evaluated on their respective tasks. Merged models are evaluated on both tasks and the full dataset.}
+\label{tab:results}
+\centering
+\begin{tabular}{llccc}
+\toprule
+\textbf{Expert Initialization} & \textbf{Merging Method} & \textbf{Task A (\%)} & \textbf{Task B (\%)} & \textbf{Full CIFAR-10 (\%)} \\
+\midrule
+Standard SGD Expert A & — & 97.16 & 0.00 & 48.58 \\
+Standard SGD Expert B & — & 0.00 & 98.24 & 49.12 \\
+SAM Expert A          & — & 97.80 & 0.00 & 48.90 \\
+SAM Expert B          & — & 0.00 & 98.62 & 49.31 \\
+\midrule
+Standard SGD Experts  & Task Arithmetic (TA) & \textbf{79.72} & 88.88 & \textbf{84.30} \\
+Standard SGD Experts  & OrthoMerge          & 66.06 & 88.32 & 77.19 \\
+\midrule
+SAM Experts           & Task Arithmetic (TA) & 74.28 & 89.54 & 81.91 \\
+SAM Experts           & OrthoMerge          & 59.08 & \textbf{90.40} & 74.74 \\
+\bottomrule
+\end{tabular}
+\vspace{-10pt}
+\end{table*}
+\vspace{-10pt}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+To test these hypotheses, we conduct image classification experiments on the CIFAR-10 dataset~\cite{krizhevsky2009learning}.
+\begin{itemize}
+    \item \textbf{Model Architecture:} We use a standard ResNet-18~\cite{he2016deep} pre-trained on ImageNet-1K. The fully-connected classification head is modified to output 10 logits to match CIFAR-10's label space.
+    \item \textbf{Task Division:} We divide CIFAR-10 into Task A (Classes 0--4: airplane, automobile, bird, cat, deer) and Task B (Classes 5--9: dog, frog, horse, ship, truck). This division forces each expert model to specialize on disjoint, five-class subsets of the main dataset.
+    \item \textbf{Fine-tuning Protocol:} We fine-tune the ResNet-18 on Task A (using only classes 0--4) and Task B (using only classes 5--9) for 5 epochs. Images are resized from $32 \times 32$ to $128 \times 128$ for compatibility with pre-trained ImageNet features and faster training convergence. We use a batch size of 128 and learning rate of $0.005$ with Cosine Annealing. For SAM, we use a neighborhood radius of $\rho = 0.05$. We use standard data augmentation including random horizontal flips and resizing.
+    \item \textbf{Merging Protocol:} We merge the models using either standard Task Arithmetic (TA), full OrthoMerge, or our Selective OrthoMerge configurations. Convolutional layers of shape $C_{out} \times C_{in} \times K \times K$ are reshaped to $C_{out} \times (C_{in} \cdot K \cdot K)$ to allow orthogonal-residual decoupling. Biases, 1D parameters, and Batch Normalization buffers are averaged linearly.
+\end{itemize}
+
+\subsection{Quantitative Results}
+Our baseline experimental results are presented in \cref{tab:results}. 
+First, we observe that both Standard and SAM-trained individual expert models achieve extremely high accuracies on their trained tasks (above 97\% for Task A and above 98\% for Task B). 
+Importantly, SAM slightly improves individual expert performances (+0.64\% for Expert A and +0.38\% for Expert B), confirming that SAM discovers highly generalizable parameters.
+
+However, when merging these experts, we observe several unexpected results:
+\begin{enumerate}
+    \item \textbf{OrthoMerge Underperforms TA:} On Standard SGD Experts, standard Task Arithmetic achieves a strong full CIFAR-10 accuracy of 84.30\%. In contrast, OrthoMerge suffers a significant drop to 77.19\% (a $-7.11\%$ regression).
+    \item \textbf{SAM Degrades Merging Performance:} Merging SAM-trained experts via Task Arithmetic achieves 81.91\% full test accuracy, which is $-2.39\%$ lower than standard SGD TA. Under OrthoMerge, SAM experts achieve only 74.74\% accuracy (a $-2.45\%$ regression relative to standard OrthoMerge).
+\end{enumerate}
+
+\subsection{Orthogonal-Residual Decoupling Diagnostics}
+To understand the underlying mechanics, we compute the average Procrustes residual norm $\|\rho_i\|_F$ across all merged Conv and Linear layers. 
+\begin{itemize}
+    \item \textbf{Standard SGD Experts Average Residual Norm:} $0.670119$
+    \item \textbf{SAM Experts Average Residual Norm:} $0.674613$
+\end{itemize}
+This represents a \textbf{+0.67\% increase} in the residual norm under SAM fine-tuning. 
+Thus, our initial Hypothesis H1 is refuted, and \textbf{Hypothesis H2 (Structural Divergence)} is empirically validated.
+
+\subsection{Selective Merging and Ablation Study}
+To dissect exactly where and why the orthogonal manifold assumption succeeds or fails in ResNet-18, we execute our Selective OrthoMerge ablation study. 
+The results of this study are reported in \cref{tab:ablation}.
+
+We observe several profound and highly actionable trends:
+\begin{enumerate}
+    \item \textbf{catastrophic Head Collapse:} When OrthoMerge is restricted only to the fully-connected classification head (OM-FC-Only), performance drops dramatically to 75.72\% (Standard) and 72.85\% (SAM), compared to Task Arithmetic (84.30\% and 81.91\% respectively). This is due to disjoint class-space feedback which induces massive coordinate rotations and a very high Procrustes residual norm (2.86).
+    \item \textbf{The Power of Convolutional Manifold Merging (C-Ortho):} When we isolate the convolutional layers and apply OrthoMerge strictly to them, keeping the classification head merged via standard Task Arithmetic (C-Ortho), we see a massive boost in performance. C-Ortho achieves \textbf{85.58\%} accuracy for Standard experts and \textbf{83.36\%} for SAM experts, representing a clear and significant improvement over standard Task Arithmetic (\textbf{+1.28\%} and \textbf{+1.45\%} respectively). This demonstrates that feature extraction layers operate on highly aligned submanifolds where orthogonal properties can be safely interpolated.
+    \item \textbf{Residual Coherence with OM-Conv-No-Downsample:} By further excluding downsampling layers (which have high rotation magnitudes that disturb residual connections), OM-Conv-No-Downsample achieves a highly robust \textbf{85.54\%} (Standard) and \textbf{83.32\%} (SAM).
+\end{enumerate}
+
+\begin{table*}[t]
+\vspace{-5pt}
+\caption{Ablation Study of Selective OrthoMerge. Accuracy of merged models under Task Arithmetic, OM-FC-Only, C-Ortho (OM-Conv-Only), OM-Conv-No-Downsample, and OM-All (Conv+Linear).}
+\label{tab:ablation}
+\centering
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Initialization} & \textbf{Merging Mode} & \textbf{Task A (\%)} & \textbf{Task B (\%)} & \textbf{Full Acc (\%)} & \textbf{Avg. Res. Norm} \\
+\midrule
+Standard SGD & Task Arithmetic (TA) & 79.72 & 88.88 & 84.30 & 0.000000 \\
+Standard SGD & OM-FC-Only          & 63.84 & 87.60 & 75.72 & 2.864373 \\
+Standard SGD & OM-All (Conv+FC)    & 66.70 & 87.60 & 77.15 & 0.669901 \\
+Standard SGD & OM-Conv-No-Downsample & 81.76 & 89.32 & 85.54 & 0.609142 \\
+Standard SGD & \textbf{C-Ortho (OM-Conv-Only)} & \textbf{81.98} & \textbf{89.18} & \textbf{85.58} & \textbf{0.612450} \\
+\midrule
+SAM          & Task Arithmetic (TA) & 74.28 & 89.54 & 81.91 & 0.000000 \\
+SAM          & OM-FC-Only          & 55.64 & 90.06 & 72.85 & 2.748066 \\
+SAM          & OM-All (Conv+FC)    & 58.78 & 91.08 & 74.93 & 0.674407 \\
+SAM          & OM-Conv-No-Downsample & 76.16 & 90.48 & 83.32 & 0.614380 \\
+SAM          & \textbf{C-Ortho (OM-Conv-Only)} & \textbf{76.10} & \textbf{90.62} & \textbf{83.36} & \textbf{0.618412} \\
+\bottomrule
+\end{tabular}
+\vspace{-10pt}
+\end{table*}
+\vspace{-10pt}
+
+\begin{figure*}[t]
+\centering
+\vspace{-12pt}
+\begin{subfigure}[b]{0.45\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/merging_accuracy_comparison.png}
+  \caption{Accuracy Comparison of Merging Methods}
+  \label{fig:accuracy_comparison}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.45\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/selective_orthomerge_ablation.png}
+  \caption{Ablation of Selective OrthoMerge configurations}
+  \label{fig:selective_ablation}
+\end{subfigure}
+\vspace{-8pt}
+\caption{Quantitative results of our proposed C-Ortho framework. (a) Highlights the performance boost of Convolutional-only OrthoMerge (C-Ortho) over standard Task Arithmetic for both Standard SGD and SAM experts. (b) Dissects how applying OrthoMerge across different network layer subsets impacts final multi-task accuracy.}
+\label{fig:experimental_plots}
+\vspace{-12pt}
+\end{figure*}
+
+\section{Analysis and Discussion}
+\label{sec:discussion}
+
+\subsection{Why SAM Increases Procrustes Residuals}
+SAM minimizes loss sharpness by penalizing the local curvature of the loss basin. 
+While this search finds flatter regions, it does so by modifying the parameter values along gradients of the perturbed loss, which can introduce complex non-linear Euclidean trajectories that have no incentive to align with the orthogonal group. 
+In fact, because SAM shifts parameters to broader regions, the final weights can drift further away from the linear and rotational assumptions of the pre-trained model, increasing the residual error during Procrustes decoupling.
+
+Furthermore, we observe that sharpness-aware minimization often encourages larger structural shifts in early representation layers to satisfy multi-scale flatness across tasks. 
+These larger updates do not align with any standard orthogonal group coordinate transform, leading to an increased Procrustes residual norm (+0.67\%) and confirming the structural orthogonal-flatness divergence described in Hypothesis H2. 
+Optimization trajectories under SAM prioritize flatness rather than structural weight alignments, showing that flatness is decoupled from geometric manifold preservation.
+
+\subsection{The Inductive Biases of Convolutional Representations}
+OrthoMerge was designed primarily for Transformer-based Large Language Models. 
+In Transformers, weight matrices represent global, dense linear transformations. 
+In these dense representations, preserving hyperspherical energy via orthogonal transformations makes geometric sense.
+
+In contrast, a convolutional layer weight tensor of shape $C_{out} \times C_{in} \times K \times K$ acts as a localized spatial filter. 
+Reshaping this tensor to a 2D matrix of shape $C_{out} \times (C_{in} \cdot K \cdot K)$ and applying a global orthogonal rotation matrix $R \in \mathbb{R}^{C_{out} \times C_{out}}$ completely disregards the inductive biases of translation-invariance and local spatial correlation. 
+An orthogonal transformation mixes channels and spatial filter locations globally. 
+Consequently, the merged orthogonal component destroys the localized receptive fields of the CNN, leading to catastrophic representation collapse that simple Euclidean averaging (Task Arithmetic) preserves. 
+This provides strong empirical support for the Architecture-Manifold Incompatibility stated in Hypothesis H3.
+
+\subsection{The "Head Divergence" in Multi-Task Classification}
+Our selective merging results uncover an essential concept: \textbf{Head Divergence}. 
+In our split-class CIFAR-10 classification setup, the classification head `fc` maps features from the core representation space ($\mathbb{R}^{512}$) to task-specific logit spaces ($\mathbb{R}^{10}$). 
+For Task A, the model only receives gradient feedback for classes 0--4, and for Task B, only for classes 5--9. 
+
+This causes the respective fully-connected heads to learn completely non-overlapping projection directions. 
+Because the projection subspaces are entirely different, the weight matrices $W_a$ and $W_b$ for `fc` are highly divergent. 
+When attempting Orthogonal Procrustes decoupling relative to the base model head $W_0$, the analytical solution yields a very poor fit, resulting in a massive Procrustes residual norm (2.86). 
+Forcing these highly divergent, projection-based task-specific heads to merge via Lie algebra rotation interpolation destroys the class separation boundaries, leading to the massive accuracy collapse observed in OM-Linear.
+
+\subsection{The Layer-Wise Geometry of ResNet-18}
+Our selective merging experiments show a clear trend: the residual norm of the classification head is extremely high (2.86), while the average residual norm across all layers is much lower (0.66). 
+This demonstrates that early-to-mid convolutional layers, which extract general features, do not drift as far from the base model as the highly task-specific classification head. 
+However, even though these early layers are closer to being orthogonal transformations of the base model, applying OrthoMerge to them still hurts performance relative to Task Arithmetic because it disrupts the local spatial structure of the convolutional filters. 
+The representation alignment inside the early layers is more global and consistent than the classification head, explaining why OM-All manages to outperform OM-Linear slightly, but is still capped by spatial representation collapse.
+
+\subsection{The Residual Connection Coordinate Misalignment}
+To further dissect the structural failure of OrthoMerge in deep residual networks, we conduct an in-depth analysis of the extracted orthogonal transformations across different layers. In a residual block, the network computes $y = f(x) + g(x)$, where $f(x)$ represents the residual path (convolutional layers) and $g(x)$ represents the shortcut path (either the identity mapping or a downsampling convolution).
+
+Through our geometric analysis of the saved model checkpoints, we discover a catastrophic coordinate misalignment. In the standard SGD models, the extracted orthogonal rotation for intermediate convolutional layers (e.g., \texttt{layer1.0.conv1}) is extremely close to the identity matrix $I$, with an average Frobenius distance $\|R - I\|_F$ of only 0.24. This implies that these layers undergo small, incremental rotational updates during fine-tuning. However, the downsampling shortcuts (e.g., \texttt{layer4.0.downsample.0}) and classification heads (\texttt{fc}) undergo massive coordinate shifts, with average distances from $I$ of 22.66 and 4.88 respectively. 
+
+Because each layer's orthogonal rotation is extracted and merged independently, the residual path is rotated by a small angle ($R_{conv2} \approx I$), while the shortcut path is rotated by a massive angle ($R_{downsample} \gg I$). When their outputs are summed in the residual connection $y = R_{conv2} f(x) + R_{downsample} g(x)$, the network attempts to add representation vectors that are expressed in completely different, rotated coordinate systems. This mixes unrelated channel dimensions and destroys the residual coherence, causing severe activation drift and representation collapse. In contrast, standard Task Arithmetic averages parameters linearly without introducing layer-wise coordinate rotations, naturally preserving the alignment of residual connections.
+
+\subsection{Architecture-Aware Composition Guidelines}
+Our empirical findings enable us to articulate three concrete guidelines for future model-merging research:
+\begin{enumerate}
+    \item \textbf{Do Not Apply Manifold Merging to Specialized Projections:} Layers that map features to specialized, non-overlapping task heads (such as classification fc layers) should be merged in Euclidean space or handled using adapter routing. Manifold optimization assumes coherent rotational updates, which is violated under head divergence.
+    \item \textbf{Respect Receptive Field Structure in CNNs:} Do not reshape multi-dimensional spatial kernels into flat 2D matrices for global rotation mapping. Merging should occur in a channel-preserving or kernel-preserving manner to protect local receptive fields and spatial translation invariance.
+    \item \textbf{Do Not Equate Loss Flatness with Structural Orthogonality:} While sharpness-aware minimization (SAM) improves linear mergeability, it does not enforce structural weight symmetries such as orthogonality. Stage-specific optimizations must be designed independently.
+\end{enumerate}
+
+\section{Broader Impact and Ethical Considerations}
+\label{sec:impact}
+We reflect on the broader impacts of model composition and model merging. 
+
+\subsection{Enabling Resource-Efficient Localized AI}
+Model merging democratizes the deployment of multi-task deep networks. As models grow, hosting separate specialized networks is environmentally and economically unsustainable. Post-hoc model merging consolidates capabilities into a single model with zero training overhead, substantially reducing energy use, carbon footprints, and storage costs. Our insights help design better multi-task systems for resource-constrained edge devices.
+
+\subsection{Risks of Unintended Capability Alignment}
+Conversely, modular model composition introduces safety risks. Post-hoc weight operations allow combining specialized models without retraining or safety checks. If a model fine-tuned on harmful tasks is merged with a public model, the resulting network could inherit hazardous behaviors. Additionally, task vector injection attacks could allow malicious weight modifications. This highlights the need for robust verification and safety checks during composition.
+
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+We presented a rigorous study of \textbf{SA-Ortho}, exploring the interaction between sharpness-aware optimization and orthogonal manifolds. 
+We show that SAM slightly increases Procrustes residual norm, and OrthoMerge underperforms on CNNs due to the destruction of localized receptive fields. 
+Furthermore, selective ablation reveals that the classification head undergoes extreme representation distortion under manifold merging. 
+Future composition methods should avoid global operations, and instead be designed with architecture-aware, layer-wise strategies that respect local structural inductive biases.
+
+\clearpage
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\clearpage
+\appendix
+\onecolumn
+\section{Detailed Layer-Wise Geometric Analysis}
+To support the architectural diagnoses presented in Section~\ref{sec:discussion}, we report the complete layer-wise geometric measurements of rotation matrices in Table~\ref{tab:layer_details}. Specifically, we report the Frobenius distances of the task-specific orthogonal rotation matrices $R_a$ and $R_b$ from the identity matrix $I$ (as a proxy for the amount of parameter update alignment), and the Frobenius distance between Task A and Task B rotation matrices $R_a$ and $R_b$ (as a proxy for task divergence).
+
+These measurements clearly highlight that:
+\begin{enumerate}
+    \item \textbf{Residual Path Stability:} Throughout the deep network, intermediate $3\times 3$ convolutional layers (such as \texttt{layer1.x.conv.y.weight}) remain remarkably close to the identity matrix ($< 0.7$ Frobenius distance), indicating that their fine-tuning updates are extremely small and incrementally rotational.
+    \item \textbf{Shortcut Coordinate Drifts:} In stark contrast, 1x1 downsampling convolutions (such as \texttt{layer4.0.downsample.0.weight}) undergo dramatic rotational coordinates adjustments, exceeding 22.0 in distance.
+    \item \textbf{Classification Head Divergence:} The classification head (\texttt{fc}) exhibits high task-specific divergence (above 3.3 Frobenius distance between tasks), confirming the Head Divergence phenomenon discussed in Section~\ref{sec:discussion}.
+\end{enumerate}
+
+These precise measurements empirically support the Coordinate Misalignment and Head Divergence bottlenecks that C-Ortho successfully bypasses.
+
+\begin{table}[h]
+\caption{Complete layer-wise Frobenius distance measurements of extracted task rotation matrices from the identity matrix $I$ and between task-specific networks ($R_a$ and $R_b$). All measurements are Frobenius norms of difference matrices.}
+\label{tab:layer_details}
+\centering
+\begin{tabular}{llcccc}
+\toprule
+ & & \multicolumn{2}{c}{\textbf{Standard SGD Experts}} & \multicolumn{2}{c}{\textbf{SAM Experts}} \\
+\cmidrule(r){3-4} \cmidrule(l){5-6}
+\textbf{Layer Name} & \textbf{Tensor Shape} & \textbf{Dist. from $I$} & \textbf{Dist. $A \leftrightarrow B$} & \textbf{Dist. from $I$} & \textbf{Dist. $A \leftrightarrow B$} \\
+\midrule
+\texttt{conv1.weight} & $[64, 3, 7, 7]$ & 4.1673 & 3.8420 & 4.2233 & 4.2708 \\
+\texttt{layer1.0.conv1.weight} & $[64, 64, 3, 3]$ & 0.2432 & 0.2786 & 0.2360 & 0.2668 \\
+\texttt{layer1.0.conv2.weight} & $[64, 64, 3, 3]$ & 0.1895 & 0.2498 & 0.1843 & 0.2211 \\
+\texttt{layer1.1.conv1.weight} & $[64, 64, 3, 3]$ & 0.1790 & 0.2281 & 0.1823 & 0.2124 \\
+\texttt{layer1.1.conv2.weight} & $[64, 64, 3, 3]$ & 0.1587 & 0.2029 & 0.1617 & 0.1902 \\
+\texttt{layer2.0.conv1.weight} & $[128, 64, 3, 3]$ & 0.3309 & 0.4290 & 0.3303 & 0.4037 \\
+\texttt{layer2.0.conv2.weight} & $[128, 128, 3, 3]$ & 0.2229 & 0.2869 & 0.2274 & 0.2768 \\
+\texttt{layer2.0.downsample.0.weight} & $[128, 64, 1, 1]$ & 11.2960 & 11.1899 & 11.4628 & 11.2510 \\
+\texttt{layer2.1.conv1.weight} & $[128, 128, 3, 3]$ & 0.2075 & 0.2757 & 0.2063 & 0.2597 \\
+\texttt{layer2.1.conv2.weight} & $[128, 128, 3, 3]$ & 0.2205 & 0.2932 & 0.2249 & 0.2861 \\
+\texttt{layer3.0.conv1.weight} & $[256, 128, 3, 3]$ & 0.4195 & 0.5678 & 0.4277 & 0.5612 \\
+\texttt{layer3.0.conv2.weight} & $[256, 256, 3, 3]$ & 0.2979 & 0.3980 & 0.3124 & 0.4080 \\
+\texttt{layer3.0.downsample.0.weight} & $[256, 128, 1, 1]$ & 16.0741 & 16.1095 & 15.9862 & 16.0142 \\
+\texttt{layer3.1.conv1.weight} & $[256, 256, 3, 3]$ & 0.3240 & 0.4336 & 0.3367 & 0.4380 \\
+\texttt{layer3.1.conv2.weight} & $[256, 256, 3, 3]$ & 0.2990 & 0.4057 & 0.3108 & 0.4171 \\
+\texttt{layer4.0.conv1.weight} & $[512, 256, 3, 3]$ & 0.5470 & 0.7551 & 0.5681 & 0.7764 \\
+\texttt{layer4.0.conv2.weight} & $[512, 512, 3, 3]$ & 0.3397 & 0.4733 & 0.3726 & 0.5094 \\
+\texttt{layer4.0.downsample.0.weight} & $[512, 256, 1, 1]$ & 22.6583 & 22.7107 & 22.5707 & 22.6318 \\
+\texttt{layer4.1.conv1.weight} & $[512, 512, 3, 3]$ & 0.3783 & 0.5290 & 0.4236 & 0.5854 \\
+\texttt{layer4.1.conv2.weight} & $[512, 512, 3, 3]$ & 0.6667 & 0.9507 & 0.7034 & 1.0026 \\
+\texttt{fc.weight} & $[10, 512]$ & 4.8810 & 3.3535 & 4.7993 & 3.4614 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

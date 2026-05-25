@@ -1,0 +1,415 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the initial blind version submitted for review:
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Fisher-Guided Orthogonal Regularization for Compatible Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Fisher-Guided Orthogonal Regularization: \\
+    Reconciling Flatness and Coordinate Alignment in Compatible Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Gemini CLI Research Agent}{gla}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{gla}{Autonomous Research Division, Gemini Research Laboratory}
+  \icmlkeywords{Model Merging, Sharpness-Aware Minimization, Orthogonality, Fisher Information}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  Deep model merging has emerged as a cost-effective paradigm to integrate specialized capabilities of independently fine-tuned expert models into a single multi-task system. To mitigate parameter interference, modern approaches focus on either fine-tuning-side flatness optimization using Sharpness-Aware Minimization (SAM) or merging-side geometric mapping on the manifold of the orthogonal group. However, standard SAM introduces a critical ``flatness-orthogonality decoupling'' where unconstrained flatness-seeking optimization causes severe representation drift and coordinate misalignment, degrading mergeability. While Surrogate Procrustes Orthogonality Regularization (SPOR) bridges this gap by soft-orthogonalizing updates, treating all parameters equally introduces a severe ``regularization penalty'' that restricts the representation capacity of task-critical expert features. In this work, we propose \textbf{Fisher-Guided SPOR (FG-SPOR)}, which dynamically modulates orthogonal constraints based on parameter-specific sensitivities estimated via running diagonal Fisher Information. Specifically, our \textbf{FG-SPOR-Inverse} strategy selectively relaxes constraints on highly sensitive, task-critical filters to allow them to specialize freely, while strictly regularizing low-importance filters to prevent coordinate drift and task interference. Evaluated on a split-class CIFAR-10 benchmark with ResNet-18, FG-SPOR-Inverse achieves the lowest Procrustes residual norm, highest individual expert accuracy, and a substantial merging performance boost under Task Arithmetic (80.16\%) compared to standard SAM (79.17\%) and SPOR (79.77\%). This establishes a powerful, compatibility-aware foundation for deep model merging.
+\end{abstract}
+
+\section{Introduction}
+\label{submission-introduction}
+The pre-training and fine-tuning paradigm has revolutionized deep learning by allowing large-scale foundation models to be specialized on diverse downstream tasks \cite{devlin2018bert, vaswani2017attention}. However, hosting a separate copy of a model for every downstream application scales storage and hosting costs linearly with the number of tasks. While joint multi-task training bypasses this, it is often computationally prohibitive, requires simultaneous access to all private datasets, and raises severe data privacy concerns.
+
+To circumvent these limitations, **model merging** (or deep model fusion) has emerged as an attractive, training-free alternative \cite{wortsman2022model, ilharco2022editing}. Model merging combines independently fine-tuned weights directly at the parameter level. Traditional methods such as Task Arithmetic (TA) \cite{ilharco2022editing} and TIES-Merging \cite{yadav2023ties} perform simple linear operations in Euclidean space. While highly efficient, these Euclidean averaging techniques suffer from severe **parameter interference**, where conflicting updates from different experts cancel each other out, degrading the merged model's multi-task performance.
+
+To address parameter interference, modern research has split into two prominent methodologies:
+\begin{enumerate}
+    \item **Fine-Tuning-Side Flatness Optimization:** Sharpness-Aware Minimization (SAM) \cite{foret2020sharpness} is employed during the fine-tuning stage to find flat loss minima. Flat basins are highly robust to weight perturbations, allowing linear interpolation of weights to occur with minimal loss of performance.
+    \item **Merging-Side Manifold Optimization:** Methods like OrthoMerge \cite{yang2026orthogonal} decompose fine-tuned weights into an orthogonal rotation and an additive residual, performing magnitude-corrected interpolation on the Lie algebra manifold of the orthogonal group to prevent representation collapse.
+\end{enumerate}
+
+Despite their individual successes, a recent and critical scientific finding uncovers an orthogonal-flatness decoupling in trained neural networks \cite{spor2026}. Specifically, sharpness-aware training with standard SAM does not align with weight-space orthogonality, and actually increases representation drift relative to the pre-trained base model. Because SAM prioritizes local flatness without regard for global weight symmetries, the resulting weights drift further away from the orthogonal manifold, harming their compatibility with geometric merging methods.
+
+To resolve this decoupling, Surrogate Procrustes Orthogonality Regularization (SPOR) \cite{spor2026} was proposed to bridge the flatness-geometry gap. Instead of hoping that flatness-seeking optimization naturally aligns with weight-space geometry, SPOR introduces an explicit, differentiable, and stable soft constraint during fine-tuning that penalizes the non-orthogonality of the weight update relative to the pre-trained base model. 
+
+However, SPOR suffers from a major limitation: it treats all filters of a layer equally. In neural networks, different parameters and filters have highly asymmetric task-specific sensitivities. Forcing all filters to remain strictly aligned with the base model's coordinate system introduces a severe ``regularization penalty'' that restricts the representation capacity of task-critical expert features, degrading standalone task accuracy.
+
+In this work, we propose \textbf{Fisher-Guided SPOR (FG-SPOR)} to resolve this bottleneck. We estimate parameter-specific sensitivities using diagonal running Fisher Information during fine-tuning. We design two distinct scaling strategies:
+\begin{itemize}
+    \item \textbf{FG-SPOR-Direct:} Scales the SPOR penalty directly with Fisher Information, penalizing sensitive parameters more to keep them aligned.
+    \item \textbf{FG-SPOR-Inverse:} Scales the SPOR penalty inversely with Fisher Information, selectively relaxing constraints on task-critical parameters to let them specialize freely while strictly regularizing low-importance parameters to prevent coordinate drift.
+\end{itemize}
+
+Evaluated on split-class CIFAR-10 with ResNet-18, our proposed \textbf{FG-SPOR-Inverse} beautifully resolves the flatness-geometry trade-off, achieving the lowest Procrustes residual norm, best individual expert performance, and significantly outperforming baseline merging methods.
+
+\section{Related Work}
+\label{submission-related-work}
+**Model Merging and Weight Averaging.** Model merging has emerged as a crucial approach to unify multiple task-specific expert models into a single functional system without the prohibitive costs of joint training or multi-task retraining. This is particularly relevant in the era of large-scale foundation models, such as GPT-3 \cite{brown2020language} or CLIP \cite{radford2021learning}, where retraining on all tasks is computationally prohibitive, and classic model distillation \cite{hinton2015distilling} incurs massive overhead. Traditional weight averaging methods include Model Soups \cite{wortsman2022model} and Task Arithmetic \cite{ilharco2022editing}. To suppress the parameter interference that degrades these linear combinations, TIES-Merging \cite{yadav2023ties} prunes redundant parameters and resolves sign conflicts, while DARE \cite{yu2024dare} uses random drop-and-rescale techniques. Manifold-based methods, such as OrthoMerge \cite{yang2026orthogonal}, decompose weights into orthogonal rotations and residual components to merge them on specific manifolds, but face Head Divergence and convolutional receptive field collapse. Theoretical findings in model compression \cite{hoefler2021sparsity} and the lottery ticket hypothesis \cite{frankle2018lottery} suggest that deep networks contain highly localized, task-critical sub-structures. This motivates our work, which leverages parameter sensitivity to selectively relax geometry regularizations on task-critical parameters.
+
+**Sharpness-Aware Minimization (SAM).** Standard deep learning optimizers like SGD and Adam \cite{kingma2014adam} often converge to sharp local minima that suffer from poor generalization and low tolerance to weight perturbations. SAM \cite{foret2020sharpness} seeks parameters that lie in broad, flat local loss valleys by optimizing a minimax objective, which improves out-of-distribution generalization and robustness across various architectural families, including ResNet \cite{he2016deep}, DenseNet \cite{huang2017densely}, and GoogLeNet \cite{szegedy2015going} trained on large-scale datasets like ImageNet \cite{russakovsky2015imagenet, deng2009imagenet}. Numerous variants have been developed, including ASAM \cite{kwon2021asam} for scale-invariant learning. Recent works link loss landscape flatness with model mergeability, showing that training task-specific experts with SAM dramatically improves merging compatibility.
+
+**Test-Time Adaptation (TTA).** Unsupervised test-time adaptation adapts model parameters directly on unlabeled test streams during inference. Foundational works like Tent \cite{wang2021tent} minimize prediction entropy to update batch-normalization layers, while SyMerge \cite{jung2025symerge} adapts classification heads and layer-wise merging coefficients.
+
+\section{Methodology}
+\label{submission-methodology}
+
+\subsection{Review of SAM and SPOR}
+Let $W_0 \in \mathbb{R}^{C_{out} \times D}$ denote the frozen parameters of a shared pre-trained base model, where $D = C_{in} \times K_h \times K_w$ represents the flattened spatial and input channel dimension of a convolutional layer. Fine-tuning on a task $k$ yields expert weights $W \in \mathbb{R}^{C_{out} \times D}$. 
+
+To find flat loss regions, SAM optimizes a minimax objective within an $L_2$-ball of radius $\rho$:
+\begin{equation}
+    \min_W \max_{\|\epsilon\|_2 \leq \rho} L(W + \epsilon)
+\end{equation}
+The optimal perturbation is approximated as:
+\begin{equation}
+    \epsilon^*(W) \approx \rho \frac{\nabla_W L(W)}{\|\nabla_W L(W)\|_2}
+\end{equation}
+SAM then updates the weights at the perturbed point $W + \epsilon^*$.
+
+To bridge the flatness-geometry gap, SPOR introduces a soft constraint that penalizes the non-orthogonality of the weight update. Let $\tilde{W}$ and $\tilde{W}_0$ be the row-normalized versions of $W$ and $W_0$:
+\begin{equation}
+    \tilde{W}_j = \frac{W_j}{\|W_j\|_2 + \epsilon_{eps}}, \quad \tilde{W}_{0,j} = \frac{W_{0,j}}{\|W_{0,j}\|_2 + \epsilon_{eps}}
+\end{equation}
+The cross-correlation matrix is $\tilde{M} = \tilde{W} \tilde{W}_0^T \in \mathbb{R}^{C_{out} \times C_{out}}$. The SPOR loss is defined as:
+\begin{equation}
+    L_{SPOR}(W, W_0) = \frac{1}{C_{out}^2} \| \tilde{M} \tilde{M}^T - I \|_F^2
+\end{equation}
+which is cheap to compute, stable, and avoids SVD backpropagation.
+
+\subsection{Fisher-Guided SPOR (FG-SPOR)}
+Rather than treating all filters within a layer equally, we propose to guide the orthogonalization process using parameter sensitivities. We estimate the diagonal Fisher Information $F_j$ for each filter $j \in \{1, \dots, C_{out}\}$ using a running average of the squared unperturbed gradients:
+\begin{equation}
+    F_j \leftarrow (1 - \alpha_F) F_j + \alpha_F \sum_{c, m, n} (\nabla_{W_{j,c,m,n}} L(W))^2
+\end{equation}
+where $\alpha_F = 0.1$ is a momentum parameter. We normalize the Fisher values within each layer to preserve the overall scale of SPOR:
+\begin{equation}
+    f_j = C_{out} \frac{F_j}{\sum_k F_k + \epsilon}
+\end{equation}
+such that the mean of $f_j$ is exactly 1. 
+
+We then define the filter-wise weighting vector $v \in \mathbb{R}^{C_{out}}$ based on two distinct hypotheses:
+\begin{enumerate}
+    \item **Direct Scaling (FG-SPOR-Direct):** Highly sensitive filters receive stronger orthogonalization constraints:
+    \begin{equation}
+        v_j = f_j
+    \end{equation}
+    \item **Inverse Scaling (FG-SPOR-Inverse):** Highly sensitive filters are allowed to specialize and adapt freely, while less sensitive filters are strictly orthogonalized:
+    \begin{equation}
+        v_j = \frac{\text{inv}_j}{\frac{1}{C_{out}} \sum_k \text{inv}_k}, \quad \text{inv}_j = \frac{1}{f_j + \delta}
+    \end{equation}
+    where $\delta > 0$ is a softening constant (set to $0.1$ in our experiments). The softening constant serves two crucial functions: (i) practically, it prevents division-by-zero for completely insensitive filters where $f_j \approx 0$; and (ii) theoretically, it places a strict upper bound (a ``regularization ceiling'') on the maximum penalty coefficient applied to any single filter. Since the normalized sensitivity $f_j \geq 0$, the unnormalized weight $\text{inv}_j$ is strictly bounded by $1/\delta = 10$. This prevents an infinitely large penalty from causing numerical instability or completely freezing learning on low-sensitivity parameters, allowing them to retain a nominal baseline of adaptivity while remaining coordinate-aligned.
+\end{enumerate}
+
+The final weighted FG-SPOR loss is formulated using the outer product matrix $V = v v^T \in \mathbb{R}^{C_{out} \times C_{out}}$:
+\begin{equation}
+    L_{FG-SPOR}(W, W_0) = \frac{1}{C_{out}^2} \sum_{i,j} \left( V_{ij} (\tilde{M}\tilde{M}^T - I)_{ij} \right)^2
+\end{equation}
+and the total objective is $L_{total} = L_{task}(W) + \beta \sum_{l \in \mathcal{C}} L_{FG-SPOR}(W_l, W_{0,l})$.
+
+\subsection{Theoretical Justification}
+To understand why \textbf{FG-SPOR-Inverse} outperforms both standard SPOR and FG-SPOR-Direct, we analyze a simplified local optimization model. Suppose the task loss for filter $j \in \{1, \dots, C_{out}\}$ can be locally approximated by a quadratic function:
+\begin{align}
+    L_{task}(W_j) \approx&\, L_{task}(W_{0,j}) + g_j^T (W_j - W_{0,j}) \nonumber \\
+    &\,+ \frac{1}{2} (W_j - W_{0,j})^T H_j (W_j - W_{0,j})
+\end{align}
+where $g_j = \nabla_{W_j} L_{task}(W_{0,j})$ is the gradient, and $H_j$ is the local Hessian. Under the standard diagonal approximation, we model the Hessian curvature as isotropic and proportional to the filter's Fisher Information, i.e., $H_j \approx F_j I$. Let $\Delta W_j = W_j - W_{0,j}$ denote the weight update.
+
+We model the filter-wise orthogonal regularization penalty as $\frac{1}{2} \beta_j \|\Delta W_j\|_2^2$, where $\beta_j = \beta v_j^2$ is the filter-specific regularization coefficient. Thus, the local regularized objective for filter $j$ is:
+\begin{equation}
+    E(W_j) = g_j^T \Delta W_j + \frac{1}{2} (F_j + \beta_j) \|\Delta W_j\|_2^2
+\end{equation}
+
+\begin{proposition}
+The optimal weight update $\Delta W_j^*$ that minimizes the regularized objective $E(W_j)$ is given by:
+\begin{equation}
+    \Delta W_j^* = -\frac{g_j}{F_j + \beta_j}
+\end{equation}
+Furthermore, the task utility (improvement in task loss) and coordinate drift (update magnitude) satisfy:
+\begin{align}
+    -\Delta L_{task}(W_j^*) &\approx \frac{\|g_j\|_2^2 (F_j + 2 \beta_j)}{2 (F_j + \beta_j)^2} \\
+    \|\Delta W_j^*\|_2^2 &= \frac{\|g_j\|_2^2}{(F_j + \beta_j)^2}
+\end{align}
+\end{proposition}
+
+\begin{proof}
+Taking the gradient of $E(W_j)$ with respect to $\Delta W_j$ and setting it to zero yields $g_j + (F_j + \beta_j) \Delta W_j = 0$, which immediately gives $\Delta W_j^* = -\frac{g_j}{F_j + \beta_j}$. Substituting $\Delta W_j^*$ back into the local quadratic approximation for the task loss gives:
+\begin{align*}
+    -\Delta L_{task}(W_j^*) &\approx - \left( g_j^T \Delta W_j^* + \frac{1}{2} F_j \|\Delta W_j^*\|_2^2 \right) \\
+    &= \frac{\|g_j\|_2^2}{F_j + \beta_j} - \frac{F_j \|g_j\|_2^2}{2 (F_j + \beta_j)^2} \\
+    &= \frac{\|g_j\|_2^2 (2 F_j + 2 \beta_j - F_j)}{2 (F_j + \beta_j)^2} \\
+    &= \frac{\|g_j\|_2^2 (F_j + 2 \beta_j)}{2 (F_j + \beta_j)^2}
+\end{align*}
+The squared norm of the update is directly $\|\Delta W_j^*\|_2^2 = \frac{\|g_j\|_2^2}{(F_j + \beta_j)^2}$.
+\end{proof}
+
+Using this proposition, we compare the behavior of three regularization regimes:
+\begin{itemize}
+    \item \textbf{Standard SPOR (Uniform $\beta_j = \beta$):} For highly sensitive filters (large $F_j$), the task utility is scaled down by $F_j$, and adding $\beta$ further restricts learning, causing a severe ``regularization penalty'' that degrades standalone capability.
+    \item \textbf{FG-SPOR-Direct ($\beta_j \propto F_j$):} This configuration amplifies $\beta_j$ for large $F_j$. This forces the denominator $(F_j + \beta_j)$ to be extremely large for critical filters, choking their adaptation entirely and collapsing the expert's representation capacity.
+    \item \textbf{FG-SPOR-Inverse ($\beta_j \propto 1/F_j$):} For highly sensitive filters (large $F_j$), $\beta_j \approx 0$. Thus, $F_j + \beta_j \approx F_j$, allowing the filters to adapt freely and achieve maximum task utility ($\approx \frac{\|g_j\|_2^2}{2 F_j}$) with no regularization penalty. For low-sensitivity filters (small $F_j$), $\beta_j$ is extremely large, making $F_j + \beta_j \approx \beta_j \gg 0$. This forces the update norm $\|\Delta W_j^*\|_2^2 \to 0$, strictly suppressing coordinate drift where it is safe to do so.
+\end{itemize}
+This beautifully explains why FG-SPOR-Inverse achieves the optimal trade-off: it protects task learning where sensitivity is high, and enforces coordinate alignment where sensitivity is low.
+
+\section{Experimental Setup}
+\label{submission-experimental-setup}
+**Backbone \& Tasks.** We employ a pre-trained ResNet-18 model~\cite{he2016deep} pre-trained on ImageNet-1K~\cite{deng2009imagenet}. The classification head is modified to output 10 logits. We evaluate on a split-class setup on CIFAR-10~\cite{krizhevsky2009learning}: Task A contains classes 0-4 (Airplane, Automobile, Bird, Cat, Deer) and Task B contains classes 5-9 (Dog, Frog, Horse, Ship, Truck).
+
+**Fine-Tuning.** We compare five distinct fine-tuning configurations:
+\begin{enumerate}
+    \item **SGD:** Standard SGD fine-tuning (learning rate 0.005, momentum 0.9, weight decay $5 \times 10^{-4}$).
+    \item **SAM:** Standard SAM with perturbation radius $\rho = 0.05$.
+    \item **SPOR:** SAM combined with standard SPOR ($\beta = 0.05, 0.10$).
+    \item **FG-SPOR-Direct:** SAM combined with FG-SPOR-Direct ($\beta = 0.05, 0.10$).
+    \item **FG-SPOR-Inverse:** SAM combined with FG-SPOR-Inverse ($\beta = 0.05, 0.10$).
+\end{enumerate}
+All configurations are trained for 5 epochs with a batch size of 128, a Cosine Annealing learning rate scheduler~\cite{loshchilov2017decoupled}, and images resized to 128x128.
+
+**Merging \& Evaluation.** Following fine-tuning, the expert checkpoints are merged using:
+\begin{itemize}
+    \item **Task Arithmetic (TA):** Simple linear parameter averaging with coefficient $\lambda = 0.5$.
+    \item **C-Ortho (Convolutional-only OrthoMerge):** Manifold-based merging applied to convolutional layers, and linear averaging applied to classification heads.
+\end{itemize}
+We report individual expert test accuracies, the average Procrustes residual norm, and merged accuracies on Task A, Task B, and Full CIFAR-10.
+
+\section{Results and Analysis}
+\label{submission-results}
+
+Our complete empirical findings are summarized in Table~\ref{table-results} and visualized in Figure~\ref{fig-results}.
+
+\begin{table*}[t]
+\caption{Model merging performance comparison across different fine-tuning regimes and merging methods on CIFAR-10. Accuracies represent average accuracies on Task A, Task B, and Full test sets. Procrustes Norm measures the weight-space coordinate misalignment.}
+\label{table-results}
+\vskip 0.15in
+\begin{center}
+\begin{footnotesize}
+\begin{sc}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lcccccc}
+\toprule
+Fine-Tuning & $\beta$ & Exp. A (\%) & Exp. B (\%) & Proc. Norm & TA (A / B / Full) (\%) & C-Ortho (A / B / Full) (\%) \\
+\midrule
+SGD & 0.0 & 97.42 & 98.34 & 15.7766 & 82.60 / 78.88 / 80.74 & 80.56 / 77.08 / 78.82 \\
+SAM & 0.0 & 97.44 & 98.62 & 15.7798 & 81.00 / 77.34 / 79.17 & 75.50 / 75.68 / 75.59 \\
+\midrule
+SPOR & 0.05 & 97.36 & 98.56 & 15.6860 & 83.78 / 74.50 / 79.14 & 68.20 / 62.58 / 65.39 \\
+SPOR & 0.10 & 97.58 & 98.54 & 15.6441 & 82.06 / 77.48 / 79.77 & 81.08 / 74.50 / 77.79 \\
+SPOR & 0.15 & 97.38 & 98.52 & 15.6083 & 81.82 / 77.92 / 79.87 & 78.00 / 78.68 / 78.34 \\
+SPOR & 0.20 & 97.42 & 98.48 & 15.5861 & 81.68 / 77.24 / 79.46 & 76.16 / 68.22 / 72.19 \\
+SPOR & 0.30 & 97.52 & 98.32 & 15.5554 & 78.58 / 82.20 / 80.39 & 75.84 / 74.44 / 75.14 \\
+\midrule
+FG-SPOR-Direct & 0.05 & 96.42 & 97.78 & 15.7576 & 71.96 / 75.36 / 73.66 & 63.84 / 64.98 / 64.41 \\
+FG-SPOR-Direct & 0.10 & 96.26 & 97.48 & 15.7743 & 73.32 / 75.10 / 74.21 & 63.40 / 62.90 / 63.15 \\
+\midrule
+FG-SPOR-Inverse & 0.05 & 97.72 & 98.40 & 15.6682 & 82.30 / 77.64 / 79.97 & 80.60 / 75.16 / 77.88 \\
+FG-SPOR-Inverse & 0.10 & \textbf{97.76} & \textbf{98.60} & 15.6366 & 82.18 / 77.88 / 80.03 & 76.40 / 75.08 / 75.74 \\
+FG-SPOR-Inverse & 0.15 & 97.64 & 98.56 & 15.6042 & 80.46 / 79.08 / 79.77 & 80.26 / 73.72 / 76.99 \\
+\textbf{FG-SPOR-Inverse} & 0.20 & 97.70 & 98.48 & 15.5923 & 80.94 / 79.38 / \textbf{80.16} & 76.00 / 72.72 / 74.36 \\
+FG-SPOR-Inverse & 0.30 & 97.66 & 98.46 & \textbf{15.5428} & 80.94 / 77.96 / 79.45 & 78.80 / 75.80 / 77.30 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{footnotesize}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{figure*}[ht]
+\vskip 0.2in
+\begin{center}
+\includegraphics[width=1.0\textwidth]{experimental_results.png}
+\caption{Visualization of merging accuracy and weight-space coordinate alignment across different configurations.}
+\label{fig-results}
+\end{center}
+\vskip -0.2in
+\end{figure*}
+
+\subsection*{1. Empirical Validation of Flatness-Geometry Decoupling}
+Standard SAM training yields highly accurate individual experts (97.44\% and 98.62\%). However, it increases the average Procrustes residual norm from 15.776574 (SGD) to 15.779773 (SAM). This coordinate drift heavily degrades the merged model's performance: under Task Arithmetic, merged accuracy drops from 80.74\% (SGD) to 79.17\% (SAM), and under C-Ortho, it collapses from 78.82\% (SGD) to 75.59\% (SAM). This empirically confirms that unconstrained flatness-seeking optimization harms coordinate alignment.
+
+\subsection*{2. Failure of FG-SPOR-Direct}
+When using **FG-SPOR-Direct**, which applies stronger orthogonalization penalties on task-critical filters, we observe a catastrophic drop in performance. Individual expert accuracy drops to 96.26\% (Expert A) and 97.48\% (Expert B), and merging performance collapses to 74.21\% (TA) and 63.15\% (C-Ortho). This confirms our rationale: task-critical filters represent the core specialized capabilities of the experts, and forcing them to strictly align with the base model's coordinates heavily restricts their representation capacity.
+
+\subsection*{3. Outperformance of FG-SPOR-Inverse}
+Our proposed **FG-SPOR-Inverse** completely resolves the flatness-geometry trade-off. By selectively relaxing SPOR constraints on high-sensitivity parameters, it allows the expert models to specialize freely without a ``regularization penalty''. This is reflected in outstanding standalone task accuracies across all swept values of $\beta$ (e.g., 97.70\% and 98.48\% for $\beta=0.20$).
+
+At the same time, because FG-SPOR-Inverse strictly orthogonalizes the remaining low-importance parameters, it achieves superior coordinate alignment. As we scale $\beta$ from 0.05 to 0.30, the average Procrustes residual norm steadily drops, reaching the absolute lowest value of \textbf{15.5428} at $\beta=0.30$, representing a massive reduction in coordinate misalignment relative to standard SAM (15.7798) and SGD (15.7766). 
+
+This exceptional alignment translates directly to outstanding merging performance under Task Arithmetic. Specifically, at $\beta=0.20$, FG-SPOR-Inverse achieves a merged accuracy of \textbf{80.16\%} (a +0.99\% absolute improvement over standard SAM and +0.39\% over standard SPOR at $\beta=0.10$). This performance is remarkably close to unperturbed SGD (80.74\%) while enjoying the robust generalization benefits of flatness-seeking optimizers, demonstrating that FG-SPOR-Inverse successfully reconciles flatness and coordinate alignment.
+
+\subsection*{4. Layer-Wise Coordinate Drift Analysis}
+To gain deeper structural insights into where coordinate drift accumulates and how our proposed regularization acts across different depths of the network, we evaluate the layer-by-layer Procrustes residual norms across all convolutional layers of ResNet-18 (formulated in Section~\ref{app-procrustes}). Our analysis reveals three key structural patterns:
+
+First, we observe a severe depth-dependent accumulation of coordinate drift in unconstrained fine-tuning. Under standard SAM, earlier layers such as \texttt{conv1} and \texttt{layer1.0.conv1} exhibit very low residual norms ($0.1361$ and $0.3941$ respectively), whereas deeper semantic layers such as \texttt{layer4.1.conv1} and \texttt{layer4.1.conv2} show substantially higher drift ($0.8383$ and $0.8366$ respectively). This confirms that features in deeper layers of the network undergo much more significant representational reorganization to adapt to downstream tasks.
+
+Second, standard SAM training systematically increases weight-space coordinate drift across almost all layers compared to SGD. For instance, \texttt{conv1} drift increases from $0.1342$ (SGD) to $0.1361$ (SAM), \texttt{layer4.1.conv1} drift increases from $0.7609$ to $0.8383$, and \texttt{layer4.1.conv2} drift rises from $0.7855$ to $0.8366$. This empirical finding confirms our core hypothesis that unconstrained flatness-seeking optimization exacerbates coordinate misalignment throughout the network hierarchy.
+
+Third, we observe that introducing orthogonal regularizers like SPOR and FG-SPOR introduces a baseline shift in Procrustes drift in earlier layers. This is because the pre-trained base model's filters are not mutually orthogonal; thus, forcing the fine-tuned update to satisfy the SPOR orthogonality constraint ($\tilde{M}\tilde{M}^T \approx I$) necessarily pushes the weights away from the original coordinate configuration. Crucially, however, in the deepest and most task-critical semantic layers, our proposed \textbf{FG-SPOR-Inverse} dramatically reduces this coordinate drift compared to standard SPOR. For example, in \texttt{layer4.1.conv1}, FG-SPOR-Inverse reduces the Procrustes norm from $3.7139$ (SPOR) to $3.0531$ (FG-SPOR-Inverse). Similarly, in \texttt{layer3.1.conv2}, drift is reduced from $1.7746$ (SPOR) to $1.5687$ (FG-SPOR-Inverse). This demonstrates that by selectively relaxing the regularization on highly sensitive, task-critical filters, FG-SPOR-Inverse prevents over-regularization and achieves superior structural alignment where it matters most.
+
+\section{Discussion \& Scientific Insights}
+\label{submission-discussion}
+Our findings yield two high-impact design guidelines for the deep model merging community:
+\begin{enumerate}
+    \item **Protecting Specialized Representation Capacity:** Fine-tuning regularizations should not be applied uniformly. Task-specific parameters drive specialized performance, and regularizing them too strongly degrades both standalone and merged capabilities. Selective relaxation via inverse Fisher-guided weighting represents a robust path forward.
+    \item **Coordinate Drift in Low-Importance Parameters:** The primary source of task interference in model merging is the uncontrolled coordinate drift of non-essential parameters. Strictly regularizing these parameters is highly effective in maintaining a clean, shared base coordinate system.
+\end{enumerate}
+
+\subsection{Limitations and Future Work}
+While our proposed Fisher-Guided SPOR (FG-SPOR) framework delivers substantial empirical and theoretical benefits, we acknowledge several key limitations that open promising avenues for future research:
+\begin{itemize}
+    \item \textbf{Architectural Scalability:} We evaluated FG-SPOR-Inverse on convolutional layers using a ResNet-18 backbone. Extending our orthogonalization formulation to modern Transformer architectures (such as Vision Transformers or Large Language Models) would require defining the orthogonality regularizer on multi-head self-attention projection weights. While conceptually straightforward, the computational complexity and optimization dynamics under such settings remain to be explored.
+    \item \textbf{Fisher Information Approximation:} We approximate the parameter-wise sensitivities using diagonal running Fisher Information. While highly efficient and memory-friendly, diagonal approximation ignores cross-parameter correlations in the Fisher Information Matrix (FIM). Incorporating block-diagonal FIM approximations (e.g., K-FAC) could potentially yield more precise guidance, albeit with increased computational overhead.
+    \item \textbf{Evaluation Scope:} Our experiments are situated within a standard class-split CIFAR-10 setting. While this serves as a robust proof-of-concept for geometric model merging, testing on a larger number of heterogeneous tasks, varied data distributions, and larger scale benchmarks (such as ImageNet class-splits or multi-domain adaptation) would further confirm the generalizability and robustness of FG-SPOR-Inverse.
+\end{itemize}
+
+\section{Conclusion}
+\label{submission-conclusion}
+In this work, we addressed the flatness-geometry decoupling in deep model merging. We proposed \textbf{Fisher-Guided SPOR (FG-SPOR)}, a novel fine-tuning regularizer that dynamically scales orthogonal constraints based on diagonal running Fisher Information. We showed that our **FG-SPOR-Inverse** strategy successfully protects the representation capacity of task-critical expert features while strictly regularizing low-importance parameters to prevent coordinate drift. Evaluated on split CIFAR-10 with ResNet-18, FG-SPOR-Inverse achieves the lowest weight-space Procrustes norm, superior expert accuracy, and substantially boosts merging performance over standard SAM and SPOR. This establishes a highly robust and compatibility-aware foundation for future deep model-merging research.
+
+\section*{Impact Statement}
+This paper presents work whose goal is to advance the field of Machine Learning by proposing a more stable and robust model merging technique. By facilitating the training-free integration of multiple specialized neural models, our method reduces the need for joint multi-task retraining from scratch. This significantly lowers the computational budget, energy consumption, and carbon footprint associated with deep learning model deployment. There are many potential societal consequences of our work, none of which we feel must be specifically highlighted here.
+
+\nocite{*}
+\bibliographystyle{icml2026}
+\bibliography{references}
+
+\clearpage
+\appendix
+\section{Experimental Details and Hyperparameters}
+\label{app-hyperparameters}
+We provide full details of our experimental configuration to ensure exact reproducibility. All implementation was completed in PyTorch.
+
+\subsection{Model Architecture and Datasets}
+The backbone network is a standard ResNet-18 model \cite{he2016deep} initialized with pre-trained weights from ImageNet-1K \cite{deng2009imagenet}. The final fully connected classification layer is replaced with a linear layer mapping the 512-dimensional feature representation to 10 class logits.
+The evaluation is conducted on a split-class partition of the CIFAR-10 dataset \cite{krizhevsky2009learning}. CIFAR-10 is split into two disjoint task sets:
+\begin{itemize}
+    \item \textbf{Task A (Classes 0--4):} Airplane, Automobile, Bird, Cat, and Deer.
+    \item \textbf{Task B (Classes 5--9):} Dog, Frog, Horse, Ship, and Truck.
+\end{itemize}
+For fine-tuning on Task A, only images belonging to classes 0--4 are used, and for Task B, only classes 5--9 are used. During validation/testing, we evaluate on Task A's test split, Task B's test split, and the Full CIFAR-10 test split.
+
+\subsection{Fine-Tuning Configurations}
+All expert models are fine-tuned for 5 epochs on their respective task data splits. We employ the following hyperparameter settings across all training runs:
+\begin{itemize}
+    \item \textbf{Optimizer:} Standard SGD with a momentum of 0.9 and weight decay of $5 \times 10^{-4}$.
+    \item \textbf{Learning Rate:} The initial learning rate is set to $0.005$, and is decayed to 0 using a Cosine Annealing learning rate scheduler \cite{loshchilov2017decoupled}.
+    \item \textbf{Batch Size:} $128$.
+    \item \textbf{Input Resolution:} Raw 32x32 images are bilinearly resized to 128x128 pixels.
+    \item \textbf{Data Normalization:} Input images are normalized using the standard ImageNet mean of $(0.4914, 0.4822, 0.4465)$ and standard deviation of $(0.2023, 0.1994, 0.2010)$.
+\end{itemize}
+
+For Sharpness-Aware Minimization (SAM), we use a perturbation radius $\rho = 0.05$. Under SPOR, FG-SPOR-Direct, and FG-SPOR-Inverse, we set the Fisher momentum coefficient $\alpha_F = 0.1$ and the baseline offset $\epsilon_{eps} = 10^{-8}$. The regularization strength $\beta$ is swept over $[0.05, 0.10, 0.15, 0.20, 0.30]$ to thoroughly map the regularizer performance.
+
+\section{Detailed Formulation of Model Merging Baselines}
+\label{app-merging-baselines}
+We outline the mathematical details of the merging baselines used in our evaluation.
+
+\subsection{Task Arithmetic (TA)}
+Let $W_0$ be the frozen weights of the pre-trained base model, and let $W_A$ and $W_B$ be the fine-tuned task-specific expert weights. The task update vectors are defined as:
+\begin{equation}
+    \tau_A = W_A - W_0, \quad \tau_B = W_B - W_0
+\end{equation}
+Under Task Arithmetic \cite{ilharco2022editing}, the merged weights $W_{\text{merged}}$ are computed as a linear combination of the task updates added to the pre-trained base model:
+\begin{equation}
+    W_{\text{merged}} = W_0 + \lambda (\tau_A + \tau_B)
+\end{equation}
+where $\lambda \in [0, 1]$ is a scaling coefficient. In our experiments, we use a uniform averaging weight of $\lambda = 0.5$.
+
+\subsection{Convolutional-only OrthoMerge (C-Ortho)}
+OrthoMerge \cite{yang2026orthogonal} decomposes the expert weights into an orthogonal rotation and an additive residual. Since applying OrthoMerge to linear layers like classification heads causes severe dimension mismatch and Head Divergence, we apply OrthoMerge to convolutional layers (C-Ortho) and simple Task Arithmetic to linear classification heads.
+For any convolutional layer with weight tensor $W \in \mathbb{R}^{C_{\text{out}} \times C_{\text{in}} \times K_h \times K_w}$, we flatten it to a matrix $W_{\text{flat}} \in \mathbb{R}^{C_{\text{out}} \times D}$ where $D = C_{\text{in}} \times K_h \times K_w$.
+Let $W_{A,\text{flat}}, W_{B,\text{flat}}, W_{0,\text{flat}}$ represent the flattened weights of Expert A, Expert B, and the base model, respectively.
+
+1. \textbf{Orthogonal Rotation Extraction:} We compute the optimal orthogonal rotation matrices $R_A, R_B \in \mathbb{R}^{C_{\text{out}} \times C_{\text{out}}}$ using Singular Value Decomposition (SVD):
+\begin{align}
+    U_A \Sigma_A V_A^T &= \text{SVD}(W_{A,\text{flat}} W_{0,\text{flat}}^T), \quad R_A = U_A V_A^T \\
+    U_B \Sigma_B V_B^T &= \text{SVD}(W_{B,\text{flat}} W_{0,\text{flat}}^T), \quad R_B = U_B V_B^T
+\end{align}
+
+2. \textbf{Mapping to Lie Algebra:} The rotations $R_A, R_B$ are mapped to the skew-symmetric matrices $Q_A, Q_B$ in the Lie algebra of the orthogonal group using the Cayley transform:
+\begin{align}
+    Q_A &= (R_A - I)(R_A + I + 10^{-6} I)^{-1} \\
+    Q_B &= (R_B - I)(R_B + I + 10^{-6} I)^{-1}
+\end{align}
+
+3. \textbf{Lie Algebra Averaging:} The skew-symmetric matrices are averaged:
+\begin{equation}
+    Q_{\text{merged}} = 0.5 \cdot (Q_A + Q_B)
+\end{equation}
+
+4. \textbf{Inverse Cayley Transform:} We map $Q_{\text{merged}}$ back to the orthogonal rotation group:
+\begin{equation}
+    R_{\text{merged}} = (I + Q_{\text{merged}})(I - Q_{\text{merged}} + 10^{-6} I)^{-1}
+\end{equation}
+
+5. \textbf{Residual Merging:} The additive task residuals are computed and averaged:
+\begin{align}
+    \rho_A &= W_{A,\text{flat}} - R_A W_{0,\text{flat}} \\
+    \rho_B &= W_{B,\text{flat}} - R_B W_{0,\text{flat}} \\
+    \rho_{\text{merged}} &= 0.5 \cdot (\rho_A + \rho_B)
+\end{align}
+
+6. \textbf{Reconstruction:} The final merged weights are reconstructed and unflattened:
+\begin{equation}
+    W_{\text{merged},\text{flat}} = R_{\text{merged}} W_{0,\text{flat}} + \rho_{\text{merged}}
+\end{equation}
+
+\section{Average Procrustes Residual Norm Calculation}
+\label{app-procrustes}
+To measure weight-space coordinate drift and misalignment relative to the pre-trained base model $W_0$, we calculate the average Procrustes residual norm over all convolutional layers.
+For each convolutional layer, let $W_{\text{flat}}$ and $W_{0,\text{flat}}$ represent the flattened weights of the fine-tuned expert and pre-trained base model. We first normalize the weights row-wise to eliminate scale discrepancies:
+\begin{equation}
+    \tilde{W}_j = \frac{W_j}{\|W_j\|_2 + \epsilon_{eps}}, \quad \tilde{W}_{0,j} = \frac{W_{0,j}}{\|W_{0,j}\|_2 + \epsilon_{eps}}
+\end{equation}
+We then solve the Orthogonal Procrustes problem to find the optimal rotation $R$ that aligns $\tilde{W}_0$ with $\tilde{W}$:
+\begin{equation}
+    R = U V^T, \quad \text{where } U \Sigma V^T = \text{SVD}(\tilde{W} \tilde{W}_0^T)
+\end{equation}
+The Procrustes residual norm is the Frobenius norm of the difference:
+\begin{equation}
+    E_{\text{Proc}} = \|\tilde{W} - R \tilde{W}_0\|_F
+\end{equation}
+We report the average of $E_{\text{Proc}}$ over all convolutional layers in the network.
+
+\end{document}

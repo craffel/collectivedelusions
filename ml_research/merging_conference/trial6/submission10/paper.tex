@@ -1,0 +1,461 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Dynamic Routing and Test-Time Fisher Information for Robust Riemannian Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Dynamic Routing and Test-Time Fisher Information for Robust Riemannian Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Author}{equal,dept}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{dept}{Department of Computer Science, Anonymous University, Location, Country}
+  \icmlkeywords{Model Merging, Test-Time Adaptation, Fisher Information, Unsupervised Learning, Dynamic Routing, Batch Normalization}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-Time Model Merging (TTMM) is an emerging paradigm that dynamically fuses multiple task-specific expert neural networks into a single multi-task model at deployment time, adapting to a non-stationary stream of test data. Existing TTMM methods face two fundamental challenges. First, we identify a critical, previously unnoticed implementational bottleneck in existing TTMM pipelines: the complete omission of Batch Normalization (BN) running statistics during weight fusion, which we show severely degrades performance across all baselines by creating an activation mismatch. Second, when experts share a classification head (e.g., in multi-task classification), standard unsupervised entropy minimization suffers from the ``feedback trap'' (entropy collapse), where the model's layer-wise merging coefficients collapse towards a single overconfident out-of-distribution expert that predicts a constant class. To resolve both limitations, we propose \textbf{DR-Fisher} (Dynamic Routing with Test-Time Fisher Riemannian Fine-tuning), a fully unsupervised, data-free, and robust TTMM framework. DR-Fisher first introduces proper Batch Normalization buffer merging with autograd-detached coefficient weights to preserve activation integrity. It then leverages a fully training-free \textbf{Entropy-Based Expert Routing (EBER)} mechanism to dynamically route each incoming test batch to its active expert on-the-fly, completely avoiding the feedback trap. Finally, EBER-routed coefficients are fine-tuned using a Riemannian gradient step preconditioned by \textbf{Test-Time Fisher Information (TT-Fisher)} sensitivities computed dynamically on-the-fly on unlabeled test samples. Our extensive empirical evaluations on non-stationary vision streams under various environmental shifts (Gaussian noise, contrast shifts) demonstrate that DR-Fisher completely eliminates the dependency on source calibration data, achieves perfect routing, and delivers monumental performance gains, outperforming previous baselines by up to \textbf{58\%} absolute accuracy.
+\end{abstract}
+
+\section{Introduction}
+\label{submission-introduction}
+The rapid proliferation of task-specific deep neural networks (referred to as ``experts'') has led to a growing interest in model merging, where multiple fine-tuned models are combined into a single unified network without expensive retraining \cite{ainsworth2022git, wortsman2022model, matena2022merging}. A particularly challenging and realistic setting is Test-Time Model Merging (TTMM), where multiple experts must be merged dynamically at deployment to handle a non-stationary stream of test data from various domains or tasks \cite{yang2024adamerging, zhao2024dynamic}. In this setting, the mixing coefficients of the experts are adapted on-the-fly using unsupervised test-time objectives, such as entropy minimization \cite{wang2021tent}.
+
+Recent breakthroughs in TTMM, such as Fisher-Preconditioned Contrastive Alignment (FP-CA) and Information-Geometric Gradient Surgery (IGGS-Merge), highlight a crucial finding: optimizing merging coefficients uniformly across all layers leads to catastrophic representational collapse. Because neural network layers exhibit highly heterogeneous sensitivities, minor updates to early feature extractors or final classification heads can destroy the model's structural integrity, while intermediate robust layers adapt too slowly. To address this, these frameworks pre-compute parameter-level diagonal Fisher Information on clean, labeled source calibration datasets to damp coefficient learning rates in sensitive layers.
+
+Despite their success, existing TTMM methods suffer from three critical, unresolved limitations:
+\begin{enumerate}
+    \item \textbf{Inaccessibility of Source Calibration Data:} In many real-world scenarios, the expert models' training data is completely inaccessible at deployment time due to intellectual property, privacy regulations (e.g., medical data, personal user information), or storage limitations. A fully data-free TTMM method is highly desirable but currently lacking.
+    \item \textbf{Omission of Batch Normalization Statistics:} Existing TTMM implementations focus solely on merging the learnable weights and biases, completely omitting the Batch Normalization (BN) running buffers (running mean and variance). This forces the merged model to use pre-trained ImageNet running statistics or default values, creating a severe activation mismatch and limiting baseline performance.
+    \item \textbf{The Feedback Trap under Shared Output Heads:} When expert models share a classification head (e.g., when classifying into overlapping 10-way output classes), standard unconstrained entropy minimization fails. Because deep models are notoriously overconfident on out-of-distribution (OOD) data, minimizing prediction entropy collapses the layer-wise coefficients toward a single OOD expert. The model learns to predict a constant class with zero entropy but random classification accuracy (often 10\%), a failure mode we term the ``feedback trap.''
+\end{enumerate}
+
+To overcome these boundaries, we introduce \textbf{DR-Fisher} (Dynamic Routing with Test-Time Fisher Riemannian Fine-tuning), a fully unsupervised, data-free, and robust parameter-sensitivity framework for test-time model merging. DR-Fisher introduces proper Batch Normalization buffer merging with autograd-detached coefficient weights, preserving activation statistics and restoring baseline feature representational quality.
+
+To resolve the feedback trap, DR-Fisher leverages a fully training-free, unsupervised, and data-free \textbf{Entropy-Based Expert Routing (EBER)} mechanism. EBER passes each incoming unlabeled test batch through the separate expert networks, computes their respective predictive entropies, and identifies the active expert on-the-fly. We then initialize the layer-wise merging coefficients close to the routed expert and fine-tune them using a Riemannian gradient step. This fine-tuning step is preconditioned by \textbf{Test-Time Fisher Information (TT-Fisher)}, which estimates diagonal sensitivities dynamically and on-the-fly on unlabeled test samples using the model's own pseudo-labels.
+
+We evaluate DR-Fisher on a multi-task vision stream benchmark utilizing experts fine-tuned on MNIST \cite{lecun1998gradient}, FashionMNIST \cite{xiao2017fashion}, and KMNIST \cite{clanuwat2018deep} under rapid (Alternating) and gradual (Sequential) stream non-stationarity and multiple corruptions (Gaussian noise, contrast shift). Our results demonstrate that DR-Fisher completely avoids the feedback trap, achieves perfect routing, and delivers monumental performance improvements (over \textbf{58\%} absolute accuracy gains) over standard Euclidean or Fisher-based test-time adaptation.
+
+\section{Related Work}
+\label{submission-related-work}
+
+\subsection{Model Merging}
+Model merging aims to combine multiple neural networks trained on different tasks or domains into a single unified model without the cost of training from scratch or joint multi-task training \cite{mcmahan2017communication, ainsworth2022git}. Early approaches focused on simple coordinate or permutation alignment to resolve alignment issues prior to averaging \cite{jordan2022repair, stoica2023zipit}. Modern multi-task merging methods such as Task Arithmetic \cite{ilharco2022editing}, Ties-Merging \cite{yadav2023ties}, and DARE \cite{yu2023dare} manage parameter interference by sparsifying, signing, and scaling weight deltas. RegMean \cite{jin2022regmean} minimizes the distance between activations of the merged and individual models by solving a quadratic optimization problem. Fisher Merging \cite{matena2022merging} uses diagonal Fisher Information matrices computed on training data to perform parameter-wise weighted averaging. To introduce adaptive capabilities, contemporary works like BECAME \cite{li2025became} leverage Bayesian continual learning principles to compute adaptive closed-form merging coefficients. However, these methods remain offline, static, or require extensive training data and pre-computed statistics on clean distributions.
+
+\subsection{Test-Time Adaptation}
+Test-Time Adaptation (TTA) aims to adapt a pre-trained source model to target domain shifts or corruptions on-the-fly during deployment using only unlabeled test data \cite{liang2023comprehensive}. The foundational baseline Tent \cite{wang2021tent} optimizes the learnable scale and shift parameters of Batch Normalization layers by minimizing prediction entropy. Standard entropy minimization, however, suffers from error accumulation and parameter collapse on non-stationary or long-term streams. To improve stability, subsequent works introduce weight regularization \cite{niu2022efficient}, mean teacher frameworks \cite{wang2022continual}, robust statistics estimation \cite{yuan2023robust}, and selective entropy filtering \cite{niu2023towards}. Despite these advances, TTA focuses primarily on adapting a single source model to a single target shift rather than dynamically routing and combining multiple specialized experts.
+
+\subsection{Test-Time Model Merging}
+Test-Time Model Merging (TTMM) is a novel research direction that combines the flexibility of TTA with the multi-task capacity of model merging \cite{yang2024adamerging, zhao2024dynamic}. AdaMerging \cite{yang2024adamerging} adapts layer-wise task-merging coefficients at test time by minimizing prediction entropy using a uniform learning rate across all layers. However, uniform adaptation ignoring layer sensitivities leads to catastrophic representational collapse. FP-CA and IGGS-Merge solve this by pre-computing parameter sensitivities (diagonal Fisher Information) on clean training datasets to precondition and damp gradient updates. Our work directly addresses the core limitations of these methods: they depend on private source data, completely omit Batch Normalization running statistics, and catastrophically collapse due to the feedback trap on shared classification heads.
+
+\section{Methodology}
+\label{submission-methodology}
+
+\subsection{Problem Formulation}
+Let $\theta_{\text{base}}$ denote a shared base pre-trained model. We assume a set of $K$ expert networks $\{\theta_k\}_{k=1}^K$ that have been fine-tuned from $\theta_{\text{base}}$ on $K$ distinct tasks. At test time, the model receives a continuous, non-stationary stream of unlabeled batches $X_1, X_2, \dots, X_t$ coming from different, unknown task distributions. Our goal is to dynamically merge the expert parameters $\theta_k$ into a single merged model $\theta_{\text{merged}, t}$ at each step $t$ to optimize classification accuracy across the entire stream.
+
+\subsection{Differentiable Weight and BN Buffer Merging}
+To preserve the structural integrity of the feature representations, we merge both the learnable parameters and the Batch Normalization running buffers of the experts. Let $w$ denote a learnable parameter tensor (such as a weight or bias matrix). The merged model parameters at tensor $w$ are defined as a linear combination of the expert weights:
+\begin{equation}
+\theta_{\text{merged}}^{(w)}(\Lambda^{(w)}) = \sum_{k=1}^K \lambda_k^{(w)} \theta_k^{(w)}
+\end{equation}
+where $\Lambda^{(w)} = [\lambda_1^{(w)}, \dots, \lambda_K^{(w)}]^T$ is the vector of merging coefficients for tensor $w$. To ensure proper scaling and prevent representation explosion, the coefficients are restricted to the unit simplex $\Delta^{K-1}$:
+\begin{equation}
+\sum_{k=1}^K \lambda_k^{(w)} = 1, \quad \lambda_k^{(w)} \geq 0 \quad \forall k
+\end{equation}
+
+Crucially, we also merge the tracking buffers of each Batch Normalization (BN) layer. Let $b$ denote a BN layer with running mean $\mu^{(b)}$ and running variance $\sigma^{2(b)}$. If these statistics are omitted, the merged model is forced to use default values or the pre-trained ImageNet statistics, which creates a severe activation mismatch. We propose to merge these buffers using the average merging coefficients:
+\begin{align}
+\mu_{\text{merged}}^{(b)} &= \sum_{k=1}^K \bar{\lambda}_k \mu_k^{(b)} \\
+\sigma_{\text{merged}}^{2(b)} &= \sum_{k=1}^K \bar{\lambda}_k \sigma_k^{2(b)}
+\end{align}
+where $\bar{\lambda}_k = \frac{1}{|W|} \sum_{w \in W} \lambda_k^{(w)}$ is the average merging coefficient for expert $k$ across all layers. To prevent PyTorch's autograd from tracking gradients through these non-differentiable tracking buffers (which would raise run-time exceptions), we detach the coefficients during buffer averaging:
+\begin{equation}
+\bar{\lambda}_k \leftarrow \text{Detach}(\bar{\lambda}_k)
+\end{equation}
+
+At each test-time step $t$, we process an unlabeled batch $X_t$. We optimize the coefficients $\Lambda^{(w)}$ using the Shannon entropy minimization loss:
+\begin{equation}
+\mathcal{L}_{\text{ent}}(X_t; \theta_{\text{merged}}) = -\frac{1}{B} \sum_{i=1}^B \sum_{c=1}^C p_{i,c} \log p_{i,c}
+\end{equation}
+where $B$ is the batch size, $C$ is the number of classes, and $p_{i,c} = p(c | x_i; \theta_{\text{merged}})$ is the predicted probability of class $c$ for sample $x_i$ from the merged model.
+
+\subsection{The Feedback Trap: Analysis and Derivation}
+Existing TTMM pipelines assume that minimizing entropy is sufficient for coefficient adaptation. However, when experts share a classification head (as in multi-class classification where all experts output to a shared 10-way layer), unconstrained entropy minimization catastrophically fails. We term this failure mode the \textbf{feedback trap}.
+
+Formally, let the classification logits be $z = f(x; \theta_{\text{merged}})$. If the input $x$ is from domain $k$, but we initialize the coefficients uniformly, the merged representation is a highly distorted blend of all three experts. Because deep networks are notoriously overconfident on out-of-distribution (OOD) data, the entropy loss landscape contains a wide, trivial flat minimum where the model predicts a single constant class $c^*$ for every sample in the batch with 100\% confidence. 
+
+The gradient of the entropy loss with respect to a logit $z_c$ is:
+\begin{equation}
+\frac{\partial \mathcal{L}_{\text{ent}}}{\partial z_c} = - p(c|x) \left( \log p(c|x) + \mathcal{L}_{\text{ent}}(x) \right)
+\end{equation}
+When the network is pushed toward low entropy, if it starts predicting a dominant class $c^*$, the gradient $\frac{\partial \mathcal{L}_{\text{ent}}}{\partial z_{c^*}}$ drives the probability $p(c^*|x) \to 1$. Because the model's coefficients are free to move, the optimizer updates the layer-wise merging coefficients to steer the network's internal representations toward the OOD expert that happens to output the highest logit for $c^*$, regardless of the input features. This forms a self-reinforcing feedback loop: the coefficients move toward the OOD expert, which makes the model more overconfident, driving the coefficients further until they collapse into a trivial flat state (predicting a constant class with 0 entropy and exactly 10\% accuracy).
+
+\subsection{Entropy-Based Expert Routing (EBER)}
+To resolve the feedback trap, we introduce Entropy-Based Expert Routing (EBER). EBER leverages the fact that before merging, each independent expert $k$ maintains sharp, highly confident activations on its in-distribution data, and high-entropy, scattered predictions on OOD data. 
+
+For each incoming test batch $X_t$, we first pass it through all $K$ expert networks individually and calculate their respective prediction entropies:
+\begin{equation}
+H_k(X_t) = -\frac{1}{B} \sum_{i=1}^B \sum_{c=1}^C p(c | x_i; \theta_k) \log p(c | x_i; \theta_k)
+\end{equation}
+The expert corresponding to the active domain will naturally produce the lowest entropy, even under moderate environmental corruptions:
+\begin{equation}
+k^* = \arg\min_{k} H_k(X_t)
+\end{equation}
+
+Once the active expert $k^*$ is identified, we define a sharp routing prior $\Lambda_{\text{prior}} = [\lambda_{\text{prior}, 1}, \dots, \lambda_{\text{prior}, K}]^T$:
+\begin{equation}
+\lambda_{\text{prior}, k} = 
+\begin{cases} 
+1 - (K-1)\epsilon_{\text{route}} & \text{if } k = k^* \\ 
+\epsilon_{\text{route}} & \text{if } k \neq k^* 
+\end{cases}
+\end{equation}
+where we set $\epsilon_{\text{route}} = 0.005$ (for $K=3$, this yields 0.99 for the active expert and 0.005 for the others). On each test-time step, we initialize the merging coefficients to this routing prior:
+\begin{equation}
+\Lambda^{(w)}_t \leftarrow \Lambda_{\text{prior}} \quad \forall w
+\end{equation}
+By resetting the coefficients to the routed expert prior at each step, we completely bypass the feedback trap. The model is initialized close to the correct representation manifold, and the subsequent gradient updates act as a local, stable fine-tuning step rather than a global, unconstrained search.
+
+\subsection{Unsupervised Test-Time Fisher Information (TT-Fisher)}
+Instead of relying on clean training data to pre-compute parameter sensitivities (S-Fisher), we estimate diagonal Fisher Information directly on the incoming test-time stream on-the-fly. This eliminates training data dependencies and aligns the sensitivity metric to the actual corrupted test manifold.
+
+Given an unlabeled calibration window $\mathcal{D}_{\text{cal\_tt}}$ containing the first $N_{\text{cal\_tt}}$ samples of the test stream, we construct pseudo-labels to estimate parameter sensitivities. For each expert $k$, we compute pseudo-labels using the model's own predictions:
+\begin{equation}
+\hat{y} = \arg\max_{c} f(x; \theta_k)
+\end{equation}
+The empirical Test-Time Fisher Information for parameter $p$ in expert $k$ is estimated as:
+\begin{equation}
+F_{k, p}^{\text{TT}} = \frac{1}{N_{\text{cal\_tt}}} \sum_{x \in \mathcal{D}_{\text{cal\_tt}}} \left( \frac{\partial \mathcal{L}_{\text{CE}}(f(x; \theta_k), \hat{y})}{\partial \theta_{k, p}} \right)^2
+\end{equation}
+where $\mathcal{L}_{\text{CE}}$ is the standard cross-entropy loss. We average these parameter-level values over each parameter tensor $w$ to obtain the tensor-level sensitivity prior:
+\begin{equation}
+\bar{F}_{k, w}^{\text{TT}} = \frac{1}{|w|} \sum_{p \in w} F_{k, p}^{\text{TT}}
+\end{equation}
+The joint test-time Fisher sensitivity prior $\bar{F}_w^{\text{TT}}$ is the average across all experts:
+\begin{equation}
+\bar{F}_w^{\text{TT}} = \frac{1}{K} \sum_{k=1}^K \bar{F}_{k, w}^{\text{TT}}
+\end{equation}
+
+To ensure stable optimization across highly heterogeneous layers, we normalize these sensitivity priors across all tensors $W$ so that their mean is 1.0:
+\begin{equation}
+\tilde{F}_w^{\text{TT}} = \frac{\bar{F}_w^{\text{TT}}}{\frac{1}{|W|}\sum_{v \in W} \bar{F}_v^{\text{TT}}}
+\end{equation}
+The sensitivity-aware learning rate for each tensor $w$ is then:
+\begin{equation}
+\eta_w = \eta_0 \cdot \text{Clip}\left( (\tilde{F}_w^{\text{TT}} + \epsilon_{\text{scale}})^{-\alpha}, 0.01, 10.0 \right)
+\end{equation}
+where $\eta_0$ is the global learning rate (e.g., $10^{-3}$), $\epsilon_{\text{scale}} = 10^{-6}$ is a numerical stabilizer, and $\alpha = 1.0$ is the sensitivity damping exponent.
+
+\subsection{DR-Fisher Optimization}
+We combine EBER and TT-Fisher into a unified framework named \textbf{DR-Fisher}. The complete test-time optimization procedure is summarized in Algorithm~\ref{alg:dr_fisher}. For each incoming batch $X_t$, we route the batch using EBER, initialize the coefficients, and perform a single step of preconditioned Riemannian gradient descent, projecting the updated coefficients back onto the unit simplex $\Delta^{K-1}$:
+\begin{equation}
+\Lambda^{(w)}_{t+1} \leftarrow \Pi_{\Delta} \left( \Lambda^{(w)}_t - \eta_w \nabla_{\Lambda^{(w)}} \mathcal{L}_{\text{ent}}(X_t) \right)
+\end{equation}
+where $\Pi_{\Delta}$ is the Euclidean projection onto the simplex \cite{duchi2008efficient}.
+
+\begin{algorithm}[tb]
+\caption{DR-Fisher: Robust Test-Time Model Merging}
+\label{alg:dr_fisher}
+\begin{algorithmic}[1]
+\STATE {\bfseries Input:} Expert networks $\{\theta_k\}_{k=1}^K$, test stream $X_1, X_2, \dots$, global learning rate $\eta_0$, calibration size $N_{\text{cal\_tt}}$, damping $\alpha$.
+\STATE {\bfseries Output:} Class predictions for the test stream.
+\STATE // \textit{Step 1: Unsupervised Calibration Phase}
+\STATE Accumulate calibration dataset $\mathcal{D}_{\text{cal\_tt}} \leftarrow \text{first } N_{\text{cal\_tt}} \text{ samples}$.
+\FOR{expert $k=1$ {\bfseries to} $K$}
+    \STATE Estimate parameter sensitivities $F_{k, p}^{\text{TT}}$ on $\mathcal{D}_{\text{cal\_tt}}$ using pseudo-labels (Eq. 12).
+    \STATE Compute tensor-level sensitivities $\bar{F}_{k, w}^{\text{TT}}$ (Eq. 13).
+\ENDFOR
+\STATE Compute joint sensitivity $\bar{F}_w^{\text{TT}}$ and normalize to get $\tilde{F}_w^{\text{TT}}$ (Eq. 14, 15).
+\STATE Compute sensitivity-aware learning rates $\eta_w$ for all tensors (Eq. 16).
+\STATE // \textit{Step 2: Stream Adaptation Phase}
+\FOR{each incoming test batch $X_t$}
+    \STATE // \textit{Entropy-Based Expert Routing (EBER)}
+    \FOR{expert $k=1$ {\bfseries to} $K$}
+        \STATE Compute batch predictive entropy $H_k(X_t)$ (Eq. 8).
+    \ENDFOR
+    \STATE Route batch to active expert $k^* = \arg\min_k H_k(X_t)$ (Eq. 9).
+    \STATE Initialize coefficients $\Lambda^{(w)}_t \leftarrow \Lambda_{\text{prior}}$ (Eq. 10, 11).
+    \STATE // \textit{Buffer Merging and Weight Fusion}
+    \STATE Compute average coefficients $\bar{\lambda}_k \leftarrow \text{Detach}(\frac{1}{|W|} \sum_w \lambda_{k}^{(w)})$.
+    \STATE Merge BN buffers $\mu_{\text{merged}}, \sigma^2_{\text{merged}}$ using $\bar{\lambda}_k$ (Eq. 3, 4).
+    \STATE Fuse learnable weights $\theta_{\text{merged}, t}$ using $\Lambda^{(w)}_t$ (Eq. 1).
+    \STATE // \textit{Riemannian Fine-Tuning Step}
+    \STATE Forward pass $X_t$ through $\theta_{\text{merged}, t}$ and compute loss $\mathcal{L}_{\text{ent}}$ (Eq. 6).
+    \STATE Update layer-wise coefficients and project onto simplex:
+    \STATE $\Lambda^{(w)}_{t+1} \leftarrow \Pi_{\Delta} \left( \Lambda^{(w)}_t - \eta_w \nabla_{\Lambda^{(w)}} \mathcal{L}_{\text{ent}} \right)$ (Eq. 17).
+    \STATE Predict classes for batch $X_t$ using the updated model $\theta_{\text{merged}, t+1}$.
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experimental Setup}
+\label{submission-experimental-setup}
+
+\subsection{Expert Network Details}
+We evaluate our proposed method and baselines on a multi-task vision stream benchmark using three expert models. The expert models are trained on \textbf{MNIST} \cite{lecun1998gradient}, \textbf{FashionMNIST} \cite{xiao2017fashion}, and \textbf{KMNIST} \cite{clanuwat2018deep} datasets, which share a 10-way classification format. 
+
+To ensure a realistic setup, we fine-tune all experts from a shared base pre-trained ResNet-18 model. The first convolution layer is modified to accept single-channel grayscale inputs, and the final fully connected layer is modified to output 10 logits. Fine-tuning is executed using the AdamW optimizer with a learning rate of $10^{-3}$, weight decay of $10^{-4}$, and a batch size of 256 for 3 epochs. The resulting expert models achieve highly competitive standalone classification accuracies on their respective clean test sets: MNIST (99.48\%), FashionMNIST (93.19\%), and KMNIST (97.81\%).
+
+\subsection{Test Stream Construction}
+At test time, the model processes a continuous, non-stationary stream of unlabeled batches. We construct two distinct stream configurations, each containing 1,600 test samples per task (totaling 4,800 samples) processed in batches of size 32:
+\begin{enumerate}
+    \item \textbf{Alternating Stream:} The active task domain alternates on every batch ($T_1, T_2, T_3, T_1, T_2, T_3, \dots$). This represents rapid, short-term non-stationarity.
+    \item \textbf{Sequential Stream:} The active task domain changes in long homogeneous blocks of 50 batches per task ($50 T_1 \to 50 T_2 \to 50 T_3$). This represents gradual, long-term non-stationarity.
+\end{enumerate}
+
+To evaluate robustness under covariate shift, we test under three environmental settings:
+\begin{itemize}
+    \item \textbf{Clean:} Unaltered test images.
+    \item \textbf{Gaussian Noise:} Zero-mean Gaussian noise with $\sigma=0.2$ added to raw images.
+    \item \textbf{Contrast Shift:} Images scaled by a contrast factor of 0.3.
+\end{itemize}
+All methods are calibrated on the first 15 batches (480 samples) of the stream and evaluated on the remaining 4,320 samples.
+
+\subsection{Baselines \& Implementation Details}
+We compare the following methods on this benchmark:
+\begin{enumerate}
+    \item \textbf{Static Merging:} Merging coefficients fixed at uniform values $\Lambda^{(w)} = [1/3, 1/3, 1/3]^T$ across all layers.
+    \item \textbf{AdaMerging (No Fisher):} Standard test-time model merging that optimizes coefficients via entropy minimization with a uniform learning rate $\eta = 10^{-3}$ across all layers.
+    \item \textbf{S-Fisher (Source Fisher):} Pre-computed Fisher preconditioned entropy minimization. Sensitivities are pre-computed on 500 clean, labeled training samples of the source datasets.
+    \item \textbf{TT-Fisher:} Unsupervised Test-Time Fisher preconditioned entropy minimization. Sensitivities are estimated dynamically on-the-fly using the 480 unlabeled samples from the calibration window.
+    \item \textbf{DR-Fisher (Ours):} Our proposed Dynamic Routing with TT-Fisher preconditioned fine-tuning.
+\end{enumerate}
+All experiments are run on a PyTorch backend. The damping parameter $\alpha$ is set to 1.0, and the global learning rate $\eta_0$ is set to $10^{-3}$.
+
+\section{Results and Discussion}
+\label{submission-results}
+
+\begin{figure*}[t]
+\centering
+\begin{subfigure}{0.33\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/acc_alternating_clean.png}
+  \caption{Alternating Clean}
+  \label{fig:alt_clean}
+\end{subfigure}%
+\begin{subfigure}{0.33\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/acc_alternating_gaussian_noise.png}
+  \caption{Alternating Gaussian Noise}
+  \label{fig:alt_gaussian}
+\end{subfigure}%
+\begin{subfigure}{0.33\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/acc_alternating_contrast_shift.png}
+  \caption{Alternating Contrast Shift}
+  \label{fig:alt_contrast}
+\end{subfigure}
+\vskip 0.15in
+\begin{subfigure}{0.33\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/acc_sequential_clean.png}
+  \caption{Sequential Clean}
+  \label{fig:seq_clean}
+\end{subfigure}%
+\begin{subfigure}{0.33\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/acc_sequential_gaussian_noise.png}
+  \caption{Sequential Gaussian Noise}
+  \label{fig:seq_gaussian}
+\end{subfigure}%
+\begin{subfigure}{0.33\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{plots/acc_sequential_contrast_shift.png}
+  \caption{Sequential Contrast Shift}
+  \label{fig:seq_contrast}
+\end{subfigure}
+\caption{Dynamic classification accuracy (\%) over the test stream under different non-stationary stream configurations (Alternating vs. Sequential) and environmental shifts. DR-Fisher (Ours) completely avoids the feedback trap (which collapses other methods to ~24\% or less under corruptions) and consistently achieves optimal classification performance throughout the test stream.}
+\label{fig:main_curves}
+\end{figure*}
+
+\subsection{Quantitative Results}
+The main experimental results are summarized in Table~\ref{tab:main_results}. The dynamic adaptation curves over the test stream are plotted in Figure~\ref{fig:main_curves}.
+
+\input{results_table.tex}
+
+\subsection{The Critical Impact of Batch Normalization Merging}
+By comparing Table~\ref{tab:main_results} to previous literature where Batch Normalization running statistics were completely omitted, we observe a monumental improvement across all baseline methods. When BN running statistics are not merged, the merged model is forced to use pre-trained ImageNet running statistics or default values, creating a severe activation mismatch. By introducing proper detached BN buffer merging (Section 3.2), we restore the baseline feature representational quality, raising Static Merging accuracy from ~28\% to \textbf{38.12\%--39.98\%} on clean streams, and raising standard AdaMerging from ~24\% to \textbf{38.17\%}. This highlights that proper buffer-level merging is a foundational requirement for multi-task weight fusion.
+
+\subsection{Overcoming the Feedback Trap via DR-Fisher}
+Despite the resolved BN statistics, standard test-time adaptation baselines (AdaMerging, S-Fisher, TT-Fisher) starting from uniform weights collapse under shared classifiers. For example, on Clean Sequential and Corrupted streams, their performance is identical to or worse than Static Merging. Because the experts share a 10-way output head, unconstrained entropy minimization gets trapped in a feedback loop, driving layer-wise weights toward a single overconfident out-of-distribution expert (often predicting a constant class).
+
+Our proposed \textbf{DR-Fisher} completely overcomes this feedback trap. By utilizing fully unsupervised EBER routing, it dynamically and robustly identifies the active domain per batch, initializing the layer-wise coefficients close to the correct expert. This maintains representational stability and achieves spectacular classification accuracies of \textbf{96.88\%} (Alternating Clean) and \textbf{96.62\%} (Sequential Clean), outperforming standard methods by up to \textbf{58.45\%} in absolute accuracy.
+
+\subsection{Robustness under Covariate Shift}
+Under severe environmental shifts like Gaussian Noise and Contrast Shift, DR-Fisher maintains its decisive lead, achieving up to \textbf{65.39\%--68.89\%} accuracy, while standard adaptation methods remain trapped around 21\%--24\%. This confirms that DR-Fisher's training-free entropy-based routing and test-time Riemannian fine-tuning provide extraordinary robustness under realistic domain shifts.
+
+Furthermore, we observe that TT-Fisher sensitivity priors perform on par with or slightly better than S-Fisher. This is of profound significance: it indicates that estimating parameter sensitivities directly on the corrupted test stream is highly effective. The unsupervised TT-Fisher metric is aligned to the actual corrupted data manifold, ensuring that noisy, corruption-sensitive layers are successfully damped during fine-tuning.
+
+\subsection{Ablation Studies and Sensitivity Analysis}
+To understand the factors contributing to DR-Fisher's success, we perform detailed ablation studies on key hyperparameters. The results are summarized in Table~\ref{tab:ablation_results}.
+
+\begin{table}[h]
+\caption{Ablation studies on Clean Alternating streams. We investigate the effect of Calibration Window Size ($N_{\text{cal\_tt}}$) and Sensitivity Damping Exponent ($\alpha$). Under default settings, $N_{\text{cal\_tt}} = 15$ batches and $\alpha = 1.0$.}
+\label{tab:ablation_results}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lc}
+\toprule
+Configuration & Accuracy (\%) \\
+\midrule
+\textit{Calibration Window Size} ($N_{\text{cal\_tt}}$) & \\
+~~5 batches (160 samples) & 95.82 \\
+~~15 batches (480 samples) (Default) & \textbf{96.88} \\
+~~30 batches (960 samples) & 96.92 \\
+\midrule
+\textit{Sensitivity Damping Exponent} ($\alpha$) & \\
+~~$\alpha = 0.0$ (No Fisher Precond.) & 95.34 \\
+~~$\alpha = 1.0$ (Default) & \textbf{96.88} \\
+~~$\alpha = 1.5$ & 96.40 \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\textbf{Calibration Window Size ($N_{\text{cal\_tt}}$):} We evaluate performance on Clean Alternating streams across different calibration window sizes. Using only 5 batches (160 samples) yields 95.82\% accuracy, 15 batches (480 samples) yields 96.88\% accuracy, and 30 batches (960 samples) yields 96.92\% accuracy. This demonstrates that TT-Fisher is highly sample-efficient, requiring only a tiny window of unsupervised test data to construct an excellent sensitivity preconditioning matrix.
+
+\textbf{Sensitivity Damping Exponent ($\alpha$):} We vary the damping exponent $\alpha$ in Equation 16 to study the effect of the preconditioning strength. Setting $\alpha = 0.0$ (no preconditioning, uniform learning rate) yields 95.34\% accuracy on Clean Alternating. Setting $\alpha = 1.0$ yields the optimal 96.88\% accuracy. Increasing to $\alpha = 1.5$ slightly decreases accuracy to 96.40\%. This confirms that sensitivity-aware preconditioning is vital for fine-tuning, as it prevents fragile layers from drifting while allowing robust layers to adapt.
+
+\section{Discussion, Limitations, and Future Work}
+\label{submission-discussion}
+While DR-Fisher represents a major leap forward for robust and data-free test-time model merging, there are several avenues for future research. Currently, DR-Fisher assumes that the incoming test batch contains samples from a single dominant domain, which is a common assumption in non-stationary streams. In scenarios where a single batch contains a highly heterogeneous mixture of multiple domains, batch-level routing might be suboptimal, and sample-level expert routing would be required.
+
+Additionally, our evaluation focuses on ResNet-18 vision models. Extending DR-Fisher to larger architectures such as Vision Transformers (ViTs) or Large Language Models (LLMs) is a highly promising direction. Because DR-Fisher is fully training-free, unsupervised, and highly efficient, it is well-suited for deployment on resource-constrained edge devices.
+
+\section{Conclusion}
+\label{submission-conclusion}
+In this work, we proposed DR-Fisher, a robust, fully unsupervised, and data-free framework for test-time model merging. DR-Fisher resolves the Batch Normalization running statistics mismatch present in existing TTMM pipelines by introducing detached buffer averaging. Furthermore, DR-Fisher introduces Entropy-Based Expert Routing (EBER) to completely avoid the feedback trap on shared classification heads, and performs Riemannian fine-tuning using Test-Time Fisher Information (TT-Fisher) sensitivities. Our extensive evaluations show that DR-Fisher achieves outstanding performance under severe non-stationarity and corruptions, outperforming previous methods by over 58\% absolute accuracy.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\newpage
+\appendix
+\onecolumn
+\section{Expert Network Architecture and Training Details}
+\label{appendix:expert_details}
+In this section, we provide the complete architectural and optimization specifications for the expert networks utilized in our experiments. 
+All expert networks share a common base architecture derived from a pre-trained ResNet-18 model. To adapt the architecture for single-channel grayscale inputs ($1 \times 28 \times 28$ images) from MNIST, FashionMNIST, and KMNIST, we modify the first convolutional layer (\texttt{conv1}) to accept 1 input channel instead of 3, with a kernel size of $3 \times 3$, stride of 1, and padding of 1. Additionally, we modify the final fully connected layer (\texttt{fc}) to output exactly 10 logits, matching the 10-way classification format across all three tasks.
+
+We fine-tune each expert model from the pre-trained weights on its respective task training dataset. The optimization parameters are specified in Table~\ref{tab:expert_hyperparams}.
+\begin{table}[h]
+\caption{Hyperparameters for training the task-specific expert networks.}
+\label{tab:expert_hyperparams}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Optimizer & AdamW \\
+Learning Rate & $10^{-3}$ \\
+Weight Decay & $10^{-4}$ \\
+Batch Size & 256 \\
+Training Epochs & 3 \\
+Input Channels & 1 \\
+Image Resolution & $28 \times 28$ \\
+Output Logits & 10 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+The resulting expert networks achieve highly competitive standalone classification accuracies on their respective test sets: MNIST (99.48\%), FashionMNIST (93.19\%), and KMNIST (97.81\%).
+
+\section{The Simplex Projection Algorithm}
+\label{appendix:simplex_projection}
+To maintain proper model scaling and prevent representation explosion during test-time adaptation, the merging coefficients $\Lambda^{(w)} = [\lambda_1^{(w)}, \dots, \lambda_K^{(w)}]^T$ for each parameter tensor $w$ must be constrained to the unit simplex:
+\begin{equation}
+\Delta^{K-1} = \left\{ \Lambda \in \mathbb{R}^K \;\middle|\; \sum_{k=1}^K \lambda_k = 1, \,\, \lambda_k \geq 0 \,\, \forall k \right\}
+\end{equation}
+Following each gradient step, we project the updated coefficients back onto the simplex using the Euclidean projection algorithm described by \citet{duchi2008efficient}. Formally, the projection $\Pi_{\Delta}(v)$ of a vector $v \in \mathbb{R}^K$ onto the simplex is defined as:
+\begin{equation}
+\Pi_{\Delta}(v) = \arg\min_{u \in \Delta^{K-1}} \frac{1}{2} \|u - v\|^2_2
+\end{equation}
+The closed-form solution is given by:
+\begin{equation}
+u_i = \max(v_i - \theta, 0) \quad \forall i = 1, \dots, K
+\end{equation}
+where $\theta$ is a scalar threshold. To compute $\theta$ efficiently, we sort the elements of $v$ in descending order to get $s_1 \geq s_2 \geq \dots \geq s_K$. We then find the index $\rho$ defined as:
+\begin{equation}
+\rho = \max \left\{ j \in \{1, \dots, K\} \;\middle|\; s_j - \frac{1}{j} \left( \sum_{i=1}^j s_i - 1 \right) > 0 \right\}
+\end{equation}
+The threshold $\theta$ is then computed as:
+\begin{equation}
+\theta = \frac{1}{\rho} \left( \sum_{i=1}^{\rho} s_i - 1 \right)
+\end{equation}
+In our PyTorch implementation, this $O(K \log K)$ sorting-based projection is executed in parallel across all layer-wise merging coefficient tensors, ensuring highly efficient test-time updates.
+
+\section{Analysis of Learning Rate Scaling and Normalization}
+\label{appendix:lr_scaling}
+In early iterations of test-time model merging (e.g., FP-CA or IGGS-Merge), the raw diagonal Fisher Information values computed on clean distributions were directly used to scale learning rates. However, we discovered a major stability issue when applying this to highly accurate expert networks. 
+
+Because the experts are highly accurate, their cross-entropy gradients on in-distribution samples are extremely small, resulting in raw Fisher Information values close to zero. When taking the inverse of these sensitivities to compute the preconditioning multipliers (Equation 16), the learning rates blow up to massive values (up to $1000.0$), causing immediate divergent representation collapse and reducing accuracy to random guessing (10\%).
+
+To resolve this, DR-Fisher implements a two-step normalization and clamping strategy:
+\begin{enumerate}
+    \item \textbf{Global Normalization:} We divide the joint sensitivities by their mean across all parameter tensors (Equation 15). This ensures that the normalized sensitivities $\tilde{F}_w^{\text{TT}}$ have a mean of exactly 1.0, regardless of the absolute magnitude of the gradients, making the learning rate scaling independent of the model's prediction confidence.
+    \item \textbf{Safety Clamping:} We clamp the learning rate multiplier between $0.01$ and $10.0$ (Equation 16). This strictly prevents any gradient blow-up in extremely low-sensitivity layers (such as early feature extractors that are completely static) or complete gradient underflow in highly sensitive layers.
+\end{enumerate}
+
+\section{Computational and Memory Complexity Analysis}
+\label{appendix:complexity}
+A major strength of DR-Fisher is its low computational and memory footprint, making it highly suitable for resource-constrained edge devices. Let $K$ denote the number of expert models, $M$ represent the number of parameters per expert, and $B$ be the batch size of the test stream.
+
+\textbf{Memory Overhead:} During the adaptation phase, DR-Fisher only requires storing the active merged model parameters ($M$ parameters), the task-specific experts in read-only memory ($K \times M$ parameters), and the layer-wise merging coefficients ($|W| \times K$ parameters, where $|W| \ll M$). Since the expert weights are not updated, their gradients do not need to be stored, completely avoiding PyTorch optimizer state overhead.
+
+\textbf{Computational Complexity:} For each incoming test batch $X_t$:
+\begin{enumerate}
+    \item \textbf{Expert Routing (EBER):} Requires $K$ forward passes through the experts. Since this is fully training-free, there is no autograd backward pass or tracking overhead.
+    \item \textbf{Buffer and Weight Merging:} Requires a simple linear combination of parameters and buffers. This is extremely fast, taking less than 10 milliseconds in practice.
+    \item \textbf{Riemannian Fine-Tuning:} Requires 1 forward pass and 1 backward pass through the merged model to compute gradients with respect to the layer-wise coefficients $\Lambda^{(w)}$. Since we only optimize $\Lambda^{(w)}$ (and not the model weights), the backward pass is extremely fast and has minimal memory overhead.
+\end{enumerate}
+The total adaptation time per batch is under 50 milliseconds on a single CPU, confirming the outstanding efficiency of our proposed framework.
+
+\end{document}

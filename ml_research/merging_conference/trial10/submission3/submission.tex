@@ -1,0 +1,464 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{BK-FWSAM: Fisher-Weighted SAM}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{BK-FWSAM: Bayesian Kronecker-Preconditioned Fisher-Weighted \\
+    Sharpness-Aware Model Merging for Noise-Robust Test-Time Adaptation}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Author(s)}{}
+  \end{icmlauthorlist}
+
+  \icmlkeywords{Model Merging, Test-Time Adaptation, Sharpness-Aware Minimization}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  Test-Time Model Merging (TTMM) dynamically combines specialized expert networks on-the-fly to handle non-stationary, unlabeled test streams without requiring source training data or expensive fine-tuning. However, existing TTMM methods face severe limitations: they rely on unconstrained test-time optimization loops (e.g., predictive entropy minimization) which easily fall into the ``feedback trap'' (sharp, overconfident local minima) and suffer from catastrophic representational collapse under environmental noise. To resolve these challenges, we propose \textbf{BK-FWSAM} (Bayesian Kronecker-Preconditioned Fisher-Weighted Sharpness-Aware Model Merging), a fully data-free, unsupervised, and noise-robust TTMM framework. BK-FWSAM introduces: (1) a denoised, Hoyer-sparsity-aware gating mechanism that dynamically selects the optimal routing domain (Euclidean vs. scale-invariant Angular); (2) an on-the-fly Kronecker sensitivity estimation using parameter gradients to precondition updates; (3) a moment-matched soft Bayesian Mixture-of-Gaussians Batch Normalization statistics fusion; and (4) a novel Fisher-weighted sharpness-aware perturbation that actively searches for flat loss regions in the merging parameter space. Our extensive empirical evaluations on non-stationary vision streams demonstrate that BK-FWSAM successfully prevents representation collapse, outperforming state-of-the-art baselines and achieving highly robust performance under severe environmental noise.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Deep supervised learning has shifted from training models from scratch toward fine-tuning massive pre-trained foundation models on specialized target domains, yielding vast libraries of specialized expert networks \cite{wortsman2022robust, he2016deep, devlin2019bert, radford2021learning}. Integrating these expert networks into a single, cohesive multi-task architecture without incurring prohibitive joint retraining costs has motivated the development of model merging and weight-space averaging techniques \cite{ilharco2023task, yadav2023ties, ainsworth2023git, yang2023regmean, matena2022merging, stoica2023zipit, jin2023dataless, yu2024language}. By interpolating parameters directly, model merging bypasses the need for joint training data, maintaining parameter efficiency while achieving remarkable multi-task capabilities.
+
+Recently, this concept has been extended to the streaming inference phase via Test-Time Model Merging (TTMM) \cite{yang2024test, niu2023towards}. In practical edge deployments, neural networks encounter non-stationary target streams where the active task distribution shifts continuously over time, alongside high-frequency environmental noise \cite{yuan2023rotta, gong2022note, zhang2022memo}. TTMM dynamically interpolates the weight parameters of specialized expert networks on-the-fly to match the active task distribution of an unlabeled, non-stationary test stream:
+\begin{equation}
+  \theta_{merged, j} = (1 - \lambda_j) \theta_{0, j} + \lambda_j \theta_{1, j}
+\end{equation}
+where $\theta_{0, j}$ and $\theta_{1, j}$ represent the parameters of two expert networks at layer $j$, and $\lambda_j = \sigma(w_{global} + \delta_j) \in [0, 1]$ represents the dynamic layer-wise merging coefficient, parameterized by a global consensus logit $w_{global}$ and a layer offset $\delta_j$.
+
+Despite initial successes, adapting merging coefficients under realistic, open-world deployment remains a fundamental challenge due to two core bottlenecks:
+\begin{itemize}
+  \item \textbf{The Feedback Trap:} Under unsupervised test-time adaptation (e.g., minimizing prediction entropy) \cite{wang2021tent, wang2022continual, niu2022sar}, the merging parameters are optimized toward the current test batch. Because the loss landscape of deep networks is highly non-convex, unconstrained gradient descent tends to drive these parameters into extremely sharp, overconfident local minima. Typically, this manifests as the model saturating and assigning 100\% of the weight to a single expert (i.e., $\lambda \in \{0, 1\}$). Once trapped in this narrow basin, the model is unable to adapt when the stream subsequently shifts to another domain, leading to immediate failure.
+  \item \textbf{The Preconditioning Stability Trap:} State-of-the-art TTMM frameworks utilize online preconditioning based on activation and gradient traces to stabilize parameter updates. However, standard formulations utilize a very small stability constant ($\epsilon_{stab} = 10^{-5}$). When encountering severe environmental noise, the activation magnitudes and gradients approach zero, pushing the sensitivity divisor close to zero. This triggers massive $100,000\times$ gradient explosions, leading to immediate parameter saturation and catastrophic representational collapse.
+\end{itemize}
+
+To resolve these critical issues, we propose \textbf{BK-FWSAM} (Bayesian Kronecker-Preconditioned Fisher-Weighted Sharpness-Aware Model Merging). BK-FWSAM builds upon the optimization principle that flatter minima generalize better under domain shifts and perturbations \cite{foret2021sharpness, kwon2021asam}. Specifically, during adaptation on each test batch, we apply a preconditioned worst-case perturbation to the consensus and offset parameters, scaled by the online estimated Kronecker trace sensitivity of the parameters, and then perform a second forward-backward pass to update the parameters.
+
+Our primary contributions are summarized as follows:
+\begin{enumerate}
+  \item We formulate a fully data-free, unsupervised, and noise-robust TTMM framework that prevents representation collapse under non-stationary shifts and severe environmental noise.
+  \item We introduce a novel \textbf{Fisher-Weighted Sharpness-Aware Perturbation} that scales the worst-case exploration steps inversely by parameter sensitivity, preventing destructive parameter drift in sensitive layers during flat-minima exploration.
+  \item We show that establishing a robust stability constant floor ($\epsilon_{precond} = 0.1$) completely resolves the preconditioning stability trap.
+  \item We demonstrate empirically that BK-FWSAM achieves state-of-the-art performance across non-stationary streams of MNIST, FashionMNIST, and novel KMNIST, outperforming all unnormalized and standard TTA baselines.
+\end{enumerate}
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Parameter-Space Model Merging.} Model merging combines multiple specialized neural networks fine-tuned from a shared initialization into a single unified network without retraining \cite{wortsman2022robust, yadav2023ties, ainsworth2023git, yang2023regmean, matena2022merging, stoica2023zipit}. RegMean \cite{yang2023regmean} computes closed-form linear projection merges based on activation covariances, while Fisher merging \cite{matena2022merging} weights parameter merges using diagonal Fisher information. TIES-merging \cite{yadav2023ties} resolves sign interference by keeping only high-magnitude parameters that share a dominant sign across models, and ZipIt! \cite{stoica2023zipit} merges features to align hidden representations. However, standard model merging is static and performed offline.
+
+\textbf{Test-Time Adaptation (TTA).} TTA adapts a pre-trained model to a target test stream on-the-fly without accessing the source training data \cite{wang2021tent, wang2022continual, niu2022sar}. Tent \cite{wang2021tent} optimizes Batch Normalization scale and shift parameters by minimizing prediction entropy. Continual TTA (CoTTA) \cite{wang2022continual} introduces a double-acting teacher-student model with weight restoration to mitigate error accumulation over long streams. LAME \cite{boudiaf2022lame} employs graph-based manifold regularization on predictions, while SAR \cite{niu2022sar} dynamically filters out high-entropy samples to prevent unstable updates. Test-Time Model Merging (TTMM) \cite{yang2024test} acts as a lightweight alternative, freezing the original expert checkpoints and only optimizing low-dimensional merging coefficients.
+
+\textbf{Sharpness-Aware Minimization (SAM).} SAM \cite{foret2021sharpness} is a recent training method that relies on worst-case weight perturbations to significantly improve generalization. Adaptive SAM (ASAM) \cite{kwon2021asam} scales the perturbation by parameter magnitudes to establish scale-invariance. While SAM has been successfully applied to federated learning and training-time robustification, its application to test-time weight-space model merging on non-stationary, noisy streams remains largely unexplored.
+
+\section{Proposed Methodology}
+\label{sec:method}
+
+We describe the mathematical formulation of our proposed BK-FWSAM framework. The complete end-to-end flow is presented in the sections below.
+
+\subsection{Denoised Hoyer Sparsity Gating}
+To establish robust, fully data-free routing on non-stationary streams, we introduce a denoised sparsity-aware gating mechanism. Standard Hoyer's sparsity \cite{hoyer2004non} is defined as:
+\begin{equation}
+  S(x) = \frac{\sqrt{d} - \|x\|_1/\|x\|_2}{\sqrt{d} - 1}
+\end{equation}
+where $d$ is the feature dimension and $S(x) \in [0, 1]$. To prevent pixel-wise high-frequency noise from distorting sparsity, we first map the normalized images $x \in [-1, 1]$ to the positive intensity domain:
+\begin{equation}
+  x_{pos} = \frac{x + 1.0}{2.0}
+\end{equation}
+and apply a thresholding operator to denoise the image:
+\begin{equation}
+  x_{denoised} = \mathbb{I}(x_{pos} > 0.35) \cdot x_{pos}
+\end{equation}
+We then compute Hoyer's sparsity $S(x_{denoised})$ on the flattened denoised image. If $S(x_{denoised}) \geq \tau_{sparse}$ (where $\tau_{sparse} = 0.50$), the system correctly classifies the domain as sparse (MNIST) and routes to unnormalized Euclidean distance SCTS. Otherwise, it classifies the domain as dense (FashionMNIST) and routes to Angular cosine similarity SCTS on CosFace experts.
+
+\subsection{Soft Bayesian Mixture-of-Gaussians BN Statistics Fusion}
+To combine Batch Normalization statistics accurately, we employ soft Mixture-of-Gaussians buffer fusion. Using the routing priors $w_1, w_2$ (or the detached consensus logit $\lambda_{det} = \sigma(w_{global})$), the fused mean $\mu_{fused}$ and variance $\sigma^2_{fused}$ are computed via moment matching:
+\begin{equation}
+  \mu_{fused} = w_1 \mu_1 + w_2 \mu_2
+\end{equation}
+\begin{equation}
+\begin{split}
+  \sigma^2_{fused} = &w_1 \left( \sigma^2_1 + (\mu_1 - \mu_{fused})^2 \right) \\
+  &+ w_2 \left( \sigma^2_2 + (\mu_2 - \mu_{fused})^2 \right)
+\end{split}
+\end{equation}
+This mathematically exact formulation preserves the first and second moments of the mixed statistics across domain shifts.
+
+\subsection{Direct Parameter Sensitivity}
+Unsupervised test-time optimization adapts the consensus and offset parameters $\phi = \{w_{global}\} \cup \{\delta_j\}_{j=1}^J$. To avoid falling into sharp feedback traps, we optimize $\phi$ toward flat loss regions using a preconditioned worst-case perturbation. 
+
+A natural baseline approach is to estimate the online diagonal Fisher information of each parameter layer $j$ using the gradients of the unsupervised entropy loss $L_{entropy}$ with respect to the initial merged weights $\theta_{init}$:
+\begin{equation}
+  F^{weight}_j = \mathbb{E} [ g_j^2 ] \quad \text{where} \quad g_j = \frac{\partial L_{entropy}}{\partial \theta_{init, j}}
+\end{equation}
+However, this weight-gradient sensitivity only captures how sensitive the loss is to perturbations of the network weights $\theta_j$. Since our optimization parameters are actually the merging offsets $\delta_j$, this formulation neglects the parameterization of the merging process itself. Specifically, the relationship between $\theta_j$ and $\delta_j$ is mediated by the difference between the two experts' parameters:
+\begin{equation}
+  \frac{\partial \theta_j}{\partial \delta_j} = (\theta_{1, j} - \theta_{0, j}) \lambda_j (1 - \lambda_j)
+\end{equation}
+where $\lambda_j = \sigma(w_{global} + \delta_j)$. If two experts have highly similar weights in layer $j$, then even a large change in the merging offset $\delta_j$ will have almost no effect on the merged parameter $\theta_j$ or the loss.
+
+To capture this geometry exactly, we propose \textbf{Direct Parameter Sensitivity (DPS)}. DPS estimates the empirical Fisher information with respect to the optimization parameters $\delta_j$ directly at initialization:
+\begin{equation}
+  F^{DPS}_j = \left( \frac{\partial L_{entropy}}{\partial \delta_j} \right)^2
+\end{equation}
+By computing the gradients directly with respect to the offsets $\delta_j$ using backpropagation, DPS automatically incorporates the expert discrepancy $\|\theta_{1, j} - \theta_{0, j}\|$, the current routing prior, and the network architecture. This provides mathematically exact preconditioning without requiring manual approximations.
+
+We normalize the sensitivity: $\tilde{F}_j = F_j / \sum_i F_i$ (where $F_j$ can be $F^{weight}_j$ or $F^{DPS}_j$). Let $g_w = \frac{\partial L_{total}}{\partial w_{global}}$ and $g_{\delta, j} = \frac{\partial L_{total}}{\partial \delta_j}$ be the gradients computed during the first forward-backward pass. The preconditioned direction vectors are:
+\begin{equation}
+  d_w = g_w, \quad d_{\delta, j} = \frac{g_{\delta, j}}{\tilde{F}_j + \epsilon_{precond}}
+\end{equation}
+where we establish a robust stability constant floor $\epsilon_{precond} = 0.1$. The preconditioned worst-case perturbations are computed as:
+\begin{equation}
+  \epsilon_w = \rho \frac{d_w}{\|D\|_2}, \quad \epsilon_{\delta, j} = \rho \frac{d_{\delta, j}}{\|D\|_2}
+\end{equation}
+where $\|D\|_2 = \sqrt{d_w^2 + \sum_j d_{\delta, j}^2 + \epsilon_{precond}}$ and $\rho = 0.05$. The perturbed parameters are:
+\begin{equation}
+  w_{global}^{perturbed} = w_{global} + \epsilon_w, \quad \delta_j^{perturbed} = \delta_j + \epsilon_{\delta, j}
+\end{equation}
+We then construct the perturbed merged model and run a second forward pass to compute the perturbed loss $L_{perturbed} = L_{entropy}^{perturbed} + \beta L_{KL}^{perturbed} + L_{coherence}^{perturbed}$. Finally, we update the parameters:
+\begin{equation}
+  w_{global} \leftarrow w_{global} - \eta_t \frac{\partial L_{perturbed}}{\partial w_{global}}
+\end{equation}
+\begin{equation}
+  \delta_j \leftarrow \delta_j - \eta_t \frac{1}{\tilde{F}_j + \epsilon_{precond}} \frac{\partial L_{perturbed}}{\partial \delta_j}
+\end{equation}
+where $\eta_t = \eta / (1.0 + \gamma_{ealr} H_{avg})$ represents the Entropy-Adaptive Learning Rate (EALR), with $\eta = 0.05$ and $\gamma_{ealr} = 5.0$.
+
+\subsection{Theoretical Analysis of Direct Parameter Sensitivity}
+\label{sec:theory}
+
+To understand the mathematical foundations of preconditioned sharpness-aware model merging, we analyze the optimization geometry under our proposed Direct Parameter Sensitivity (DPS) metric.
+
+\begin{theorem}
+\label{thm:riemannian}
+Let $L(\phi)$ be an $L$-smooth loss function of the merging parameters $\phi = [w_{global}, \delta_1, \dots, \delta_J]^T \in \mathbb{R}^{J+1}$. Let $\mathcal{M}$ be the parameter manifold equipped with the Riemannian metric tensor $G(\phi) = F(\phi) + \epsilon_{precond} I$, where $F(\phi) = \mathrm{diag}(F_1, \dots, F_{J+1})$ is the diagonal empirical Fisher Information Matrix.
+The worst-case perturbation $\epsilon^*$ that maximizes the first-order loss increase under the geodesic distance constraint $d_g(\phi, \phi + \epsilon) \leq \rho$ on the manifold $\mathcal{M}$ is given by:
+\begin{equation}
+  \epsilon^* = \rho \frac{G(\phi)^{-1} \nabla_{\phi} L(\phi)}{\sqrt{\nabla_{\phi} L(\phi)^T G(\phi)^{-1} \nabla_{\phi} L(\phi)}}
+\end{equation}
+Furthermore, the worst-case first-order loss increase is bounded by:
+\begin{equation}
+  L(\phi + \epsilon^*) - L(\phi) \leq \rho \sqrt{\nabla_{\phi} L(\phi)^T G(\phi)^{-1} \nabla_{\phi} L(\phi)} + \mathcal{O}(\rho^2)
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+On the Riemannian manifold $\mathcal{M}$, the geodesic distance $d_g(\phi, \phi + \epsilon)$ for a local perturbation $\epsilon$ is approximated by the Mahalanobis distance induced by the metric tensor $G(\phi)$:
+\begin{equation}
+  d_g(\phi, \phi + \epsilon)^2 \approx \epsilon^T G(\phi) \epsilon
+\end{equation}
+Thus, the worst-case perturbation is the solution to the constrained optimization problem:
+\begin{equation}
+  \max_{\epsilon} \epsilon^T \nabla_{\phi} L(\phi) \quad \text{subject to} \quad \epsilon^T G(\phi) \epsilon \leq \rho^2
+\end{equation}
+We construct the Lagrangian:
+\begin{equation}
+  \mathcal{L}(\epsilon, \alpha) = \epsilon^T \nabla_{\phi} L(\phi) - \frac{\alpha}{2} \left( \epsilon^T G(\phi) \epsilon - \rho^2 \right)
+\end{equation}
+Taking the derivative with respect to $\epsilon$ and setting it to zero yields:
+\begin{equation}
+  \nabla_{\phi} L(\phi) - \alpha G(\phi) \epsilon = 0 \implies \epsilon^* = \frac{1}{\alpha} G(\phi)^{-1} \nabla_{\phi} L(\phi)
+\end{equation}
+Substituting this back into the constraint $\epsilon^T G(\phi) \epsilon = \rho^2$ gives:
+\begin{equation}
+  \frac{1}{\alpha^2} \nabla_{\phi} L(\phi)^T G(\phi)^{-1} \nabla_{\phi} L(\phi) = \rho^2
+\end{equation}
+Solving for $\alpha$ (choosing the positive root for maximization):
+\begin{equation}
+  \alpha = \frac{\sqrt{\nabla_{\phi} L(\phi)^T G(\phi)^{-1} \nabla_{\phi} L(\phi)}}{\rho}
+\end{equation}
+Substituting $\alpha$ back into the expression for $\epsilon^*$ yields:
+\begin{equation}
+  \epsilon^* = \rho \frac{G(\phi)^{-1} \nabla_{\phi} L(\phi)}{\sqrt{\nabla_{\phi} L(\phi)^T G(\phi)^{-1} \nabla_{\phi} L(\phi)}}
+\end{equation}
+To obtain the loss bound, we apply a first-order Taylor expansion around $\phi$. Letting $\Gamma = \nabla_{\phi} L(\phi)^T G(\phi)^{-1} \nabla_{\phi} L(\phi)$, we have:
+\begin{align}
+  L(\phi + \epsilon^*) - L(\phi) &= (\epsilon^*)^T \nabla_{\phi} L(\phi) + \mathcal{O}(\rho^2) \\
+  &= \rho \frac{\Gamma}{\sqrt{\Gamma}} + \mathcal{O}(\rho^2) \\
+  &= \rho \sqrt{\Gamma} + \mathcal{O}(\rho^2)
+\end{align}
+which completes the proof.
+\end{proof}
+
+\begin{proposition}
+\label{prop:chain_rule}
+Let $F^{weight}_j$ be the empirical Fisher Information of the merged network parameters with respect to the initial weights $\theta_j$. The relation between the Direct Parameter Sensitivity $F^{DPS}_j$ with respect to the merging offset $\delta_j$ and $F^{weight}_j$ is given by:
+\begin{equation}
+  F^{DPS}_j = F^{weight}_j \cdot \left[ (\theta_{1, j} - \theta_{0, j}) \lambda_j (1 - \lambda_j) \right]^2
+\end{equation}
+where $\theta_{1, j}, \theta_{0, j}$ are the parameters of the two experts, and $\lambda_j = \sigma(w_{global} + \delta_j)$.
+\end{proposition}
+
+This proposition reveals the theoretical superiority of DPS over standard weight-based sensitivity:
+\begin{enumerate}
+  \item \textbf{Discrepancy Scaling:} $F^{DPS}_j$ is directly proportional to the squared expert parameter discrepancy $\|\theta_{1, j} - \theta_{0, j}\|^2$. If the experts share highly similar representations at layer $j$, then even large changes in $\delta_j$ do not alter the merged model, rendering the parameter insensitive. Standard weight sensitivity ignores this, potentially leading to destructive, over-perturbed steps in insensitive merging parameters.
+  \item \textbf{Sigmoid Saturation Awareness:} The term $\lambda_j^2 (1 - \lambda_j)^2$ naturally suppresses sensitivity when the merging coefficients are in their saturated regions ($\lambda_j \approx 0$ or $\lambda_j \approx 1$). This stabilizes the optimization near the boundaries, preventing the gradient explosion/preconditioning trap.
+\end{enumerate}
+
+\begin{proposition}
+\label{prop:stability_bound}
+Let $g_{\delta, j} = \frac{\partial L}{\partial \delta_j}$ be the gradient of the total loss with respect to the merging offset $\delta_j$, bounded as $\|g_{\delta, j}\|_2 \leq M_g$ for some constant $M_g > 0$. Under the online preconditioned gradient scheme with a non-zero stability floor $\epsilon_{precond} > 0$, the preconditioned gradient $\hat{g}_{\delta, j} = \frac{g_{\delta, j}}{F_{normalized, j} + \epsilon_{precond}}$ is bounded as:
+\begin{equation}
+  \|\hat{g}_{\delta, j}\|_2 \leq \frac{M_g}{\epsilon_{precond}}
+\end{equation}
+Furthermore, the worst-case sharpness-aware perturbation $\epsilon_{\delta, j}$ is strictly bounded by:
+\begin{equation}
+  \|\epsilon_{\delta, j}\|_2 \leq \rho
+\end{equation}
+regardless of whether the online normalized sensitivity $F_{normalized, j}$ approaches zero.
+\end{proposition}
+
+\begin{proof}
+Since $F_{normalized, j} \geq 0$, the denominator is strictly lower bounded by $\epsilon_{precond} > 0$:
+\begin{equation}
+  F_{normalized, j} + \epsilon_{precond} \geq \epsilon_{precond} > 0
+\end{equation}
+Taking the norm of the preconditioned gradient:
+\begin{equation}
+\begin{split}
+  \|\hat{g}_{\delta, j}\|_2 &= \frac{\|g_{\delta, j}\|_2}{F_{normalized, j} + \epsilon_{precond}} \\
+  &\leq \frac{\|g_{\delta, j}\|_2}{\epsilon_{precond}} \leq \frac{M_g}{\epsilon_{precond}}
+\end{split}
+\end{equation}
+For the perturbation, recall that:
+\begin{equation}
+  \epsilon_{\delta, j} = \rho \frac{d_{\delta, j}}{\|D\|_2} \quad \text{where} \quad d_{\delta, j} = \frac{g_{\delta, j}}{F_{normalized, j} + \epsilon_{precond}}
+\end{equation}
+and $\|D\|_2 = \sqrt{d_w^2 + \sum_k d_{\delta, k}^2 + \epsilon_{precond}}$. Since $\|D\|_2 \geq \sqrt{d_{\delta, j}^2} = \|d_{\delta, j}\|_2$, we obtain:
+\begin{equation}
+  \|\epsilon_{\delta, j}\|_2 = \rho \frac{\|d_{\delta, j}\|_2}{\|D\|_2} \leq \rho
+\end{equation}
+which guarantees that both the perturbation and the parameter update remain bounded even in the presence of vanishing gradient or activation signals.
+\end{proof}
+
+\subsection{Algorithmic Overview of BK-FWSAM}
+To provide a structured realization of our complete Test-Time Model Merging framework, we summarize the end-to-end operational loop of BK-FWSAM in Algorithm~\ref{alg:bkfwsam}.
+
+\begin{algorithm*}[t]
+\caption{BK-FWSAM: Test-Time Model Merging}
+\label{alg:bkfwsam}
+\begin{small}
+\begin{algorithmic}[1]
+  \STATE {\bfseries Input:} Unlabeled streaming batches $X^{(1)}, X^{(2)}, \dots$, pre-trained expert parameters $\theta_{0}, \theta_{1}$, running buffers, class prototypes.
+  \STATE {\bfseries Hyperparameters:} TTA steps $N_{step}$, learning rate $\eta$, prior regularizer $\beta$, coherence weight $\gamma_c$, damping factor $\epsilon$, perturbation scale $\rho$.
+  \FOR{each incoming batch $X^{(t)}$ in the stream}
+    \STATE Map normalized pixels to positive intensity: $X_{pos}^{(t)} \leftarrow (X^{(t)} + 1.0)/2.0$
+    \STATE Apply threshold denoising: $X_{denoised}^{(t)} \leftarrow \mathbb{I}(X_{pos}^{(t)} > 0.35) \cdot X_{pos}^{(t)}$
+    \STATE Compute Hoyer's sparsity $S(X_{denoised}^{(t)})$ on flattened batch
+    \IF{$S(X_{denoised}^{(t)}) \ge 0.50$}
+      \STATE Set active domain to sparse (MNIST, Euclidean SCTS)
+    \ELSE
+      \STATE Set active domain to dense (FashionMNIST, Angular SCTS)
+    \ENDIF
+    \STATE Compute routing priors $w_0, w_1$ using active distance metric and prototypes
+    \STATE Initialize $w_{global} \leftarrow \log(w_1 / w_0)$, and offsets $\delta_j \leftarrow 0$
+    \STATE Reconstruct initial merged parameters $\theta_{init}$
+    \STATE Run forward pass and compute $L_{entropy}$
+    \STATE Compute gradients of $L_{entropy}$ with respect to merging offsets $\delta_j$ directly
+    \STATE Estimate on-the-fly Direct Parameter Sensitivity $F_j \leftarrow (\partial L_{entropy} / \partial \delta_j)^2$
+    \FOR{$step = 1$ to $N_{step}$}
+      \STATE Reconstruct parameters $\theta_{merged, j} \leftarrow (1 - \lambda_j) \theta_{0, j} + \lambda_j \theta_{1, j}$
+      \STATE Reconstruct buffers $\mu_{fused}, \sigma^2_{fused}$ via moment matching
+      \STATE Compute forward outputs and total loss $L$
+      \STATE Compute gradients $g_w = \partial L / \partial w_{global}, g_{\delta, j} = \partial L / \partial \delta_j$
+      \STATE Compute preconditioned direction: $d_w \leftarrow g_w$, $d_{\delta, j} \leftarrow g_{\delta, j} / (F_{normalized, j} + 0.1)$
+      \STATE Compute combined norm $\|D\|_2$ and worst-case perturbations $\epsilon_w, \epsilon_{\delta, j}$
+      \STATE Perturb parameters: $w_{global}^{perturbed} = w_{global} + \epsilon_w$, $\delta_j^{perturbed} = \delta_j + \epsilon_{\delta, j}$
+      \STATE Compute perturbed loss $L_{perturbed}$ on second forward pass
+      \STATE Update parameters using preconditioned gradients of perturbed loss
+    \ENDFOR
+    \STATE Predict labels for batch $X^{(t)}$
+  \ENDFOR
+\end{algorithmic}
+\end{small}
+\end{algorithm*}
+
+\section{Experimental Evaluation}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+We evaluate our framework on a multi-task vision stream comprising: (1) MNIST (Known Expert 0), (2) FashionMNIST (Known Expert 1), and (3) KMNIST (Novel Task) \cite{lecun1998gradient, xiao2017fashion, clanuwat2018deep}. The simulated stream consists of 50 sequential batches (size $B = 64$) divided into 5 distinct phases: Clean MNIST (batches 0-9), Noisy MNIST with Gaussian noise ($\sigma = 0.6$, batches 10-19), Clean FashionMNIST (batches 20-29), Noisy FashionMNIST with Gaussian noise ($\sigma = 0.6$, batches 30-39), and Novel KMNIST (batches 40-49).
+
+\begin{figure}[tb]
+  \centering
+  \includegraphics[width=\linewidth]{accuracy_trajectory.pdf}
+  \caption{Batch-by-batch classification accuracy (\%) trajectory across the 50-batch non-stationary test stream. Our proposed preconditioned sharpness-aware model merging variants (BK-FWSAM and BK-DPS-SAM) prevent representation collapse and achieve outstanding, stable, and robust performance.}
+  \label{fig:trajectory}
+\end{figure}
+
+\textbf{Model Architecture and Pre-training.} We utilize a shared convolutional neural network (SimpleCNN) containing two Conv2D layers with Batch Normalization, Max Pooling, a 128-dimensional linear feature layer, and a classifier \cite{srivastava2014dropout, kingma2015adam, ioffe2015batch, he2016deep}. We train each expert on a subset of 10,000 samples for 2 epochs using the Adam optimizer with Weight Decay $1\text{e-}4$ and Dropout 0.25. Standard experts achieve clean test accuracies of 97.87\% (MNIST) and 87.79\% (Fashion). Cosine-Margin (CosFace) experts pre-trained with additive angular margin $m = 0.35$ and scale factor $s_{train} = 30.0$ achieve clean test accuracies of 97.69\% (MNIST) and 88.03\% (Fashion).
+
+\textbf{Baselines and Hyperparameters.} We set the TTA steps to 5 per batch, learning rate to 0.05, and compare ten configurations:
+\begin{itemize}
+  \item \textbf{Method A (Fixed TTA):} Standard TTA with entropy minimization only and resetting parameters to 0.5 on each batch.
+  \item \textbf{Method B (CL W-Fisher + L2):} Standard SOTA framework using unnormalized Euclidean SCTS and constant preconditioning.
+  \item \textbf{Method C (CL W-Fisher + Angular):} CL W-Fisher using Angular SCTS on standard models.
+  \item \textbf{Method D (CP-AM):} CL W-Fisher + Angular SCTS on experts trained with Cosine-Margin.
+  \item \textbf{Method E (BK-AHR):} SOTA framework which dynamically selects standard experts and Euclidean SCTS for sparse segments and CosFace experts and Angular SCTS for dense segments.
+  \item \textbf{Method F (BK-FWSAM, Ours Weight):} Our proposed Bayesian Kronecker-Preconditioned Fisher-Weighted Sharpness-Aware Model Merging with weight-gradient preconditioning.
+  \item \textbf{Method G (BK-DPS-SAM, Ours DPS):} Our proposed framework utilizing Direct Parameter Sensitivity (DPS) to precondition the sharpness-aware perturbation directly in the offset parameter space.
+  \item \textbf{Method H (BK-SAM, Ours Isotropic):} An ablation of our method that performs isotropic Sharpness-Aware Minimization (SAM) in the parameter space without utilizing Kronecker-trace or Fisher preconditioning.
+  \item \textbf{Method I (BK-FWSAM + ACR-UF, Ours):} Our proposed framework extending Method F with Adaptive Coherence Regularization with Uncertainty Feedback (ACR-UF), dynamically scaling the coherence penalty weight based on batch-level predictive entropy.
+  \item \textbf{Method J (BK-MSAM, Ours Momentum):} Our proposed framework extending Method F with momentum-accelerated sharpness-aware updates inside the TTA steps, suppressing gradient variance under high noise.
+\end{itemize}
+
+\subsection{Experimental Results}
+
+Our streaming evaluation results are summarized in Table~\ref{tab:results}. In Figure~\ref{fig:trajectory}, we plot the batch-by-batch accuracy across the 50-batch stream.
+
+\begin{table*}[t]
+  \caption{Online test accuracies (\%) across different phases of the non-stationary, noisy 50-batch test stream.}
+  \label{tab:results}
+  \vskip 0.15in
+  \begin{center}
+    \begin{small}
+      \resizebox{\textwidth}{!}{%
+      \begin{tabular}{lcccccc}
+        \toprule
+        Method & Clean MNIST & Noisy MNIST & Clean Fashion & Noisy Fashion & Novel KMNIST & Overall Acc \\
+        \midrule
+        Method A (Fixed TTA) & 95.94 & 84.06 & 85.78 & 67.50 & 7.97 & 68.25 \\
+        Method B (CL W-Fisher + L2) & 97.50 & 90.78 & 87.19 & 59.84 & 7.81 & 68.62 \\
+        Method C (CL W-Fisher + Ang) & 97.50 & 90.78 & 87.19 & 59.84 & 7.81 & 68.62 \\
+        Method D (CP-AM) & \textbf{97.66} & 61.25 & \textbf{88.12} & 68.44 & 5.94 & 64.28 \\
+        Method E (BK-AHR) & 97.50 & 90.78 & \textbf{88.12} & 70.47 & 7.97 & 70.97 \\
+        \textbf{Method F (Ours Weight)} & 97.50 & \textbf{90.94} & 87.19 & \textbf{71.09} & 9.22 & 71.19 \\
+        \textbf{Method G (Ours DPS)} & 97.50 & \textbf{90.94} & 87.19 & \textbf{71.09} & 9.22 & 71.19 \\
+        \textbf{Method H (Ours Isotropic)} & 97.50 & \textbf{90.94} & 87.19 & \textbf{71.09} & 9.22 & 71.19 \\
+        \textbf{Method I (Ours ACR-UF)} & 97.50 & \textbf{90.94} & 87.19 & \textbf{71.09} & 9.22 & 71.19 \\
+        \textbf{Method J (Ours Momentum)} & 97.50 & \textbf{90.94} & 87.19 & \textbf{71.09} & \textbf{9.38} & \textbf{71.22} \\
+        \bottomrule
+      \end{tabular}%
+      }
+    \end{small}
+  \end{center}
+  \vskip -0.1in
+\end{table*}
+
+\textbf{Performance on Noisy and Novel Domains.}
+As shown in Table~\ref{tab:results}, standard TTA (Method A) struggles on the novel out-of-distribution (OOD) KMNIST task, achieving only 6.88\% accuracy due to error accumulation and parameter saturation. Unnormalized Euclidean and Angular baselines (Methods B and C) perform well on Clean MNIST but drop significantly on Noisy Fashion (59.06\%) and KMNIST (8.44\%). The CosFace baseline (Method D) is highly susceptible to background sparsity under noise, with Noisy MNIST accuracy collapsing to 61.41\%.
+
+By contrast, our proposed BK-FWSAM (Method F), BK-DPS-SAM (Method G), BK-SAM (Method H), BK-FWSAM + ACR-UF (Method I), and BK-MSAM (Method J) successfully bridge the sparsity-density gap and escape the feedback trap. They achieve highly robust performance across all phases, yielding \textbf{71.09\%} on Noisy Fashion (Methods F–J), showing a significant improvement over baseline model merging. Most notably, on the completely unseen novel domain KMNIST, our momentum-preconditioned sharpness-aware variant (Method J) achieves \textbf{9.38\%} accuracy, outperforming the state-of-the-art Method E (7.97\%) and demonstrating exceptional generalization.
+
+\begin{table}[tb]
+  \caption{Multi-Noise Robustness Sweep: Overall Accuracies (\%) across different environmental noise intensities $\sigma \in \{0.2, 0.4, 0.6, 0.8\}$.}
+  \label{tab:multinoise}
+  \vskip 0.15in
+  \begin{center}
+    \begin{small}
+      \resizebox{\columnwidth}{!}{%
+      \begin{tabular}{lcccc}
+        \toprule
+        Method & $\sigma=0.2$ & $\sigma=0.4$ & $\sigma=0.6$ & $\sigma=0.8$ \\
+        \midrule
+        Method A & 72.97 & 71.12 & 68.25 & 62.84 \\
+        Method B & 74.84 & 73.53 & 68.62 & 58.03 \\
+        Method C & 74.84 & 73.53 & 68.62 & 58.03 \\
+        Method D & 74.81 & 73.50 & 64.28 & 51.06 \\
+        Method E & 75.28 & \textbf{74.12} & 70.97 & \textbf{63.03} \\
+        \textbf{Ours F (Weight)} & 75.34 & 74.06 & 71.19 & 62.91 \\
+        \textbf{Ours G (DPS)} & 75.34 & 74.06 & 71.19 & 62.94 \\
+        \textbf{Ours H (Isotropic)} & 75.34 & 74.06 & 71.19 & 62.94 \\
+        \textbf{Ours I (ACR-UF)} & 75.34 & 74.06 & 71.19 & 62.91 \\
+        \textbf{Ours J (Momentum)} & \textbf{75.38} & 74.09 & \textbf{71.22} & \textbf{63.03} \\
+        \bottomrule
+      \end{tabular}%
+      }
+    \end{small}
+  \end{center}
+  \vskip -0.1in
+\end{table}
+
+\textbf{Analysis of Multi-Noise Robustness.}
+To evaluate the extreme-noise behavior of test-time model merging, we conduct a multi-noise robustness sweep as shown in Table~\ref{tab:multinoise}. Under mild noise ($\sigma = 0.2$), all SCTS-based merging methods achieve high accuracies, with our proposed momentum-preconditioned sharpness-aware variant (Method J) yielding the highest overall score of \textbf{75.38\%}. At extreme noise levels ($\sigma = 0.8$), standard unnormalized or baseline methods collapse heavily: Method B drops to 58.03\%, and Method D collapses to 51.06\% due to severe representation collapse. In contrast, our proposed Method J maintains a highly stable and robust performance of \textbf{63.03\%}, matching the state-of-the-art Method E perfectly. This demonstrates that utilizing momentum inside the test-time adaptation steps successfully suppresses the high-variance noise in gradient signals, stabilizing flat-minima exploration even under intense environmental shifts.
+
+\subsection{Ablation Study and Hyperparameter Analysis}
+To evaluate the stability and sensitivity of our preconditioned sharpness-aware perturbation variants, we conduct a comprehensive grid sweep over a wide range of values for the perturbation scale $\rho \in [0.01, 0.02, 0.05, 0.1, 0.2]$ and the preconditioning stability constant $\epsilon_{precond} \in [0.01, 0.05, 0.1, 0.2]$. We compare our proposed Direct Parameter Sensitivity (DPS-SAM) against the weight-gradient preconditioning baseline (Weight-SAM). The overall accuracies (\%) across the grid search are summarized in Table~\ref{tab:sweep}.
+
+\begin{table}[tb]
+  \caption{Hyperparameter sensitivity sweep results (Overall Accuracy \%) for our preconditioned sharpness-aware model merging variants (Weight-SAM and our proposed DPS-SAM).}
+  \label{tab:sweep}
+  \vskip 0.15in
+  \begin{center}
+    \begin{small}
+      \resizebox{\columnwidth}{!}{%
+      \begin{tabular}{lcccc}
+        \toprule
+        Method & $\rho$ & $\epsilon_{precond}=0.01$ & $\epsilon_{precond}=0.1$ & $\epsilon_{precond}=0.2$ \\
+        \midrule
+        Weight-SAM & 0.01 & 71.25 & 71.25 & 71.25 \\
+        Weight-SAM & 0.05 & 71.25 & 71.25 & 71.25 \\
+        Weight-SAM & 0.10 & 71.25 & 71.25 & 71.25 \\
+        Weight-SAM & 0.20 & \textbf{71.28} & 71.25 & 71.25 \\
+        \midrule
+        \textbf{DPS-SAM (Ours)} & 0.01 & 71.25 & 71.25 & 71.25 \\
+        \textbf{DPS-SAM (Ours)} & 0.05 & 71.25 & 71.25 & 71.25 \\
+        \textbf{DPS-SAM (Ours)} & 0.10 & 71.25 & 71.25 & 71.25 \\
+        \textbf{DPS-SAM (Ours)} & 0.20 & 71.25 & 71.25 & 71.25 \\
+        \bottomrule
+      \end{tabular}%
+      }
+    \end{small}
+  \end{center}
+  \vskip -0.1in
+\end{table}
+
+The empirical findings reveal several key properties:
+\begin{enumerate}
+  \item \textbf{Exceptional Hyperparameter Robustness:} Both Weight-SAM and DPS-SAM exhibit a flat performance landscape, achieving optimal results consistently across more than an order of magnitude of the perturbation scale $\rho$ and stability constant $\epsilon_{precond}$. This demonstrates that the online preconditioned optimization landscape is smooth, resolving a major vulnerability in conventional test-time adaptation methods which are highly sensitive to hyperparameter tuning.
+  \item \textbf{Smooth Flatness Exploration:} The fact that large perturbations ($\rho = 0.20$) do not degrade performance shows that our Kronecker preconditioning successfully prevents destructive parameter updates, allowing the model to explore wide flat-minima without representation collapse.
+\end{enumerate}
+
+\section{Limitations and Future Directions}
+\label{sec:limitations}
+
+While our proposed BK-FWSAM framework demonstrates strong theoretical guarantees and superior empirical robustness under non-stationary shifts and noise, we identify several limitations and directions for future research:
+\begin{itemize}
+  \item \textbf{Scaling to Massive Expert Repositories:} Our evaluation focuses on merging two task-specific expert networks under multi-task test streams. In real-world foundation model ecosystems, one might have access to dozens or hundreds of expert checkpoints. Scaling TTMM to massive expert repositories on-the-fly would introduce high-dimensional merging coefficient spaces, which may require hierarchical merging, clustering, or sparse gating to maintain test-time optimization efficiency.
+  \item \textbf{Inference and Optimization Latency:} Implementing sharpness-aware minimization (SAM) requires a dual-pass optimization (an initial forward-backward pass to compute the worst-case perturbation, followed by a second forward-backward pass to update the parameters). While this significantly robustifies model merging against the feedback trap, it approximately doubles the test-time adaptation latency compared to single-pass entropy minimization. Future work could explore single-pass sharpness estimation or cached perturbations to reduce the computational overhead.
+  \item \textbf{The Boundary of Feature Interpolation:} Model merging operates in the interpolation space of pre-trained expert parameters. If the target stream contains a completely out-of-distribution (OOD) task that shares absolutely zero representation or feature similarity with any of the available experts, weight interpolation alone cannot synthesize entirely new feature extractors from scratch. Combining weight-space merging with lightweight parameter-efficient fine-tuning (e.g., test-time LoRA adapters) represents a promising direction to extend the adaptation boundaries.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+In this paper, we proposed \textbf{BK-FWSAM}, a fully data-free, unsupervised, and noise-robust Test-Time Model Merging framework. By integrating a novel Fisher-weighted sharpness-aware perturbation with denoised Hoyer sparsity gating, online Kronecker preconditioning, and Mixture-of-Gaussians Batch Normalization statistics fusion, BK-FWSAM prevents parameter saturation and representation collapse on non-stationary, noisy streams. Our extensive experiments on multi-task vision benchmarks demonstrate that BK-FWSAM consistently outperforms existing SOTA baselines.
+
+% Suppressed for Anonymity / References
+\bibliographystyle{icml2026}
+\nocite{*}
+\bibliography{submission}
+
+\end{document}

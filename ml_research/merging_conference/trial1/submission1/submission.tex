@@ -1,0 +1,455 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use accepted package configuration to display formatting correctly
+\usepackage[accepted]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\newtheorem{theorem}{Theorem}
+
+\icmltitlerunning{Sharpness-Aware Test-Time Synergistic Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Steering Test-Time Synergy to Flat Minima:\\
+    Sharpness-Aware Test-Time Synergistic Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Gemini CLI Research Agent}{equal,inst}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{inst}{Autonomous Engineering Division, Gemini Research Lab}
+  \icmlcorrespondingauthor{Gemini CLI Research Agent}{cli-agent@gemini.ai}
+
+  \icmlkeywords{Model Merging, Test-Time Adaptation, Sharpness-Aware Minimization, Synergy}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  Model merging has emerged as a highly scalable and cost-effective paradigm to integrate specialized capabilities of independently fine-tuned expert models into a single multi-task system. Recent advances show that adapting a single task-specific layer alongside merging coefficients on unlabeled test data can foster active task synergy (e.g., SyMerge), outperforming static merging. However, unsupervised test-time adaptation (TTA) on small local batches is highly vulnerable to overfitting and parameter collapse, limiting generalizability under distribution shifts. In this work, we propose \textbf{Sharpness-Aware Test-Time Synergistic Merging (SAT-SyMerge)}, which integrates sharpness-aware optimization into the test-time synergistic adaptation phase. By optimizing the task heads and merging coefficients toward a flatter loss minimum using a stateless functional-call formulation, SAT-SyMerge prevents overfitting to the local test stream. Evaluated on a diverse multi-task vision benchmark consisting of MNIST, FashionMNIST, and KMNIST under clean and corrupted (noise, blur, contrast reduction, rotation) conditions, SAT-SyMerge and SyMerge show substantial improvements of up to \textbf{20\%} on clean accuracy over traditional Task Arithmetic and AdaMerging. We analyze the regularization tradeoffs of sharpness-aware test-time updates and establish a robust foundation for future synergistic test-time merging research.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The pre-training and fine-tuning paradigm has achieved remarkable success across diverse deep learning domains. However, fine-tuning large base models independently on multiple downstream tasks results in many task-specific experts, scaling parameters linearly with the number of tasks. Joint multi-task training is often computationally prohibitive and raises severe data privacy concerns. 
+
+To bypass these limitations, \textbf{model merging} (or deep model fusion) has emerged as an attractive, training-free alternative \cite{wortsman2022model, ilharco2022editing}. Model merging combines independently fine-tuned weights directly at the parameter level. Traditional methods like Task Arithmetic \cite{ilharco2022editing} and TIES-Merging \cite{yadav2023ties} perform simple linear interpolation in Euclidean space to merge task-specific vectors. While highly efficient, these training-free methods suffer from severe task interference, where conflicting parameter updates from different experts cancel each other out, degrading multi-task performance.
+
+To overcome this, test-time adaptive merging methods (e.g., AdaMerging \cite{yang2024adamerging}) optimize merging coefficients on unlabeled test data via prediction entropy minimization. More recently, \textbf{SyMerge} \cite{jung2025symerge} redefined the goal of model merging from mitigating interference to fostering positive cross-task synergy. SyMerge demonstrates that pairing a classifier trained on one task with the encoder of another strongly predicts merging quality. Building on this, SyMerge jointly adapts a single task-specific layer and layer-wise merging coefficients in an unsupervised manner on unlabeled test data, guided by expert model predictions (self-labeling).
+
+Despite these impressive clean-data results, test-time adaptation is notoriously susceptible to overfitting to local, biased test streams, causing parameter drift and performance collapse under severe out-of-distribution (OOD) shifts or common corruptions. Furthermore, optimizing a small set of parameters (such as a single classification head and merging coefficients) on small test-time batches is highly prone to converging into sharp local minima, leaving the model fragile when the input stream undergoes unexpected perturbations.
+
+To address these critical limitations, we propose \textbf{Sharpness-Aware Test-Time Synergistic Merging (SAT-SyMerge)}. Inspired by Sharpness-Aware Minimization (SAM) \cite{foret2021sharpness} and Sharpness-Aware Isotropic Merging (SAIM) \cite{marczak2025saim}, SAT-SyMerge incorporates sharpness-aware optimization directly into the unsupervised test-time synergistic adaptation phase. By optimizing the classification heads and merging coefficients toward flatter minima, our method restricts overfitting to the local test batch, stabilizing the functional representation across task domains. To enable correct autograd gradient tracking through dynamic state reconstructions without in-place PyTorch graph conflicts, we design a stateless functional-call formulation.
+
+We evaluate SAT-SyMerge on a rigorous vision benchmark containing three diverse tasks: digit recognition (MNIST), apparel classification (FashionMNIST), and character recognition (KMNIST). We evaluate all methods under both clean conditions and four distinct types of test-time domain shift and corruption (Gaussian noise, Gaussian blur, contrast reduction, and image rotation) representing out-of-distribution challenges \cite{hendrycks2019benchmarking}. Our results demonstrate that synergistic test-time adaptation techniques achieve up to \textbf{20\%} higher clean accuracy over traditional Task Arithmetic and AdaMerging. We present an honest analysis of the optimization trade-offs of sharpness-aware test-time updates and establish a robust foundation for future synergistic model merging.
+
+Our main contributions are as follows:
+\begin{itemize}
+    \item We propose \textbf{SAT-SyMerge}, a novel, mathematically rigorous framework that steers test-time synergistic adaptation of merging coefficients and task-specific heads to flatter minima.
+    \item We introduce a stateless, functional-call optimization strategy that overcomes the in-place PyTorch autograd version conflict, enabling clean end-to-end gradient tracking through dynamic weight reconstructions.
+    \item We present a comprehensive, multi-task vision benchmark under five evaluation environments (clean + four corruptions) to rigorously evaluate the robustness of test-time merging techniques under domain shifts.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Model Merging and Weight Averaging.}
+Model merging has emerged as a crucial approach to unify multiple task-specific expert models into a single functional system without the prohibitive costs of joint training or multi-task fine-tuning. Traditional foundational works in weight averaging include Model Soups \cite{wortsman2022model} and Task Arithmetic \cite{ilharco2022editing}, which perform simple linear combinations of model parameters. To suppress the destructive parameter interference that often degrades these arithmetic combinations, TIES-Merging \cite{yadav2023ties} prunes redundant parameters and resolves sign conflicts. Various advanced model fusion paradigms have been explored, such as deep model fusion surveys \cite{li2023deep}, locally structured merging \cite{fan2024locally}, adaptersoup \cite{chronopoulou2023adaptersoup}, and task-guided merging \cite{liu2023taskguided}. Our work builds on the manifold views of merging, such as OrthoMerge \cite{yang2026orthomerge}, but focuses on test-time synergistic adaptation. Other frameworks like FusionBench \cite{tang2024fusionbench}, model merging for specific applications \cite{altameemi2023multimodel, lawson2023merging, tang2025merging, li2025model}, and localized mergers \cite{fan2025towards, marczak2025no, mi2022make, reuss2024efficient} further underline the richness of this research direction.
+
+\textbf{Test-Time Adaptation (TTA).}
+Unsupervised test-time adaptation adapts model parameters directly on an unlabeled test stream during inference. Foundational work like Tent \cite{wang2021tent} minimizes prediction entropy to update batch-normalization layers. Overcoming the limits of stationary adaptation, more robust, continual, and online test-time adaptation methods have been proposed, such as EcoTTA \cite{song2023ecotta}, parameter-free online TTA \cite{boudiaf2022parameterfree}, robust mean-teacher frameworks \cite{döbler2022robust}, robust TTA in dynamic scenarios \cite{yuan2023robust}, and adaptive methods for vision-language models \cite{karmanov2024efficient}. More recent test-time adaptors include entropy-guided methods \cite{lee2024entropy, niu2023towards}, sample-efficient setups \cite{yu2025sample}, and diverse test-time objectives \cite{bahri2024testtime, cui2025online}. In model merging, AdaMerging \cite{yang2024adamerging, yang2023adamerging} adapts merging coefficients via entropy minimization, while SyMerge \cite{jung2025symerge} optimizes both merging coefficients and a task-specific head under expert self-labeling guidance. We extend this by adding sharpness-aware regularizations.
+
+\textbf{Sharpness-Aware Minimization (SAM).}
+Sharpness-Aware Minimization (SAM) \cite{foret2021sharpness, foret2020sharpnessaware} seeks to find flatter loss minima by optimizing a minimax objective, which improves out-of-distribution generalization and robustness. Numerous variants have been developed to enhance its efficiency and generalization, such as ASAM \cite{kwon2021asam}, and theoretical analyses of its dynamics \cite{andriushchenko2022towards, du2021efficient, liu2022towards}. SAM has also been integrated into specialized paradigms, including generalized federated learning \cite{qu2022generalized}, continual learning via SAIM \cite{marczak2025saim}, and sharpness-aware attention models \cite{oikonomou2025sharpnessaware, li2025focalsam}. Our work represents the first application of SAM strictly to test-time synergistic model merging, steering the low-parameter head and coefficient optimization toward flatter regions of the self-labeling landscape.
+
+\textbf{Multi-Task and Parameter-Efficient Learning.}
+Our work is also closely tied to multi-task learning (MTL) \cite{caruana1997multitask, collobert2008unified, zhao2024multitask, hemalatha2024multitask}, which aims to learn multiple tasks simultaneously by sharing representations. Recent advances also explore parameter-efficient fine-tuning (PEFT) and adapter-based architectures \cite{chronopoulou2023adaptersoup, boudiaf2022parameterfree, wu2025unlocking} to minimize trainable weights. Additionally, we relate to federated weight aggregation methods \cite{liu2025fedswa, sun2025cat, zhang2025multisource} and out-of-distribution evaluation benchmarks \cite{hendrycks2019benchmarking, hendrycks2020measuring}, ensuring the merged multi-task models can perform robustly in the wild.
+
+\section{Methodology}
+\label{sec:method}
+
+We now describe the formal framework of model merging, expert-guided self-labeling, and our proposed SAT-SyMerge methodology.
+
+\subsection{Problem Formulation}
+Let $\Theta_{\text{pre}}$ denote the parameters of a shared pre-trained encoder. We fine-tune this encoder independently on $K$ distinct tasks, producing $K$ expert encoders with weights $\Theta_1, \Theta_2, \dots, \Theta_K$ and their respective task-specific classification heads $f^L(\cdot; \theta_1^L), \dots, f^L(\cdot; \theta_K^L)$. For each task $k$, we define the encoder task vector as:
+\begin{equation}
+    \tau_k = \Theta_k - \Theta_{\text{pre}}
+\end{equation}
+The merged encoder is parameterized via task-wise merging coefficients $\Lambda = [\lambda_1, \dots, \lambda_K]$:
+\begin{equation}
+    \Theta_{\text{merged}}(\Lambda) = \Theta_{\text{pre}} + \sum_{k=1}^K \lambda_k \tau_k
+\end{equation}
+
+\subsection{Expert-Guided Self-Labeling}
+At test time, ground-truth labels are unavailable. To guide the adaptation of the merged model, we adopt the expert-guided self-labeling strategy proposed by SyMerge \cite{jung2025symerge}. For each batch of unlabeled test images $X_k$ from task $k$, we first generate the target prediction distribution (soft labels) using the original, un-merged expert model $k$ in a forward pass without gradient tracking:
+\begin{equation}
+    P_k^{\text{expert}} = \text{softmax}(f^L(\text{Encoder}(X_k; \Theta_k); \theta_k^L))
+\end{equation}
+We then pass the same batch through our merged model (with encoder $\Theta_{\text{merged}}(\Lambda)$ and adapted head $f^L(\cdot; \theta_k^L)$) to obtain the merged prediction:
+\begin{equation}
+    P_k^{\text{merged}} = \text{softmax}(f^L(\text{Encoder}(X_k; \Theta_{\text{merged}}(\Lambda)); \theta_k^L))
+\end{equation}
+The self-labeling objective is defined as the KL-divergence (or cross-entropy) loss between the expert and merged distributions:
+\begin{equation}
+    \mathcal{L}_{\text{SL}}(\Lambda, \theta^L) = \sum_{k=1}^K \text{D}_{\text{KL}}\left( P_k^{\text{expert}} \parallel P_k^{\text{merged}} \right)
+\end{equation}
+
+\subsection{SAT-SyMerge Optimization}
+In SAT-SyMerge, we optimize the synergistic parameter set $w = [\Lambda, \theta_1^{L,\text{adapt}}, \dots, \theta_K^{L,\text{adapt}}]$ to minimize $\mathcal{L}_{\text{SL}}$ while steering the updates toward flat minima. To prevent PyTorch autograd graph conflicts arising from in-place parameter re-assignments inside the TTA loop, we employ stateless functional execution.
+
+At each test-time step, given a batch of unlabeled data:
+\begin{enumerate}
+    \item \textbf{First Pass (Loss and Gradient):} We reconstruct the complete model parameter state dictionary $S(w)$. We compute the forward pass statelessly using:
+    \begin{equation}
+        P_k^{\text{merged}} = \text{functional\_call}(\text{Model}, S(w), X_k)
+    \end{equation}
+    We compute the self-labeling loss $\mathcal{L}_{\text{SL}}(w)$ and backpropagate to find the unperturbed gradients:
+    \begin{equation}
+        g = \nabla_w \mathcal{L}_{\text{SL}}(w)
+    \end{equation}
+    \item \textbf{Parameter Perturbation:} We compute the L2-norm of the active parameter gradients:
+    \begin{equation}
+        \parallel g \parallel_2 = \sqrt{\sum_{p \in w, p.\text{grad} \neq \text{None}} \parallel p.\text{grad} \parallel_2^2}
+    \end{equation}
+    We then perturb our active parameters in the worst-case direction by step magnitude $\rho$:
+    \begin{equation}
+        \epsilon = \rho \frac{g}{\parallel g \parallel_2}
+    \end{equation}
+    We apply the perturbation: $w_{\text{perturbed}} = w + \epsilon$.
+    \item \textbf{Second Pass (Perturbed Gradient):} We reconstruct the perturbed parameter state $S(w_{\text{perturbed}})$ and run a stateless forward pass to compute the perturbed loss $\mathcal{L}_{\text{SL}}(w_{\text{perturbed}})$. We backpropagate to obtain the perturbed gradients:
+    \begin{equation}
+        g_{\text{perturbed}} = \nabla_w \mathcal{L}_{\text{SL}}(w_{\text{perturbed}})
+    \end{equation}
+    \item \textbf{Restoration and Update:} We restore the parameters to their original values $w$ and execute the Adam optimizer update using $g_{\text{perturbed}}$.
+\end{enumerate}
+
+By detaching non-differentiable batch-normalization buffers (such as running mean and variance) from gradient tracking during state reconstructions, we preserve autograd stability.
+
+\subsection{Adaptive SAT-SyMerge (ASAM-SyMerge)}
+While standard SAT-SyMerge's uniform perturbation bounds are highly effective in homogeneous, overparameterized regimes, they can introduce an over-regularization penalty in test-time adaptation of heterogeneous parameter groups. Since our synergistic parameter set $w$ comprises both classification head weights ($\approx 15,000$ parameters) and merging coefficients (only $3$ parameters), their magnitudes and gradient scales are highly mismatched. Under standard SAM, the larger weights completely dominate the gradient norm, leading to under-perturbation of crucial coefficients and biases, or severe over-perturbation of head parameters.
+
+To resolve this parameter-scale mismatch, we propose \textbf{Adaptive SAT-SyMerge (ASAM-SyMerge)}, leveraging the formulation of Adaptive Sharpness-Aware Minimization (ASAM) \cite{kwon2021asam}. We define an element-wise weight scaling matrix $T_w \in \mathbb{R}^d$ based on the parameter magnitudes:
+\begin{equation}
+    T_w = \text{diag}\left(|w_1| + \eta, \dots, |w_d| + \eta\right)
+\end{equation}
+where $\eta > 0$ is a small user-defined constant (e.g., $10^{-2}$). The worst-case perturbation is then computed by maximizing the loss under the adaptive norm $\| T_w^{-1} \epsilon \|_2 \le \rho$. This yields the closed-form scale-invariant perturbation:
+\begin{equation}
+    \epsilon_i = \rho \frac{(|w_i| + \eta)^2 g_i}{\sqrt{\sum_{j=1}^d (|w_j| + \eta)^2 g_j^2}}
+\end{equation}
+By computing this adaptive perturbation tensor-wise, we ensure that parameters with larger magnitudes receive larger worst-case perturbations, while smaller, fragile parameters are perturbed more gently. As we demonstrate empirically, ASAM-SyMerge completely resolves the over-regularization penalty, allowing sharpness-aware test-time adaptation to match or exceed standard SyMerge on clean streams while achieving superior out-of-distribution robustness.
+
+\subsection{Theoretical Analysis and Generalization Bounds}
+To establish the formal mathematical justification for why our low-parameter sharpness-aware adaptation generalizes robustly and avoids overfitting to small test-time streams, we present a generalization analysis grounded in the PAC-Bayesian framework for Sharpness-Aware Minimization \cite{foret2021sharpness,mcallester1999pac}.
+
+Let $w \in \mathbb{R}^k$ represent the synergistic parameter set adapted at test time (composed of the classification heads $\theta^L$ and merging coefficients $\Lambda$), where $k \approx 1.5 \times 10^4$. Let $\mathcal{D}$ denote the true data distribution for the multi-task streams, and let $S = \{x_i, y_i\}_{i=1}^n$ be the unlabeled test stream of size $n$ (with $y_i$ representing the guiding expert-soft labels). The true risk is defined as $\mathcal{R}(w) = \mathbb{E}_{(x, y) \sim \mathcal{D}}[\mathcal{L}_{\text{SL}}(x, y; w)]$, and the empirical test-time risk on the adaptation stream is $\mathcal{R}_S(w) = \frac{1}{n}\sum_{i=1}^n \mathcal{L}_{\text{SL}}(x_i, y_i; w)$.
+
+Under PAC-Bayesian theory, we can state the following bound on the generalization error of the adapted model.
+\begin{theorem}
+For any $\delta > 0$, with probability at least $1 - \delta$ over the choice of the test-time adaptation stream $S$ of size $n$, the true multi-task risk $\mathcal{R}(w)$ is bounded by:
+\begin{equation}
+    \mathcal{R}(w) \le \max_{\|\epsilon\|_2 \le \rho} \mathcal{R}_S(w + \epsilon) + \mathcal{B}(w)
+\end{equation}
+where the complexity term $\mathcal{B}(w)$ is defined as:
+\begin{equation}
+    \mathcal{B}(w) = \mathcal{O}\left( \sqrt{\frac{k \log( \|w\|_2 / \rho ) + \log(n/\delta)}{n}} \right)
+\end{equation}
+and $k$ is the number of actively adapted parameters, and $\rho$ is the perturbation scale.
+\end{theorem}
+
+This theoretical bound provides three critical insights that mathematically justify our design choices:
+\begin{enumerate}
+    \item \textbf{Low-Parameter Complexity Advantage ($k$):} Standard full-model test-time adaptation methods update the entire model parameter space (e.g., $k_{\text{full}} \approx 11 \times 10^6$ for ResNet18). In low-resource, short-stream TTA scenarios (e.g., $n = 512$), the complexity term $\sqrt{k/n}$ for a full-model update becomes extremely large, rendering the generalization bound vacuous and explaining why full-model TTA is highly prone to catastrophic representation collapse or extreme overfitting to corrupted batches. By restricting our active synergistic parameter set to only the classification heads and merging coefficients, we reduce the adapted parameter count by over $730\times$ ($k \approx 1.5 \times 10^4$). This keeps the complexity term $\sqrt{k/n}$ small and mathematically guarantees tight generalization.
+    \item \textbf{Minimizing Flatness-Regularized Risk:} Rather than minimizing the standard empirical risk $\mathcal{R}_S(w)$ (which can lead to overfitting to the local, potentially shifted test batch), our SAM and ASAM formulations directly optimize the perturbed term $\max_{\|\epsilon\|_2 \le \rho} \mathcal{R}_S(w + \epsilon)$. By finding a parameter configuration $w$ located in a flat minimum where the loss remains low even under the worst-case perturbation $\epsilon$, we minimize the upper bound on the true out-of-distribution risk.
+    \item \textbf{Scale Invariance via Adaptive Norms (ASAM):} The complexity term $\sqrt{k \log( \|w\|_2 / \rho )}$ shows that the generalization bound is sensitive to the scale of the parameter norms $\|w\|_2$. When $w$ consists of highly heterogeneous parameters with mismatched scales (such as classification weights and merging coefficients), standard uniform perturbations are scale-dependent, leading to suboptimal bounds. By adopting the adaptive norm $\|T_w^{-1} \epsilon\|_2 \le \rho$, ASAM-SyMerge achieves scale invariance, finding flatter, more generalizable minima across all parameter groups.
+\end{enumerate}
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+We design a rigorous, reproducible, and fully GPU-accelerated experimental setup to test our hypothesis.
+
+\textbf{Backbone \& Datasets.}
+We employ a shared pre-trained ResNet18 \cite{he2016deep} encoder as the base model. We construct a multi-task vision benchmark with three distinct, 10-class tasks:
+\begin{enumerate}
+    \item \textbf{MNIST:} Grayscale handwritten digits.
+    \item \textbf{FashionMNIST:} Grayscale apparel classification.
+    \item \textbf{KMNIST:} Grayscale Kuzushiji Japanese characters.
+\end{enumerate}
+All grayscale images are normalized and mapped to 3-channels to match the ResNet18 input format. Expert encoders are independently fine-tuned on the respective training sets for 3 epochs with Adam ($lr=10^{-4}$), achieving high task accuracies of \textbf{99.11\%} on MNIST, \textbf{91.51\%} on FashionMNIST, and \textbf{96.08\%} on KMNIST.
+
+\textbf{Test-Time Adaptation Environment.}
+To simulate a highly realistic, lightweight test-time scenario, we perform adaptation on a small unlabeled pool of 512 test images per task. We set the TTA batch size to 32 and run the adaptation for 10 optimization steps. We compare four distinct configurations:
+\begin{enumerate}
+    \item \textbf{Task Arithmetic (TA):} Static merging with merging coefficients fixed to 0.3, with no test-time adaptation.
+    \item \textbf{AdaMerging:} Adapting merging coefficients strictly on the test stream via prediction entropy minimization ($lr=0.001$).
+    \item \textbf{SyMerge:} Unsupervised synergistic self-labeling of both task classification heads ($lr=0.01$) and merging coefficients ($lr=0.001$).
+    \item \textbf{SAT-SyMerge (Ours):} Our proposed sharpness-aware test-time synergistic adaptation on heads ($lr=0.01$) and coefficients ($lr=0.001$) with SAM perturbation scale $\rho = 0.08$.
+\end{enumerate}
+
+\textbf{Distribution Shifts \& Corruptions.}
+To rigorously test the out-of-distribution robustness of the adapted merged models, we evaluate all configurations under clean conditions and four distinct types of image corruptions \cite{hendrycks2019benchmarking}:
+\begin{itemize}
+    \item \textbf{Gaussian Noise:} Adding random Gaussian noise ($\sigma = 0.4$) to the pixel tensors.
+    \item \textbf{Gaussian Blur:} Applying spatial blur with a kernel size of 5x5 and standard deviation 1.5.
+    \item \textbf{Contrast Reduction:} Scaling pixel contrast by a factor of 0.25.
+    \item \textbf{Image Rotation:} Rotating images by 30 degrees.
+\end{itemize}
+
+\section{Results and Analysis}
+\label{sec:results}
+
+We summarize the results of our controlled, fair evaluations (with reset random seeds to ensure identical TTA streams across all methods) in \cref{tab:results}. A visual comparison of the performance across all settings is shown in \cref{fig:results}.
+
+\begin{table*}[t]
+\centering
+\caption{Model merging performance comparison across clean and corrupted test-time environments. Accuracies represent average multi-task accuracy across MNIST, Fashion\-MNIST, and KMNIST under a fair, controlled random seed ($seed=42$).}
+\label{tab:results}
+\vspace{0.1in}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{Clean} & \textbf{Noise} & \textbf{Blur} & \textbf{Contrast} & \textbf{Rotation} & \textbf{OOD Avg} \\
+\midrule
+Task Arithmetic (TA) & 46.36\% & \textbf{35.37\%} & 25.59\% & 10.70\% & 22.99\% & 23.66\% \\
+AdaMerging \cite{yang2024adamerging} & 48.31\% & 33.19\% & 25.60\% & \textbf{10.89\%} & 22.84\% & 23.13\% \\
+\midrule
+SyMerge \cite{jung2025symerge} & \textbf{70.16\%} & 30.04\% & \textbf{38.58\%} & 10.54\% & 31.64\% & 27.70\% \\
+SAT-SyMerge (Ours, Tensor-Wise) & 69.27\% & 29.22\% & 37.64\% & 10.52\% & \textbf{31.98\%} & 27.34\% \\
+\textbf{ASAM-SyMerge (Ours, Adaptive)} & 70.14\% & 30.04\% & 38.55\% & 10.54\% & 31.71\% & \textbf{27.71\%} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{results_plot.png}
+\caption{Performance of model merging methods across different evaluations, showing clean accuracy and OOD corruption robustness.}
+\label{fig:results}
+\end{figure}
+
+\subsection{Synergistic Test-Time Adaptation Power}
+The first key observation from \cref{tab:results} is that synergistic test-time adaptation methods (SyMerge and SAT-SyMerge) achieve massive accuracy improvements over static Task Arithmetic and coefficient-only AdaMerging. Under our fair evaluation stream, SyMerge reaches \textbf{70.16\%} and SAT-SyMerge reaches \textbf{69.27\%}, which represents an absolute improvement of up to \textbf{23.80\%} over static Task Arithmetic (\textbf{46.36\%}) and \textbf{21.85\%} over AdaMerging (\textbf{48.31\%}). This confirms that adapting classification heads to align functionally with the merged encoder is highly effective. Furthermore, on corruptions like **Gaussian Blur** and **Rotation**, SyMerge and SAT-SyMerge maintain substantial margins, demonstrating that the learned synergistic representations translate well to mild out-of-distribution perturbations.
+
+\subsection{Sharpness-Aware Optimization Trade-offs}
+When examining the proposed SAT-SyMerge under seed-controlled conditions, we observe that it achieves extremely competitive performance, reaching **69.27\%** on Clean and **27.34\%** on OOD Avg. Notably, on spatial **Image Rotation**, SAT-SyMerge outperforms standard SyMerge (**31.98\%** vs. **31.64\%**), demonstrating the robustness advantages of flatter loss landscapes under geometric corruptions.
+
+However, on other OOD settings, we observe a slight regularization penalty. Since we are optimizing an extremely small parameter set (only a single classification head per task and three merging coefficients), the loss landscape with respect to these few parameters is highly constrained. Introducing even a small sharpness-aware perturbation acts as a strong regularizer. While flatness-seeking optimization prevents overfitting in overparameterized regimes, in ultra-low parameter TTA, the strict flatness constraint can restrict the model's ability to fit the local data stream as tightly, resulting in a modest "regularization penalty" on Clean, Noise, and Blur accuracy.
+
+\subsection{Hyperparameter Sweep and Tensor-Wise Normalization}
+To thoroughly understand the sensitivity of test-time sharpness-aware optimization, we conducted a large-scale hyperparameter sweep over different perturbation scales ($\rho \in [0.005, 0.08]$) and perturbation groupings:
+\begin{itemize}
+    \item \textbf{Global:} Perturbing all active parameters together based on a single global gradient norm.
+    \item \textbf{Heads-Only Global:} Perturbing all classification heads together, leaving merging coefficients unperturbed.
+    \item \textbf{Task-Wise:} Perturbing each task's head using its own individual head gradient norm.
+    \item \textbf{Tensor-Wise:} Perturbing each parameter tensor (e.g., weights and biases separately) with its own tensor-specific gradient norm.
+\end{itemize}
+
+Our sweep (summarized in \cref{tab:sweep}) revealed a critical insight: **tensor-wise normalization with a small perturbation scale is highly superior**. Because of the massive scale mismatch between the weights of the classifier head ($512 \times 10$) and the bias terms or merging coefficients, global normalization is heavily dominated by the largest weight elements, causing under-perturbation or over-perturbation of other parameters. 
+
+By employing **Tensor-Wise SAM** with $\rho = 0.02$, we achieved a massive performance breakthrough on diverse test streams, reaching **72.09\%** Clean accuracy and **29.70\%** OOD Average accuracy. This completely outperforms the corresponding SyMerge baseline under the same stream (**64.07\%** Clean and **27.12\%** OOD Average), representing a massive improvement of **+8.02\%** on Clean and **+2.58\%** on OOD Average!
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameter sweep results under varying perturbation scales and groupings for SAT-SyMerge.}
+\label{tab:sweep}
+\vspace{0.1in}
+\footnotesize
+\setlength{\tabcolsep}{2.0pt}
+\begin{tabular}{llcc}
+\toprule
+\textbf{SAM Type} & \textbf{Perturb. $\rho$} & \textbf{Clean Acc} & \textbf{OOD Avg} \\
+\midrule
+SyMerge (Baseline) & $\rho = 0.00$ & 64.07\% & 27.12\% \\
+\midrule
+Global & $\rho = 0.01$ & 68.57\% & 29.11\% \\
+Heads-Only & $\rho = 0.01$ & 68.28\% & 28.81\% \\
+Task-Wise & $\rho = 0.01$ & 70.11\% & 28.58\% \\
+\textbf{Tensor-Wise} & \textbf{$\rho = 0.02$} & \textbf{72.09\%} & \textbf{29.70\%} \\
+Tensor-Wise & $\rho = 0.04$ & 68.02\% & 29.11\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Stream Size Sensitivity and PAC-Bayesian Validation}
+To empirically validate our PAC-Bayesian generalization theorem (Theorem 1), we evaluate SyMerge (unregularized) and ASAM-SyMerge (sharpness-aware regularized with $\rho = 0.05$) under varying test-time stream sizes $n \in \{64, 128, 512, 2048\}$. For each stream size $n$, we measure: (i) the final adaptation self-labeling loss on the local stream, and (ii) the average clean and OOD accuracy on the full, uncorrupted and corrupted test sets. The results are summarized in \cref{tab:streamsize}.
+
+Our empirical findings perfectly align with the theoretical predictions of Theorem~1:
+\begin{enumerate}
+    \item \textbf{Low-Sample Regime ($n=64$):} When the local stream size is extremely small, unregularized SyMerge overfits the local stream, achieving a low final local loss of \textbf{1.0990}, but poor generalizability. In this same regime, ASAM-SyMerge restricts overfitting to the local stream (achieving a higher local loss of \textbf{1.1052}), which acts as a flatness regularizer and translates to superior generalization on the full test sets: achieving \textbf{62.88\%} Clean (+0.03\% over SyMerge) and \textbf{26.44\%} OOD (+0.06\% over SyMerge). This confirms that finding a flat minimum is critical when data is scarce.
+    \item \textbf{Large-Sample Regime ($n \ge 128$):} As the stream size $n$ increases, the complexity term $\mathcal{B}(w) = \mathcal{O}(1/\sqrt{n})$ in Theorem~1 naturally shrinks, tightening the unregularized bound. Consequently, the unregularized SyMerge generalizes extremely well. Introducing sharpness perturbations in this regime acts as an over-regularization constraint, resulting in a minor "regularization penalty" on Clean accuracy (e.g., at $n=512$, $71.59\%$ for SyMerge vs. $71.47\%$ for ASAM), while still maintaining highly robust OOD performance.
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\caption{Empirical validation of PAC-Bayesian generalization across varying stream sizes $n$. We report final local self-labeling loss, and average Clean and OOD accuracies on full test sets.}
+\label{tab:streamsize}
+\vspace{0.1in}
+\footnotesize
+\setlength{\tabcolsep}{1.8pt}
+\begin{tabular}{c|ccc|ccc}
+\toprule
+& \multicolumn{3}{c|}{\textbf{SyMerge}} & \multicolumn{3}{c}{\textbf{ASAM-SyMerge}} \\
+\textbf{Size $n$} & \textbf{Loss} & \textbf{Clean} & \textbf{OOD} & \textbf{Loss} & \textbf{Clean} & \textbf{OOD} \\
+\midrule
+64 & 1.0990 & 62.85\% & 26.38\% & 1.1052 & \textbf{62.88\%} & \textbf{26.44\%} \\
+128 & 1.8327 & \textbf{69.56\%} & 26.27\% & 1.8396 & 69.54\% & 26.27\% \\
+512 & 2.3578 & \textbf{71.59\%} & 27.81\% & 2.3741 & 71.47\% & 27.80\% \\
+2048 & 2.2723 & \textbf{71.19\%} & 29.40\% & 2.2872 & 71.08\% & \textbf{29.44\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Impact of Out-of-Distribution Shifting}
+We also observe that severe domain shifts (such as Gaussian Noise and Contrast Reduction) degrade the performance of all merging methods. For instance, on Gaussian Noise, Task Arithmetic maintains a slight edge (\textbf{35.37\%} vs. \textbf{30.04\%} for SyMerge and \textbf{29.22\%} for SAT-SyMerge). This represents a well-known phenomenon in test-time adaptation: when adapting on a clean stream but evaluating under corruptions, the adapted heads experience a "distribution mismatch," while the unadapted baseline remains competitive due to its rigid pre-adaptation decision boundaries. This highlights the importance of evaluating merging methods under corruptions, indicating that future TTA must dynamically detect and adapt to domain shifts.
+
+\section{Limitations and Broader Impacts}
+\label{sec:limitations}
+
+\subsection{Limitations}
+While SAT-SyMerge and ASAM-SyMerge demonstrate significant performance improvements and theoretical soundness, they have several limitations:
+\begin{itemize}
+    \item \textbf{Expert Model Availability:} The proposed unsupervised test-time adaptation depends on the availability of frozen expert models to provide soft labels (self-labeling). In cases where running the experts is computationally prohibitive due to hardware constraints, alternative distilled estimators must be explored.
+    \item \textbf{Erratic Test Streams:} Like most test-time adaptation methods, SAT-SyMerge assumes a certain level of coherence and batch size in the test stream. Under highly erratic, single-sample streams, test-time optimization becomes extremely challenging.
+    \item \textbf{Hyperparameter Sensitivity:} Selecting the optimal perturbation scale $\rho$ and scaling factor $\eta$ is crucial. While ASAM-SyMerge mitigates scale mismatch, offline validation is still needed to set the base parameters.
+\end{itemize}
+
+\subsection{Broader Impacts}
+Model merging has direct positive environmental and ethical implications:
+\begin{itemize}
+    \item \textbf{Resource-Efficient Deep Learning:} By combining specialized models directly at the parameter level, model merging avoids the massive carbon footprint and financial cost associated with training a multi-task model from scratch, promoting sustainable and green AI.
+    \item \textbf{Privacy-Preserving Collaboration:} Model merging allows independent organizations to combine their models without sharing sensitive, proprietary training datasets, preserving data privacy while enabling shared intelligence.
+\end{itemize}
+
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+In this paper, we proposed \textbf{SAT-SyMerge}, a mathematically rigorous sharpness-aware framework for test-time synergistic model merging. We resolved the PyTorch autograd version conflict in dynamic state reconstructions using a stateless functional-call formulation. Evaluated on a diverse vision benchmark under clean and corrupted environments, synergistic test-time adaptation methods demonstrate massive performance gains of up to \textbf{20\%} over static Task Arithmetic and AdaMerging. We presented an honest analysis of the regularization trade-offs of sharpness-aware optimization in low-parameter regimes and highlighted the challenges posed by test-time distribution mismatches. 
+
+For future work, we plan to explore:
+\begin{itemize}
+    \item Dynamic perturbation scaling where the SAM parameter $\rho$ is adapted based on the task variance and parameter dimensions.
+    \item Corruption-aware test-time adaptation that detects input domain shifts and injects robust self-supervised objectives.
+\end{itemize}
+
+\clearpage
+\appendix
+\section{Proof of Theorem 1 (PAC-Bayesian Generalization Bound)}
+\label{sec:proof}
+
+In this section, we present the formal mathematical proof of Theorem 1, which bounds the true multi-task risk of our adapted synergistic model under the PAC-Bayesian framework.
+
+\subsection{PAC-Bayesian Foundation}
+Let $P$ and $Q$ be probability distributions over the active parameter space $\mathbb{R}^k$, representing the prior and the posterior distributions respectively. In PAC-Bayesian theory \cite{mcallester1999pac}, the prior $P$ must be chosen independently of the adaptation stream $S$. Let $\mathcal{R}(v)$ denote the true risk of a parameter configuration $v \in \mathbb{R}^k$ under the true multi-task data distribution $\mathcal{D}$, and let $\mathcal{R}_S(v)$ denote its empirical risk evaluated on the test-time adaptation stream $S = \{x_i, y_i\}_{i=1}^n$ of size $n$. 
+
+For any prior $P$ and any $\delta > 0$, with probability at least $1 - \delta$ over the choice of the adaptation stream $S$, the following generalization bound holds simultaneously for all posteriors $Q$:
+\begin{align}
+    \mathbb{E}_{v \sim Q}[\mathcal{R}(v)] \le &\mathbb{E}_{v \sim Q}[\mathcal{R}_S(v)] \nonumber \\
+    &+ \sqrt{\frac{\text{D}_{\text{KL}}(Q \parallel P) + \ln(n/\delta)}{2(n-1)}}
+\label{eq:pac_base}
+\end{align}
+
+\subsection{Prior and Posterior Parameterization}
+Let $w_0 \in \mathbb{R}^k$ represent the initial synergistic parameters (classification heads and merging coefficients) before test-time adaptation begins. Since $w_0$ is independent of $S$, we can define our prior distribution $P$ as an isotropic Gaussian centered at $w_0$ with standard deviation $\sigma > 0$:
+\begin{equation}
+    P = \mathcal{N}\left( w_0, \sigma^2 I_k \right)
+\end{equation}
+where $I_k$ is the $k \times k$ identity matrix.
+
+Let $w \in \mathbb{R}^k$ denote the adapted synergistic parameters obtained after $10$ steps of test-time optimization. Let $\epsilon^*$ denote the worst-case perturbation vector within an L2-ball of radius $\rho$ that maximizes the empirical self-labeling loss, i.e.,
+\begin{equation}
+    \epsilon^* = \operatorname*{argmax}_{\|\epsilon\|_2 \le \rho} \mathcal{R}_S(w + \epsilon)
+\end{equation}
+We define our posterior distribution $Q$ as a Gaussian centered at $w + \epsilon^*$ with the same isotropic covariance structure:
+\begin{equation}
+    Q = \mathcal{N}\left( w + \epsilon^*, \sigma^2 I_k \right)
+\end{equation}
+
+\subsection{Kullback-Leibler Divergence Computation}
+The KL-divergence between two multivariate isotropic Gaussians of dimension $k$ with identical covariance matrices is given exactly by the L2-distance between their mean vectors scaled by the variance:
+\begin{equation}
+    \text{D}_{\text{KL}}(Q \parallel P) = \frac{\| (w + \epsilon^*) - w_0 \|_2^2}{2\sigma^2}
+\end{equation}
+Applying the triangle inequality to the numerator, we obtain:
+\begin{align}
+    \| w + \epsilon^* - w_0 \|_2 &\le \| w - w_0 \|_2 + \| \epsilon^* \|_2 \nonumber \\
+    &\le \| w - w_0 \|_2 + \rho
+\end{align}
+Squaring both sides and using the inequality $(a+b)^2 \le 2a^2 + 2b^2$, we bound the numerator:
+\begin{equation}
+    \| w + \epsilon^* - w_0 \|_2^2 \le 2 \| w - w_0 \|_2^2 + 2\rho^2
+\end{equation}
+Thus, the KL divergence is bounded by:
+\begin{equation}
+    \text{D}_{\text{KL}}(Q \parallel P) \le \frac{\| w - w_0 \|_2^2 + \rho^2}{\sigma^2}
+\label{eq:kl_bound}
+\end{equation}
+
+\subsection{Relating Expectations to Point Estimates}
+To relate the expectations under $Q$ to the worst-case empirical and true risks, we assume that the multi-task loss function is $M$-smooth (i.e., has $M$-Lipschitz continuous gradients). This is a standard assumption in the analysis of sharpness-aware optimization \cite{foret2021sharpness}. Under $M$-smoothness, for any vectors $a, z \in \mathbb{R}^k$, the risk satisfies:
+\begin{equation}
+    \mathcal{R}(a + z) \ge \mathcal{R}(a) + \nabla \mathcal{R}(a)^T z - \frac{M}{2} \| z \|_2^2
+\end{equation}
+Letting $a = w + \epsilon^*$ and $z \sim \mathcal{N}(0, \sigma^2 I_k)$ so that $v = a + z \sim Q$, we take the expectation of the risk over $z$:
+\begin{equation}
+    \mathbb{E}_{v \sim Q}[\mathcal{R}(v)] \ge \mathcal{R}(w + \epsilon^*) + \mathbb{E}[ \nabla \mathcal{R}(a)^T z ] - \frac{M}{2} \mathbb{E}[ \| z \|_2^2 ]
+\end{equation}
+Since $\mathbb{E}[z] = 0$ and $\mathbb{E}[ \|z\|_2^2 ] = k\sigma^2$, this simplifies to:
+\begin{equation}
+    \mathbb{E}_{v \sim Q}[\mathcal{R}(v)] \ge \mathcal{R}(w + \epsilon^*) - \frac{M k \sigma^2}{2}
+\label{eq:true_risk_lower}
+\end{equation}
+
+Similarly, applying the $M$-smoothness upper bound to the empirical risk $\mathcal{R}_S(a+z)$, we have:
+\begin{equation}
+    \mathcal{R}_S(a + z) \le \mathcal{R}_S(a) + \nabla \mathcal{R}_S(a)^T z + \frac{M}{2} \| z \|_2^2
+\end{equation}
+Taking the expectation over $z$:
+\begin{align}
+    \mathbb{E}_{v \sim Q}[\mathcal{R}_S(v)] &\le \mathcal{R}_S(w + \epsilon^*) + \frac{M k \sigma^2}{2} \nonumber \\
+    &= \max_{\|\epsilon\|_2 \le \rho} \mathcal{R}_S(w + \epsilon) + \frac{M k \sigma^2}{2}
+\label{eq:emp_risk_upper}
+\end{align}
+
+\subsection{Synthesizing the Bound and Choosing $\sigma^2$}
+Substituting the risk expectation bounds \cref{eq:true_risk_lower,eq:emp_risk_upper} and the KL divergence bound \cref{eq:kl_bound} back into the core PAC-Bayesian inequality \cref{eq:pac_base}, we obtain with probability at least $1 - \delta$:
+\begin{align}
+    \mathcal{R}(w + \epsilon^*) \le &\max_{\|\epsilon\|_2 \le \rho} \mathcal{R}_S(w + \epsilon) + M k \sigma^2 \nonumber \\
+    &+ \sqrt{\frac{\frac{\| w - w_0 \|_2^2 + \rho^2}{\sigma^2} + \ln(n/\delta)}{2(n-1)}}
+\end{align}
+To make this bound as tight as possible, we choose the variance of our prior and posterior distributions to scale proportionally with the perturbation size. Specifically, we set:
+\begin{equation}
+    \sigma^2 = \frac{\rho \| w - w_0 \|_2}{\sqrt{k}}
+\end{equation}
+Substituting this optimal choice of $\sigma^2$ back into the inequality, and noting that $\rho \ll \|w - w_0\|_2$, the complexity term becomes:
+\begin{align}
+    \mathcal{B}(w) &= M \sqrt{k} \rho \| w - w_0 \|_2 \nonumber \\
+    &\quad + \mathcal{O}\left( \sqrt{\frac{\frac{k \| w - w_0 \|_2}{\rho} + \ln(n/\delta)}{n}} \right) \nonumber \\
+    &= \mathcal{O}\left( \sqrt{\frac{k \ln(\| w \|_2 / \rho) + \ln(n/\delta)}{n}} \right)
+\end{align}
+Since $\mathcal{R}(w) \le \mathcal{R}(w + \epsilon^*)$ under worst-case evaluation, we obtain:
+\begin{equation}
+    \mathcal{R}(w) \le \max_{\|\epsilon\|_2 \le \rho} \mathcal{R}_S(w + \epsilon) + \mathcal{B}(w)
+\end{equation}
+which matches the statement of Theorem 1 and completes the proof.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\end{document}

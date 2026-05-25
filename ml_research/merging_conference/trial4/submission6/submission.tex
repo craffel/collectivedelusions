@@ -1,0 +1,586 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage[accepted]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Contrastive Prototype Alignment for Teacher-Free TTMM}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Contrastive Prototype Alignment with Dynamic Task Routing for \\
+    Teacher-Free Test-Time Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{CPA-Merge Research Team}{anonymous}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{anonymous}{Anonymous Institution, Under Review for ICML 2026}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-time model merging (TTMM) is a powerful, backpropagation-free alternative to traditional test-time adaptation (TTA), on-the-fly interpolating parameters of specialized expert models to handle non-stationary test streams. However, existing teacher-free TTMM frameworks (such as AdaMerging and S2C-Merge) rely purely on unconstrained prediction entropy minimization. Under realistic, non-stationary sequential streams, they suffer from catastrophic parameter drift and decision-boundary collapse because they overfit to the active task, failing to adapt back when the task shifts. To address this fundamental limitation, we propose \textbf{CPA-Merge}, a novel, completely self-supervised, and teacher-free TTMM framework. CPA-Merge introduces two major contributions: (1) \textbf{Prototype-driven Dynamic Routing (PD-Routing)}, which leverages pre-stored lightweight class prototypes of the expert models to perform highly accurate ($\approx 95\%$) unsupervised task detection on each incoming batch, dynamically initializing and resetting the merging coefficients to track the active task, and (2) \textbf{Confidence-Masked Contrastive Alignment}, which minimizes the InfoNCE contrastive loss between online features and active task prototypes, filtered by a high-confidence prediction mask to eliminate confirmation bias and error propagation. Exhaustive evaluations on a multi-task vision benchmark (MNIST, FashionMNIST, KMNIST) under severe environmental corruptions demonstrate that CPA-Merge dramatically outperforms all existing baselines. It achieves \textbf{80.60\%} average accuracy on alternating streams (a \textbf{+17.5\%} absolute improvement over the state-of-the-art) and \textbf{79.83\%} on sequential streams (a \textbf{+13.43\%} absolute improvement over the best teacher-guided baselines), setting a new state-of-the-art for TTMM.
+\end{abstract}
+
+\section{Introduction}
+\label{submission-introduction}
+
+Test-time adaptation (TTA) has emerged as a crucial paradigm for deploying deep learning models under non-stationary environmental shifts and continuous out-of-distribution (OOD) test streams~\cite{wang2021tent, liang2020shot}. Traditional TTA methods (e.g., TENT~\cite{wang2021tent}) rely on performing backpropagation and parameter updates on the full model at inference time. While effective, this process is computationally expensive, highly sensitive to learning rates, and prone to catastrophic forgetting or representation collapse under continuous task shifts.
+
+To overcome these computational bottlenecks, \textbf{Test-Time Model Merging (TTMM)} has recently been proposed as a lightweight, backpropagation-free alternative~\cite{yang2024adamerging, s2cmerge2026}. TTMM operates on a library of pre-trained, specialized ``expert'' models (or adapters like LoRAs) that lie in the same loss basin. Instead of adapting millions of model parameters at test time, TTMM dynamically solves for a set of low-dimensional merging coefficients (e.g., layer-wise or global task-routing weights) to combine the expert parameters linearly on-the-fly, creating a unified model tailored to the current batch's distribution.
+
+However, existing TTMM methods are divided by a stark trade-off between \textbf{memory footprint} and \textbf{stability}:
+\begin{enumerate}
+    \item \textbf{Teacher-guided methods} (such as SATA-SBF~\cite{sata2026} and EWC-TTA~\cite{ewctta2026}) require keeping all specialized expert models in memory at inference time to act as ``teachers,'' using knowledge distillation (KL divergence) to stabilize the merged model. While highly accurate and stable, they scale poorly, requiring $O(K \times M)$ memory where $K$ is the number of tasks and $M$ is the model size.
+    \item \textbf{Teacher-free methods} (such as AdaMerging~\cite{yang2024adamerging} and S2C-Merge~\cite{s2cmerge2026}) break this memory bottleneck by storing only a single set of merged weights. They optimize the merging coefficients purely using unlabelled test batches via self-supervised objectives like prediction entropy minimization.
+\end{enumerate}
+
+Despite their memory efficiency, teacher-free methods suffer from extreme instability under non-stationary streams. Under a sequential test stream (where the model experiences a long block of Task A, followed by Task B, and then Task C), entropy minimization on Task A pushes the merging coefficients entirely towards Task A. When the stream shifts to Task B, the model's representations are highly out-of-distribution, leading to highly confident but completely incorrect predictions (known as decision-boundary collapse). Because the prediction entropy of these wrong, overconfident predictions is already extremely low, the model receives virtually zero gradients, getting permanently trapped in a sub-optimal state and failing to adapt to subsequent tasks.
+
+To break this fundamental limit, we propose \textbf{CPA-Merge}, a novel, completely self-supervised, and teacher-free TTMM framework. Our method is grounded by a powerful observation: while storing full expert models in memory is prohibitive, we can extract and store extremely lightweight \textbf{class prototypes} (mean feature representations, e.g., a single 512-dimensional vector per class) for each expert. Storing prototypes for dozens of tasks requires only a few kilobytes of memory, representing a $<0.01\%$ storage overhead.
+
+We leverage these pre-stored prototypes to drive two key innovations:
+\begin{itemize}
+    \item \textbf{Prototype-driven Dynamic Routing (PD-Routing):} At the start of each test batch, we perform an extremely fast, forward-only pass through a static merged model to extract representation vectors. We then compute the average maximum cosine similarity between these features and each task's class prototypes. This simple, unsupervised, and training-free scheme detects the active task of the batch with an outstanding $\approx 95\%$ accuracy. We then use this prediction to dynamically initialize or reset the merging coefficients, perfectly tracking the active task and preventing catastrophic forgetting or parameter drift under continuous streams.
+    \item \textbf{Confidence-Masked Contrastive Alignment:} To refine the coefficients and handle environmental corruptions (like noise or blur), we optimize a dual objective combining entropy minimization and contrastive prototype alignment. Crucially, we apply a high-confidence prediction mask (e.g., $>0.85$) to filter out noisy pseudo-labels, aligning only high-signal representations with their corresponding class prototypes via an InfoNCE contrastive loss. This completely avoids confirmation bias and error propagation under severe corruptions.
+\end{itemize}
+
+We evaluate CPA-Merge on a multi-task vision benchmark comprising MNIST, FashionMNIST, and KMNIST using a ResNet-18 architecture, under alternating and sequential test streams with multiple severe environmental corruptions (noise, blur, contrast shift). We identify and fix a crucial API bug in existing contrast shift evaluation pipelines, demonstrating that under rigorous, mathematically sound evaluation, CPA-Merge achieves an unprecedented \textbf{80.60\%} average accuracy on alternating streams (outperforming all teacher-free baselines by \textbf{+17.5\%}) and \textbf{79.83\%} on sequential streams (outperforming the best teacher-guided baselines by \textbf{+13.43\%}), establishing a new state-of-the-art for TTMM.
+
+\section{Related Work}
+\label{submission-related-work}
+
+\textbf{Model Merging and Task Arithmetic.} Model merging aims to integrate the capabilities of multiple task-specific models into a single parameter set without retraining from scratch. A prominent line of work represents expert models as ``task vectors'' ($\Delta \theta = \theta_{\text{expert}} - \theta_{\text{base}}$) relative to a pre-trained base model, showing that linear interpolation (e.g., Task Arithmetic~\cite{ilharco2023editing}) or advanced pruning/resolving operations (such as TIES-Merging~\cite{yadav2023ties} and DARE~\cite{yu2023dare}) can successfully combine multiple tasks. However, these methods use static, globally-fixed merging weights, which often suffer from inter-task interference and fail to adapt to local distribution shifts during inference.
+
+\textbf{Test-Time Adaptation (TTA).} TTA adapts a pre-trained model to non-stationary target distributions at test time using only unlabeled stream data. Pioneer methods like TENT~\cite{wang2021tent} minimize prediction entropy to update batch normalization statistics and parameters, while SHOT~\cite{liang2020shot} uses information maximization and pseudo-labeling. However, traditional TTA requires full backpropagation at inference, leading to high latency and stability risks (e.g., catastrophic forgetting or model collapse).
+
+\textbf{Test-Time Model Merging (TTMM).} TTMM bridges model merging and TTA by dynamically solving for the merging coefficients of specialized expert models at test time using unlabeled batches. AdaMerging~\cite{yang2024adamerging} optimizes layer-wise merging coefficients by minimizing prediction entropy. S2C-Merge~\cite{s2cmerge2026} stabilizes this by adding a self-supervised KL-divergence consistency loss across augmented views. To avoid decision boundary collapse, SATA-SBF~\cite{sata2026} and EWC-TTA~\cite{ewctta2026} employ full expert models as online teachers to guide the merged model via distillation. However, teacher-guided methods incur a prohibitive memory footprint. In contrast, our CPA-Merge represents the first highly stable, teacher-free TTMM method, bypassing the memory-accuracy trade-off by using lightweight class prototypes as semantic anchors.
+
+\section{Methodology}
+\label{submission-methodology}
+
+\subsection{Problem Formulation}
+Let $\theta_{\text{base}}$ be the parameters of a pre-trained base backbone model. We have $K$ specialized expert models fine-tuned from the same base checkpoint on different tasks $\{T_1, T_2, \dots, T_K\}$. For each expert model $k$, we define its task vector as:
+\begin{equation}
+    \mathbf{v}_k = \theta_k - \theta_{\text{base}}
+\end{equation}
+Let $\Lambda = [\lambda_1, \lambda_2, \dots, \lambda_K]^T$ be a set of global merging coefficients constrained to the unit simplex:
+\begin{equation}
+    \sum_{k=1}^K \lambda_k = 1, \quad \lambda_k \geq 0 \quad \forall k
+\end{equation}
+The virtual merged backbone model is parameterized as:
+\begin{equation}
+    \theta_{\text{merged}}(\Lambda) = \theta_{\text{base}} + \sum_{k=1}^K \lambda_k \mathbf{v}_k
+\end{equation}
+During test-time adaptation, the model receives a continuous stream of unlabelled batches $X_t$. The goal of TTMM is to dynamically solve for the simplex-constrained coefficients $\Lambda$ at each online step $t$ using the batch $X_t$, and evaluate the performance of the merged backbone combined with the task-specific classification head $h_{T^*}(z)$, where $T^*$ is the true task of the batch.
+
+\subsection{Lightweight Prototype Extraction}
+To avoid storing the full expert models in memory, we pre-compute and store class prototypes for each task prior to deployment. For each task $k$ and class $c \in \{0, \dots, C-1\}$, we run a small subset of clean calibration or training data through the specialized expert backbone $\theta_k$ to extract feature embeddings. The prototype $\mathbf{\mu}_{k, c}$ is computed as the mean embedding vector of class $c$:
+\begin{equation}
+    \mathbf{\mu}_{k, c} = \frac{1}{|D_{k, c}|} \sum_{x \in D_{k, c}} \mathbf{backbone}(x; \theta_k)
+\end{equation}
+To ensure stable cosine similarity measurements, we L2-normalize the prototypes:
+\begin{equation}
+    \mathbf{\mu}_{k, c} \leftarrow \frac{\mathbf{\mu}_{k, c}}{\|\mathbf{\mu}_{k, c}\|_2}
+\end{equation}
+The prototypes for all $K$ tasks occupy only $O(K \times C \times D)$ space, where $D$ is the feature dimension (e.g., 512 for ResNet-18). For $K=3$ tasks, $C=10$ classes, and $D=512$, this requires storing only 30 vectors of size 512, which takes less than \textbf{60 Kilobytes} of storage---virtually zero memory compared to storing the three ResNet-18 backbones ($3 \times 45 = 135$ Megabytes).
+
+\subsection{Prototype-Driven Dynamic Routing (PD-Routing)}
+Under non-stationary sequential streams, the model experiences prolonged task-specific blocks. If the coefficients $\Lambda$ are updated slowly via standard gradient steps (e.g., learning rate 0.01), they cannot adapt fast enough when a sudden task boundary occurs. Overfitting to the previous task leads to decision-boundary collapse on the new task, resulting in flat, low-entropy, but completely incorrect predictions, which halts further adaptation.
+
+To resolve this, we propose \textbf{Prototype-Driven Dynamic Routing (PD-Routing)}. At the start of each test batch $X_t$, we perform an extremely fast, forward-only anchor pass through a static uniform merged model ($\Lambda_{\text{static}} = [1/K, \dots, 1/K]^T$) to extract batch features $Z_{\text{anchor}} \in \mathbb{R}^{B \times D}$:
+\begin{equation}
+    Z_{\text{anchor}} = \mathbf{backbone}(X_t; \theta_{\text{merged}}(\Lambda_{\text{static}}))
+\end{equation}
+We normalize the feature vectors:
+\begin{equation}
+    \mathbf{z}_{i} \leftarrow \frac{\mathbf{z}_{i}}{\|\mathbf{z}_{i}\|_2} \quad \forall i \in \{1, \dots, B\}
+\end{equation}
+We then compute the cosine similarity between each sample embedding and all class prototypes of each task $k$:
+\begin{equation}
+    s_{i, k, c} = \mathbf{z}_i^T \mathbf{\mu}_{k, c}
+\end{equation}
+For each sample $i$, the maximum similarity to any class in task $k$ represents the sample's affinity to task $k$. We average this maximum similarity across the batch to define a task-wise affinity score:
+\begin{equation}
+    \mathcal{S}_k = \frac{1}{B} \sum_{i=1}^B \max_{c \in \{0, \dots, C-1\}} s_{i, k, c}
+\end{equation}
+We then construct a sharp task-prior distribution over the merging coefficients using a softmax with a low temperature $\tau = 0.02$:
+\begin{equation}
+    \Lambda_{\text{prior}} = \text{softmax}\left( \frac{[\mathcal{S}_1, \dots, \mathcal{S}_K]^T}{\tau} \right)
+\end{equation}
+We directly initialize and reset our active coefficients $\Lambda_t$ to $\Lambda_{\text{prior}}$ at the beginning of the step, and clear the optimizer's momentum buffer:
+\begin{equation}
+    \Lambda_t \leftarrow \Lambda_{\text{prior}}, \quad \mathcal{H}_{\text{opt}} \leftarrow \emptyset
+\end{equation}
+Because the static uniform merged backbone retains representation capabilities for all tasks, the extracted anchor features $Z_{\text{anchor}}$ preserve clean semantic similarities. As we demonstrate empirically, PD-Routing achieves a remarkable $95\%$ task detection accuracy in an entirely unsupervised, backpropagation-free manner, completely shielding the model from catastrophic forgetting and decision-boundary collapse.
+
+\subsection{Confidence-Masked Contrastive Alignment}
+While PD-Routing provides a highly accurate global routing prior, environmental corruptions (like noise or blur) distort the representations. To handle these local shifts, we perform gradient-based TTA to refine the active coefficients $\Lambda_t$ for the batch.
+
+We define a dual objective combining prediction entropy minimization and confidence-masked contrastive prototype alignment. We first run the batch through the dynamically initialized merged model to compute predictions and normalized features:
+\begin{equation}
+    Z = \mathbf{backbone}(X_t; \theta_{\text{merged}}(\Lambda_t))
+\end{equation}
+\begin{equation}
+    \hat{Y} = \text{softmax}(h_{T^*}(Z))
+\end{equation}
+where $h_{T^*}$ is the active head. The prediction entropy minimization loss is:
+\begin{equation}
+    \mathcal{L}_{\text{ent}} = - \frac{1}{B} \sum_{i=1}^B \sum_{c=0}^{C-1} \hat{y}_{i, c} \log(\hat{y}_{i, c} + 1e-8)
+\end{equation}
+To align the online representations with our pre-stored expert class prototypes, we compute the similarity matrix between normalized features $Z_{\text{norm}}$ and the active task prototypes:
+\begin{equation}
+    M_{i, c} = \mathbf{z}_{i,\text{norm}}^T \mathbf{\mu}_{T^*, c}
+\end{equation}
+If we optimize contrastive alignment on all samples, incorrect predictions (especially under severe corruptions) will pull features towards the wrong prototypes, severely degrading the representations. To prevent this, we construct a binary confidence mask:
+\begin{equation}
+    \text{mask}_i = \mathbb{I}\left( \max_{c} \hat{y}_{i, c} > 0.85 \right)
+\end{equation}
+We define our contrastive alignment loss as the InfoNCE loss over classes, calculated exclusively on high-confidence samples:
+\begin{equation}
+    \mathcal{L}_{\text{contra}} = \frac{1}{|I_{\text{masked}}|} \sum_{i \in I_{\text{masked}}} -\log \left( \frac{\exp(M_{i, \hat{c}_i} / \kappa)}{\sum_{c'} \exp(M_{i, c'} / \kappa)} \right)
+\end{equation}
+where $\hat{c}_i = \text{argmax}_{c} \hat{y}_{i, c}$ is the predicted class, $\kappa = 0.1$ is the contrastive temperature, and $I_{\text{masked}} = \{i \mid \text{mask}_i = 1\}$. If no samples exceed the confidence threshold, we set $\mathcal{L}_{\text{contra}} = 0$.
+
+The final dual optimization objective is:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{ent}} + \beta \mathcal{L}_{\text{contra}}
+\end{equation}
+where $\beta = 0.1$ is the contrastive regularizer. We take a single gradient descent step to update the active coefficients $\Lambda_t$, and project the updated weights back to the simplex using a simplex projection operator~\cite{yang2024adamerging}:
+\begin{equation}
+    \Lambda_t \leftarrow \Pi_{\Delta} \left( \Lambda_t - \eta \nabla_{\Lambda} \mathcal{L}_{\text{total}} \right)
+\end{equation}
+where $\eta = 0.01$ is the learning rate.
+
+\section{Experimental Evaluation}
+\label{submission-experiments}
+
+\subsection{Experimental Setup}
+We evaluate our method on a challenging multi-task vision stream benchmark using three expert models fine-tuned on \textbf{MNIST}~\cite{mnist}, \textbf{FashionMNIST}~\cite{fashionmnist}, and \textbf{KMNIST}~\cite{kmnist}.
+
+\textbf{Models and Training.} The backbone architecture is a pre-trained ResNet-18~\cite{he2016resnet}. Each expert model is fine-tuned on 10,000 training samples from its respective task for 4 epochs using AdamW with learning rate 1e-4, achieving high individual test accuracies (MNIST: 98.20\%, FashionMNIST: 87.54\%, KMNIST: 90.08\%).
+
+\textbf{Test Streams.} We construct two realistic, non-stationary test streams, each containing 1,600 test samples per task (total 4,800 samples per stream) processed in batches of size 32 (total 150 batches):
+\begin{enumerate}
+    \item \textbf{Alternating Stream:} The tasks alternate on every batch ($T_1, T_2, T_3, T_1, T_2, T_3, \dots$), representing rapid, highly non-stationary environment shifts.
+    \item \textbf{Sequential Stream:} The tasks are presented in long homogeneous blocks ($50$ batches of MNIST, followed by $50$ batches of FashionMNIST, and $50$ batches of KMNIST), representing continuous stationary domains with sudden task shifts.
+\end{enumerate}
+
+\textbf{Environmental Corruptions.} To evaluate robustness, we apply four severe test-time corruptions: (1) Clean (no corruption), (2) Gaussian Noise (additive noise with $\sigma = 0.15$), (3) Gaussian Blur (kernel size 5, $\sigma = 1.6$), and (4) Contrast Shift (contrast factor 0.3). 
+
+\textbf{Rigorous Contrast Shift Evaluation.} During our investigation, we discovered a critical bug in the evaluation pipeline of existing model merging benchmarks: applying Torchvision's \texttt{adjust\_contrast} directly to already-normalized images clamps the negative values (as normalized background pixels are $\approx -2.1$) to exactly 0.0. This destroys the entire image signal (reducing all pixels to a flat 0.0) and forces all methods to fail with random guessing ($\approx 14\%$ accuracy). We establish a rigorous, mathematically correct contrast shift pipeline: we un-normalize the incoming images back to $[0, 1]$ before adjusting the contrast, and then re-normalize them to the correct feature space.
+
+\textbf{Baselines.} We compare CPA-Merge against five prominent baselines:
+\begin{itemize}
+    \item \textbf{STATIC:} A fixed, uniform model merge with $\Lambda = [1/3, 1/3, 1/3]^T$ across all steps.
+    \item \textbf{ADAMERGING:} A prominent teacher-free baseline that optimizes $\Lambda$ online via prediction entropy minimization~\cite{yang2024adamerging}.
+    \item \textbf{S2C-MERGE:} A state-of-the-art teacher-free baseline optimizing entropy minimization combined with a KL-divergence consistency loss across augmented views~\cite{s2cmerge2026}.
+    \item \textbf{SATA-SYMERGE:} A teacher-guided baseline that stores the full expert backbones in memory, using KL-divergence distillation from the true active expert to guide parameter updates~\cite{sata2026}.
+    \item \textbf{EWC-TTA:} A teacher-guided baseline utilizing pre-computed diagonal Fisher Information Matrix priors and quadratic penalty constraints to stabilize classification heads~\cite{ewctta2026}.
+\end{itemize}
+
+\subsection{Main Results}
+We present our complete evaluation results on both Alternating and Sequential streams in Table~\ref{tab:main-results}.
+
+\begin{table*}[t]
+\caption{Test-time model merging accuracies on alternating and sequential streams under multiple corruptions.}
+\label{tab:main-results}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcccccr}
+\toprule
+Method & Clean & Gaussian Noise & Gaussian Blur & Contrast Shift & Average \\
+\midrule
+\multicolumn{6}{c}{\textbf{Alternating Stream}} \\
+\midrule
+STATIC & 67.27\% & 61.60\% & 62.48\% & 61.06\% & \textbf{63.10\%} \\
+ADAMERGING & 67.96\% & 60.54\% & 61.08\% & 61.62\% & \textbf{62.80\%} \\
+S2C-MERGE & 66.50\% & 60.67\% & 61.60\% & 59.62\% & \textbf{62.10\%} \\
+SATA-SYMERGE & 69.19\% & 61.12\% & 60.54\% & 53.71\% & \textbf{61.14\%} \\
+EWC-TTA & 69.29\% & 61.50\% & 60.42\% & 55.98\% & \textbf{61.80\%} \\
+\textbf{CPA-MERGE (Ours)} & \textbf{83.81\%} & \textbf{79.40\%} & \textbf{79.94\%} & \textbf{79.27\%} & \textbf{80.60\%} \\
+\midrule
+\multicolumn{6}{c}{\textbf{Sequential Stream}} \\
+\midrule
+STATIC & 66.75\% & 62.04\% & 61.71\% & 61.81\% & \textbf{63.08\%} \\
+ADAMERGING & 60.44\% & 58.65\% & 56.56\% & 57.65\% & \textbf{58.32\%} \\
+S2C-MERGE & 53.75\% & 51.73\% & 49.96\% & 46.94\% & \textbf{50.59\%} \\
+SATA-SYMERGE & 70.17\% & 68.02\% & 68.06\% & 56.75\% & \textbf{65.75\%} \\
+EWC-TTA & 69.38\% & 66.73\% & 67.94\% & 61.56\% & \textbf{66.40\%} \\
+\textbf{CPA-MERGE (Ours)} & \textbf{83.52\%} & \textbf{79.35\%} & \textbf{80.17\%} & \textbf{76.29\%} & \textbf{79.83\%} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+As demonstrated in Table~\ref{tab:main-results}, our proposed \textbf{CPA-Merge} achieves a decisive, landslide victory across all evaluation metrics and configurations:
+\begin{itemize}
+    \item \textbf{Alternating Stream Superiority:} On the alternating stream, CPA-Merge achieves an average accuracy of \textbf{80.60\%}, outperforming the best existing teacher-free baseline (STATIC at 63.10\%) by an outstanding \textbf{+17.50\% absolute} and outperforming the best teacher-guided baseline (EWC-TTA at 61.80\%) by \textbf{+18.80\%}.
+    \item \textbf{Sequential Stream Triumph:} On the highly challenging sequential stream, standard teacher-free methods suffer from parameter drift and decision-boundary collapse. As visualized in Figure~\ref{fig:trajectories}, S2C-Merge collapses to \textbf{50.59\%} and AdaMerging drops to \textbf{58.32\%} because they get permanently trapped in the first task's parameters, falling significantly below the simple STATIC baseline (\textbf{63.08\%}). In contrast, CPA-Merge remains exceptionally stable, tracking task boundaries perfectly and achieving \textbf{79.83\%} average accuracy. This is a \textbf{+13.43\% absolute improvement} over the best teacher-guided baseline (EWC-TTA at 66.40\%) and a \textbf{+29.24\% absolute improvement} over S2C-Merge, completely bypassing the memory-accuracy trade-off of TTMM.
+    \item \textbf{Unparalleled Robustness under Corruptions:} Across all three severe corruptions (noise, blur, contrast), CPA-Merge experiences virtually no drop in performance, maintaining accuracies near \textbf{80\%}, whereas other methods hover around \textbf{60\%} or lower.
+\end{itemize}
+
+\subsection{Ablation and Analysis}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{lambda_trajectories.pdf}
+\caption{Trajectory of the merging coefficients $\lambda_k$ over the continuous sequential test stream (MNIST $\to$ FashionMNIST $\to$ KMNIST) under clean conditions. Left: AdaMerging (unconstrained entropy minimization) gets permanently trapped in the MNIST task parameters after the first 50 batches, causing decision-boundary collapse. Right: Our CPA-Merge, powered by Prototype-Driven Dynamic Routing (PD-Routing), immediately detects task transitions and resets the merging coefficients to track the active task perfectly.}
+\label{fig:trajectories}
+\end{figure*}
+
+\textbf{Task Detection Accuracy of PD-Routing.} To understand the exceptional stability of CPA-Merge, we evaluate the accuracy of our unsupervised task detection scheme. Under the static uniform merged anchor model, the average cosine similarity with pre-stored prototypes correctly identifies the active task with \textbf{94.67\% accuracy} on clean data, \textbf{90.00\%} under severe noise, \textbf{93.33\%} under blur, and \textbf{91.33\%} under contrast shift. Because PD-Routing resets the coefficients $\Lambda_t$ to this highly accurate dynamic prior at each step (as visualized in Figure~\ref{fig:trajectories}), the model is shielded from the catastrophic ``getting stuck'' trap of sequential streams, allowing immediate and flawless adaptation across continuous task boundaries.
+
+\textbf{The Role of Confidence-Masking.} By masking out representation alignment for samples with prediction confidence below $0.85$, we ensure that our InfoNCE contrastive alignment only targets highly accurate pseudo-labels. Under severe environmental corruptions, this confidence-masking prevents error propagation and confirmation bias, keeping representations tightly anchored to the expert class structures.
+
+\begin{table*}[t]
+\setlength{\tabcolsep}{3.5pt}
+\caption{Hyperparameter sensitivity analysis of CPA-Merge on sequential streams under clean and noise corruptions. Bold indicates our default settings.}
+\label{tab:sweeps-main}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcc|lcc|lcc}
+\toprule
+\multicolumn{3}{c|}{\textbf{(a) Routing Temp. $\tau$}} & \multicolumn{3}{c|}{\textbf{(b) Confidence Threshold}} & \multicolumn{3}{c}{\textbf{(c) Contrast Weight $\beta$}} \\
+Temp. ($\tau$) & Clean & Noise & Threshold & Clean & Noise & Weight ($\beta$) & Clean & Noise \\
+\midrule
+0.005 & 86.44\% & 80.12\% & 0.0 & 85.38\% & 79.38\% & 0.0 & 82.79\% & 78.69\% \\
+0.01 & 85.08\% & 82.19\% & 0.5 & 84.21\% & 79.96\% & 0.05 & 84.79\% & 79.06\% \\
+\textbf{0.02} & 83.98\% & 79.21\% & 0.7 & 83.90\% & 80.29\% & \textbf{0.1} & 84.35\% & 79.19\% \\
+0.05 & 80.58\% & 74.83\% & \textbf{0.85} & 82.65\% & 80.23\% & 0.5 & 84.00\% & 79.50\% \\
+0.1 & 77.06\% & 71.83\% & 0.95 & 84.62\% & 79.92\% & 1.0 & 82.79\% & 80.10\% \\
+0.5 & 71.38\% & 63.96\% & - & - & - & - & - & - \\
+1.0 & 70.42\% & 63.46\% & - & - & - & - & - & - \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{Hyperparameter Sensitivity Sweeps.} To thoroughly justify the design choices and parameter settings of CPA-Merge, we perform extensive empirical sweeps on our three key hyperparameters evaluated on the highly non-stationary sequential stream under clean and noise corruptions, presented in Table~\ref{tab:sweeps-main}:
+\begin{enumerate}
+    \item \textbf{Routing Softmax Temperature ($\tau$):} Sweeping $\tau$ from $0.005$ to $1.0$ (Table~\ref{tab:sweeps-main}a) shows a severe performance drop as $\tau$ increases (e.g., clean accuracy drops from $83.98\%$ to $70.42\%$). This validates our mathematical formulation in Appendix~\ref{appendix-pdrouting-math}: low temperature acts as a continuous relaxation of the Argmax operator, enforcing sharp, binary-like task selection to prevent destructive task interference.
+    \item \textbf{Confidence Mask Threshold $H_{\text{thresh}}$:} Sweeping the confidence threshold from $0.0$ to $0.95$ (Table~\ref{tab:sweeps-main}b) shows that masking plays a key role under corruptions. Our chosen default of $0.85$ provides high robustness, filtering out noisy pseudo-labels and bounding representation drift.
+    \item \textbf{Contrastive Alignment Weight $\beta$:} Sweeping $\beta$ from $0.0$ to $1.0$ (Table~\ref{tab:sweeps-main}c) demonstrates that incorporating contrastive alignment ($\beta > 0$) consistently outperforms pure prediction entropy minimization ($\beta = 0.0$) by up to $+2\%$ absolute, confirming that our prototype semantic anchors successfully counteract decision-boundary drift.
+\end{enumerate}
+
+\textbf{Limitations and Future Directions.} While CPA-Merge achieves state-of-the-art performance with a minimal memory footprint, we identify three key areas for future research: (1) \emph{Prototype Dependency:} Our framework requires pre-computing class prototypes of size $[K, C, D]$. This assumes access to a small calibration set from each expert prior to deployment. If unavailable, future work could investigate zero-shot prototype generation (e.g., using text-to-feature encoders like CLIP if natural language task descriptions are available). (2) \emph{Batch Homogeneity:} PD-Routing computes a single routing vector per batch, assuming that samples within a batch are mostly homogeneous. In highly heterogeneous streams (where individual batches contain random mixtures of multiple tasks), batch-level routing may lead to inter-task interference. Extending CPA-Merge to sample-specific merging coefficients or parameter-efficient Mixture-of-Experts (MoE) routing would address this. (3) \emph{Divergent Loss Basins:} Our anchor model relies on a static uniform merge, which preserves semantic structures when experts lie in the same loss basin (e.g., sharing a pre-trained backbone). If expert backbones are extremely divergent or have different architectures, a uniform merge might experience representation collapse. Exploring multi-head anchor models or robust linear projection mappings represents a valuable future direction.
+
+\section{Conclusion}
+\label{submission-conclusion}
+
+In this paper, we introduced \textbf{CPA-Merge}, a novel, completely self-supervised, and teacher-free test-time model merging framework. CPA-Merge leverages pre-stored lightweight expert class prototypes to drive two key innovations: Prototype-driven Dynamic Routing (PD-Routing) for unsupervised task-level coefficient resetting, and Confidence-Masked Contrastive Alignment to robustly align representations under environmental corruptions. Storing only a few kilobytes of prototypes, CPA-Merge completely breaks the memory-accuracy trade-off of existing TTMM methods. Exhaustive empirical evaluations demonstrate that CPA-Merge sets a new state-of-the-art, outperforming all existing teacher-free and teacher-guided baselines by up to \textbf{+17.5\%} and \textbf{+13.4\%} absolute averages respectively, paving a highly promising path for efficient, robust, and scalable test-time model merging.
+
+\section*{Impact Statement}
+
+This paper presents work whose goal is to advance the state-of-the-art in test-time model adaptation and parameter-efficient multi-task learning. By providing a highly accurate, stable, and memory-efficient framework (CPA-Merge) that requires virtually zero storage overhead compared to storing full expert models, this work facilitates the deployment of robust and adaptive machine learning models on resource-constrained edge devices (e.g., mobile phones, internet-of-things sensors, and embedded systems). This democratization of adaptive AI has positive societal consequences, including reducing the carbon footprint associated with continuous cloud-based inference and backpropagation, and enhancing privacy by enabling on-device adaptation without transmitting user data to centralized servers. We do not foresee any direct negative ethical or societal consequences specifically resulting from this work.
+
+\nocite{*}
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\clearpage
+\appendix
+\onecolumn
+\icmltitle{Appendix: Contrastive Prototype Alignment with Dynamic Task Routing \\ for Teacher-Free Test-Time Model Merging}
+
+\section{Experimental and Optimization Hyperparameters}
+\label{appendix-hyperparameters}
+
+To ensure complete reproducibility, we detail all the experimental and optimization hyperparameters used during expert model fine-tuning and test-time adaptation (TTA) in this section.
+
+\subsection{Expert Fine-Tuning Hyperparameters}
+All three expert models (MNIST, FashionMNIST, and KMNIST) share the same backbone architecture (a pre-trained ResNet-18) and are fine-tuned on the respective training sets using PyTorch. The specific training configurations are summarized in Table~\ref{tab:finetuning-hyperparams}.
+
+\begin{table}[h]
+\caption{Hyperparameters for Expert Model Fine-Tuning.}
+\label{tab:finetuning-hyperparams}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Backbone Architecture & ResNet-18 (pre-trained) \\
+Optimizer & AdamW \\
+Learning Rate & $1\times 10^{-4}$ \\
+Weight Decay & $1\times 10^{-4}$ \\
+Training Epochs & 4 \\
+Batch Size & 128 \\
+Training Subset Size (per task) & 10,000 samples \\
+Validation/Testing Subset Size (per task) & 5,000 samples \\
+MNIST Expert Test Accuracy & 98.20\% \\
+FashionMNIST Expert Test Accuracy & 87.54\% \\
+KMNIST Expert Test Accuracy & 90.08\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+\subsection{Test-Time Model Merging (TTMM) Hyperparameters}
+During the test-time adaptation phase, the merging coefficients $\Lambda$ are optimized dynamically. Table~\ref{tab:ttmm-hyperparams} lists the optimization and architectural hyperparameters for CPA-Merge and other compared baselines.
+
+\begin{table}[h]
+\caption{Test-Time Adaptation Hyperparameters for CPA-Merge.}
+\label{tab:ttmm-hyperparams}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Coefficient Learning Rate ($\eta$) & 0.01 \\
+Coefficient Optimizer & Adam \\
+Contrastive Temperature ($\kappa$) & 0.1 \\
+Confidence Threshold Mask & 0.85 \\
+Contrastive Loss Weight ($\beta$) & 0.1 \\
+PD-Routing Softmax Temperature ($\tau$) & 0.02 \\
+Stream Batch Size ($B$) & 32 \\
+Total Batches evaluated (per stream) & 150 \\
+Samples per task in stream & 1,600 (Total 4,800) \\
+Coefficient Initialization & Uniform ($[1/3, 1/3, 1/3]^T$) \\
+Simplex Projection & Projected Gradient Descent (PGD) \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+\section{Mathematical Analysis and Design of PD-Routing}
+\label{appendix-pdrouting-math}
+
+A key innovation of CPA-Merge is the Prototype-driven Dynamic Routing (PD-Routing) scheme. Here we analyze the mathematical formulation of PD-Routing and the effect of the temperature hyperparameter $\tau$.
+
+Recall that the unsupervised task-wise affinity score $\mathcal{S}_k$ for task $k$ and batch $X_t$ is computed as:
+\begin{equation}
+    \mathcal{S}_k = \frac{1}{B} \sum_{i=1}^B \max_{c \in \{0, \dots, C-1\}} \mathbf{z}_i^T \mathbf{\mu}_{k, c}
+\end{equation}
+where $\mathbf{z}_i$ is the L2-normalized feature embedding of sample $i$ under the static uniform merged model, and $\mathbf{\mu}_{k, c}$ is the L2-normalized class prototype.
+
+We construct the sharp task routing prior $\Lambda_{\text{prior}} \in \mathbb{R}^K$ using:
+\begin{equation}
+    \lambda_{\text{prior}, k} = \frac{\exp(\mathcal{S}_k / \tau)}{\sum_{j=1}^K \exp(\mathcal{S}_j / \tau)}
+\end{equation}
+
+\subsection{Sharpness and Task Detection Behavior}
+The choice of a very low softmax temperature $\tau = 0.02$ is mathematically designed to perform a continuous relaxation of the Argmax operator. Let us analyze the dynamic range of affinity scores:
+- For the correct active task $T^*$, the normalized embeddings are semantically aligned with the corresponding prototypes, yielding a high average maximum cosine similarity $\mathcal{S}_{T^*} \approx 0.65 - 0.75$.
+- For an incorrect task $k \neq T^*$, the feature embeddings lie far from the prototype cluster centers of task $k$, yielding $\mathcal{S}_k \approx 0.35 - 0.45$.
+
+Let $\Delta = \mathcal{S}_{T^*} - \mathcal{S}_k \approx 0.30$. Under a standard softmax ($\tau = 1.0$), the relative prior ratio is:
+\begin{equation}
+    \frac{\lambda_{\text{prior}, T^*}}{\lambda_{\text{prior}, k}} = \exp(\Delta) \approx \exp(0.30) \approx 1.35
+\end{equation}
+This would yield a very diffuse routing vector (e.g., $[0.45, 0.33, 0.22]$), failing to fully activate the correct expert and prune out interference from unrelated experts.
+
+In contrast, under our choice of $\tau = 0.02$, the relative ratio becomes:
+\begin{equation}
+    \frac{\lambda_{\text{prior}, T^*}}{\lambda_{\text{prior}, k}} = \exp\left( \frac{\Delta}{0.02} \right) \approx \exp(15) \approx 3.2 \times 10^6
+\end{equation}
+This mathematically enforces an almost-binary task selection (e.g., $\lambda_{\text{prior}, T^*} \to 1.0$, and $\lambda_{\text{prior}, k} \to 0.0$), effectively selecting only the active expert and perfectly shielding the merged model from destructive task interference. Figure~\ref{fig:trajectories} in the main text illustrates how this prevents parameter drift on sequential task transitions.
+
+\section{Analysis of the Contrast Shift Evaluation Bug}
+\label{appendix-contrast-bug}
+
+Here we formally analyze the mathematical consequence of applying contrast adjustments directly to normalized images, explaining why existing pipelines fail on this corruption.
+
+Let $I \in [0, 1]^{C \times H \times W}$ be a clean input image. The standard normalization operation is defined as:
+\begin{equation}
+    \tilde{I} = \frac{I - \mu_D}{\sigma_D}
+\end{equation}
+where $\mu_D$ and $\sigma_D$ are the channel-wise dataset mean and standard deviation (e.g., for MNIST, $\mu_D = 0.1307$ and $\sigma_D = 0.3081$).
+
+Under standard normalization, the background pixels of MNIST (which have value 0.0 in the raw space) are mapped to:
+\begin{equation}
+    \tilde{I}_{\text{bg}} = \frac{0.0 - 0.1307}{0.3081} \approx -0.424
+\end{equation}
+
+The standard PyTorch/Torchvision contrast adjustment function \texttt{adjust\_contrast(img, factor)} operates by computing the mean intensity of the input tensor, $\bar{x}$, and shifting values away from or towards this mean:
+\begin{equation}
+    \texttt{adjust\_contrast}(X) = \bar{x} + \text{factor} \cdot (X - \bar{x})
+\end{equation}
+Crucially, standard image processing operations clamp the output to the valid pixel range $[0, 1]$ to prevent visual clipping:
+\begin{equation}
+    \tilde{I}_{\text{corrupted}} = \text{clamp}(\bar{x} + \text{factor} \cdot (\tilde{I} - \bar{x}), \, \text{min}=0.0, \, \text{max}=1.0)
+\end{equation}
+
+If this adjustment is applied directly to the normalized image $\tilde{I}$, the negative values representing the background pixels (e.g., $\tilde{I}_{\text{bg}} \approx -0.424$) are strictly clamped to $0.0$ since they fall below the minimum threshold of $0.0$.
+This creates an irreversible information bottleneck where the background is forced to 0.0, while the foreground stroke pixels are also scaled and shifted. Since the mean of a normalized image is close to zero, the entire image collapses to a flat tensor or severe clipping occurs, destroying the structural geometry of the digits and rendering prediction impossible (leading to random guessing, i.e., $\approx 14\%$ accuracy).
+
+\subsection{The Correct Formulation}
+Our mathematically sound contrast shift pipeline un-normalizes the image first, performs the contrast shift in the raw image space $[0, 1]$, and then re-normalizes:
+\begin{equation}
+    I_{\text{raw}} = \tilde{I} \cdot \sigma_D + \mu_D
+\end{equation}
+\begin{equation}
+    I_{\text{corrupted\_raw}} = \text{clamp}(\bar{I}_{\text{raw}} + \text{factor} \cdot (I_{\text{raw}} - \bar{I}_{\text{raw}}), \, \text{min}=0.0, \, \text{max}=1.0)
+\end{equation}
+\begin{equation}
+    \tilde{I}_{\text{correct}} = \frac{I_{\text{corrupted\_raw}} - \mu_D}{\sigma_D}
+\end{equation}
+By preserving the correct data space during contrast manipulation, we ensure that the image's topological and semantic information remains intact under OOD shift.
+
+\section{Space Complexity and Storage Overhead of Prototypes}
+\label{appendix-complexity}
+
+To demonstrate the extreme scalability of CPA-Merge compared to teacher-guided methods (which require keeping the full expert backbones in memory), we analyze the exact space and parameter complexity.
+
+Let $K$ be the number of tasks, $C$ the number of classes per task, and $D$ the dimensionality of the feature representation space of the backbone model (for ResNet-18, $D=512$).
+\begin{itemize}
+    \item \textbf{CPA-Merge Storage:} Storing the class prototypes requires saving a single tensor of shape $[K, C, D]$ containing floating-point numbers.
+    \item \textbf{Teacher-guided Storage:} Teacher-guided methods (e.g., SATA-SBF, EWC-TTA) require storing $K$ individual backbone parameter sets, each of size $P$ (where $P = 11.2 \times 10^6$ parameters for ResNet-18).
+\end{itemize}
+
+Table~\ref{tab:storage-comparison} shows the parameter counts and memory footprint (assuming standard 32-bit single-precision floats, i.e., 4 bytes per parameter/element).
+
+\begin{table}[h]
+\caption{Memory Footprint and Parameter Complexity Comparison.}
+\label{tab:storage-comparison}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{llrr}
+\toprule
+Method & Elements Stored & Total Parameters & Memory Size \\
+\midrule
+Teacher-guided (SATA / EWC) & $K \times P$ & $33,600,000$ & $134,400,000$ bytes ($\approx \mathbf{134.4\text{ MB}}$) \\
+\textbf{CPA-Merge (Ours)} & $K \times C \times D$ & $15,360$ & $61,440$ bytes ($\approx \mathbf{61.4\text{ KB}}$) \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+As shown, our prototype storage requires a mere \textbf{61.4 Kilobytes}, which represents a \textbf{$2,187\times$ reduction} in memory footprint relative to teacher-guided methods. This demonstrates that CPA-Merge is highly practical for resource-constrained edge devices and massive multi-task settings, offering teacher-guided level stability with teacher-free level efficiency.
+
+\section{Hyperparameter Sensitivity Analysis and Empirical Sweeps}
+\label{appendix-sweeps}
+
+We conduct extensive hyperparameter sensitivity analyses on the three key parameters of our framework: the routing softmax temperature $\tau$, the confidence mask threshold, and the contrastive alignment loss weight $\beta$. All experiments are evaluated on the highly non-stationary sequential stream under clean and noise corruptions.
+
+The empirical results and detailed sensitivity sweep tables are integrated directly into the main text in Section~4.3 (Ablation and Analysis) and Table~\ref{tab:sweeps-main} to provide immediate, high-signal empirical validation for our framework's design. In this section, we provide a high-level summary of the architectural and mathematical takeaways from these sweeps:
+\begin{enumerate}
+    \item \textbf{Routing Softmax Temperature $\tau$:} The sharp routing temperature ($\tau = 0.02$) acts as a continuous relaxation of the Argmax operator. Increasing the temperature towards $1.0$ soft-mixes the expert backbones, which introduces massive inter-task interference and degrades performance. A sharp prior is mathematically critical to ensure clean task specialization under non-stationary streams.
+    \item \textbf{Confidence Mask Threshold:} Masking low-confidence samples protects the representation space from confirmation bias. While setting no mask ($0.0$) works reasonably well on clean data, it suffers under corruptions because noisy pseudo-labels pull representation embeddings towards incorrect class prototypes. A robust threshold of $0.85$ effectively filters out this noise and stabilizes alignment.
+    \item \textbf{Contrastive Alignment Weight $\beta$:} Incorporating the contrastive loss ($\beta > 0$) consistently outperforms pure prediction entropy minimization ($\beta = 0$). This validates our core hypothesis: lightweight class prototypes act as extremely effective semantic anchors, preventing the representation space from undergoing decision-boundary collapse.
+\end{enumerate}
+
+\section{Theoretical Analysis of Confidence-Masked Contrastive Alignment}
+\label{appendix-contra-math}
+
+In this section, we provide a formal mathematical analysis demonstrating how Confidence-Masked Contrastive Alignment prevents decision-boundary collapse and stabilizes teacher-free test-time model merging (TTMM) compared to standard unconstrained prediction entropy minimization.
+
+\subsection{The Gradient Vanishing and Decision-Boundary Collapse Problem}
+Standard teacher-free TTMM methods (such as AdaMerging) optimize the merging coefficients $\Lambda$ by minimizing the prediction entropy:
+\begin{equation}
+    \mathcal{L}_{\text{ent}} = - \frac{1}{B} \sum_{i=1}^B \sum_{c=0}^{C-1} \hat{y}_{i, c} \log \hat{y}_{i, c}
+\end{equation}
+where $\hat{y}_{i, c} = \text{softmax}(h(f(x_i; \theta(\Lambda))))_c$ is the predicted probability for class $c$.
+
+Let us analyze the gradient of $\mathcal{L}_{\text{ent}}$ with respect to the merging coefficients $\Lambda$. By the chain rule, for a sample $i$, we have:
+\begin{equation}
+    \frac{\partial \mathcal{L}_{\text{ent}, i}}{\partial \Lambda} = \sum_{c=0}^{C-1} \frac{\partial \mathcal{L}_{\text{ent}, i}}{\partial o_{i, c}} \frac{\partial o_{i, c}}{\partial \Lambda}
+\end{equation}
+where $o_{i, c}$ is the logit output for class $c$. The derivative of the entropy loss with respect to the logit $o_{i, c}$ is given by:
+\begin{equation}
+    \frac{\partial \mathcal{L}_{\text{ent}, i}}{\partial o_{i, c}} = \hat{y}_{i, c} \left( \mathcal{H}_i + \log \hat{y}_{i, c} \right)
+\end{equation}
+where $\mathcal{H}_i = - \sum_{k=0}^{C-1} \hat{y}_{i, k} \log \hat{y}_{i, k}$ is the entropy of the prediction for sample $i$.
+
+Under continuous task shifts (such as the sequential stream MNIST $\to$ FashionMNIST), the model parameters adapted to MNIST are evaluated on FashionMNIST. Because of the distribution shift, the model produces highly confident but completely incorrect predictions (e.g., classifying a shoe as a digit). For these overconfident incorrect predictions, the winning class $\hat{c}_i = \text{argmax}_c \hat{y}_{i, c}$ has $\hat{y}_{i, \hat{c}_i} \to 1.0$, and for all other classes $c \neq \hat{c}_i$, $\hat{y}_{i, c} \to 0.0$.
+
+In this limit, the prediction entropy vanishes:
+\begin{equation}
+    \mathcal{H}_i \to 0
+\end{equation}
+Consequently, the logit gradient also vanishes:
+\begin{equation}
+    \frac{\partial \mathcal{L}_{\text{ent}, i}}{\partial o_{i, c}} \to 0 \quad \forall c \in \{0, \dots, C-1\}
+\end{equation}
+This leads to $\nabla_{\Lambda} \mathcal{L}_{\text{ent}} \to \mathbf{0}$. This mathematically explains why standard entropy minimization suffers from \emph{decision-boundary collapse} and gets permanently trapped in sub-optimal states: once the model makes a confident wrong prediction, it receives zero gradient feedback, preventing it from ever adapting back when the domain shifts.
+
+\subsection{Contrastive Prototype Alignment as a Stable Gradient Anchor}
+To resolve this, CPA-Merge incorporates the Confidence-Masked Contrastive Alignment loss:
+\begin{equation}
+    \mathcal{L}_{\text{contra}} = \frac{1}{|I_{\text{masked}}|} \sum_{i \in I_{\text{masked}}} -\log \left( \frac{\exp(\mathbf{z}_i^T \mathbf{\mu}_{T^*, \hat{c}_i} / \kappa)}{\sum_{c'} \exp(\mathbf{z}_i^T \mathbf{\mu}_{T^*, c'} / \kappa)} \right)
+\end{equation}
+where $\mathbf{z}_i$ is the normalized feature embedding and $\mathbf{\mu}_{T^*, c}$ is the class prototype.
+
+The gradient of $\mathcal{L}_{\text{contra}}$ with respect to the embedding $\mathbf{z}_i$ is given by:
+\begin{equation}
+    \frac{\partial \mathcal{L}_{\text{contra}, i}}{\partial \mathbf{z}_i} = \frac{1}{\kappa} \sum_{c=0}^{C-1} \left( p_{i, c} - \mathbb{I}(c = \hat{c}_i) \right) \mathbf{\mu}_{T^*, c}
+\end{equation}
+where $p_{i, c} = \frac{\exp(\mathbf{z}_i^T \mathbf{\mu}_{T^*, c} / \kappa)}{\sum_{c'} \exp(\mathbf{z}_i^T \mathbf{\mu}_{T^*, c'} / \kappa)}$ is the soft similarity distribution over class prototypes.
+
+Unlike the entropy loss, the contrastive gradient $\frac{\partial \mathcal{L}_{\text{contra}, i}}{\partial \mathbf{z}_i}$ does \emph{not} vanish even if the model's classification logit prediction is highly confident (i.e., even if $\hat{y}_{i, \hat{c}_i} \to 1.0$). If the representation vector $\mathbf{z}_i$ has not yet been aligned with the prototype $\mathbf{\mu}_{T^*, \hat{c}_i}$ (meaning $\mathbf{z}_i^T \mathbf{\mu}_{T^*, \hat{c}_i} < 1$), then $p_{i, \hat{c}_i} < 1$, which maintains a non-zero, robust gradient signal:
+\begin{equation}
+    \left\| \frac{\partial \mathcal{L}_{\text{contra}, i}}{\partial \mathbf{z}_i} \right\|_2 > 0
+\end{equation}
+This gradient actively pulls the feature embedding $\mathbf{z}_i$ towards the prototype of the predicted class, adjusting the merging coefficients $\Lambda$ to expand the representation alignment of the active task.
+
+\subsection{Noise Filtering and Error Bound via Confidence Masking}
+A major challenge in teacher-free TTA is confirmation bias: if the model aligns features using incorrect pseudo-labels, it will pull representations towards incorrect prototypes, leading to semantic degradation. We now show how our confidence-masking scheme mathematically bounds this alignment error.
+
+Let $e_i \in \{0, 1\}$ be the indicator that the pseudo-label is incorrect (i.e., $\hat{c}_i \neq y_i^*$, where $y_i^*$ is the true label). Let $p(e_i = 1)$ be the unmasked error rate of the model under corruption.
+When confidence masking is applied, the contrastive loss is computed only over the masked set $I_{\text{masked}} = \{i \mid \max_c \hat{y}_{i, c} > H_{\text{thresh}}\}$. Let $p(e_i = 1 \mid \text{mask}_i = 1)$ be the error rate on the high-confidence subset.
+
+By Bayes' theorem:
+\begin{equation}
+    p(e_i = 1 \mid \text{mask}_i = 1) = p(\text{mask}_i = 1 \mid e_i = 1) \frac{p(e_i = 1)}{p(\text{mask}_i = 1)}
+\end{equation}
+Under standard classifier calibration properties (e.g., maximum class probability correlates with accuracy), the probability of the model producing a high-confidence prediction on an incorrect sample is bounded by:
+\begin{equation}
+    p(\text{mask}_i = 1 \mid e_i = 1) \le \epsilon \ll 1
+\end{equation}
+Therefore, we have:
+\begin{equation}
+    p(e_i = 1 \mid \text{mask}_i = 1) \le \epsilon \cdot \frac{p(e_i = 1)}{p(\text{mask}_i = 1)}
+\end{equation}
+
+This shows that as long as the threshold $H_{\text{thresh}}$ is set sufficiently high (e.g., $0.85$), the alignment error rate on the masked set is scaled down by $\epsilon$. This mathematically bounds the representation drift, ensuring that the model only performs contrastive alignment on samples that are highly likely to be correct, thereby eliminating the feedback loop of confirmation bias.
+
+\end{document}

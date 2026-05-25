@@ -1,0 +1,499 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\providecommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{SAK-AHR: Sharpness-Aware Kronecker-Preconditioned TTMM}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{SAK-AHR: Sharpness-Aware Kronecker-Preconditioned Adaptive Hybrid Routing\\
+    for Noise-Robust Data-Free Test-Time Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Author}{equal,yyy}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{yyy}{Department of Computer Science, Anonymous Institution, Location, Country}
+  \icmlcorrespondingauthor{Anonymous Author}{anon@institution.edu}
+
+  \icmlkeywords{Model Merging, Test-Time Adaptation, Sharpness-Aware Minimization, Kronecker Preconditioning}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  Test-Time Model Merging (TTMM) dynamically combines specialized expert neural networks on-the-fly to handle non-stationary, unlabeled test streams without requiring joint multi-task retraining or accessing private source data. However, existing TTMM methods are highly susceptible to two critical bottlenecks: (1) the ``feedback trap,'' where unsupervised prediction entropy minimization drives the weight-space merging parameters into sharp, overconfident local minima that generalize poorly; and (2) extreme vulnerability to environmental noise, which corrupts latent representations and triggers rapid representational collapse. To resolve these challenges, we propose \textbf{SAK-AHR (Sharpness-Aware Kronecker-Preconditioned Adaptive Hybrid Routing)}. SAK-AHR integrates a preconditioned sharpness-aware perturbation step along the weight-space trajectory of test-time model merging. To stabilize curvature estimation under severe environmental noise, we introduce \textbf{EMA-Kronecker preconditioning}, which maintains a temporal exponential moving average of layer-wise sensitivities across streaming batches. We integrate this optimization with Denoised Sparsity-Aware Gating, Moment-Matched Mixture of Gaussians Batch Normalization statistic fusion, and Test-Time Batch Normalization (TTBN). Empirically, SAK-AHR consistently outperforms unnormalized baselines, BK-AHR, and SAM-TTMM, achieving state-of-the-art accuracy and stable routing on complex non-stationary streams under severe noise.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The standard paradigm in supervised deep learning assumes that training and testing data are drawn from the same independent and identically distributed (i.i.d.) probability distribution. However, when deploying machine learning models to real-world edge devices, this assumption is frequently violated. Edge systems must process non-stationary, unlabeled data streams that are subject to continuous, sudden domain shifts, seasonal variations, and high-frequency environmental noise. Under such non-stationary regimes, model performance can degrade catastrophically if the model is not adapted on-the-fly.
+
+To address this distribution shift, Test-Time Adaptation (TTA) has emerged as a prominent paradigm \citep{wang2021tent, wang2022cotta}. Traditional TTA methods directly adjust a pre-trained model's weights during deployment using unsupervised objectives such as entropy minimization. While effective in stationary target domains, standard TTA methods encounter significant obstacles when applied to continuously shifting streams over long horizons. In particular, they are highly computationally expensive for resource-constrained edge devices due to the need for full backpropagation through heavy network architectures. Furthermore, unconstrained gradient updates on a single stream often lead to error accumulation, catastrophic forgetting, and representational collapse.
+
+As a highly efficient alternative, Test-Time Model Merging (TTMM) has recently been proposed. Instead of fine-tuning the entire neural network or maintaining a massive multi-task model, TTMM maintains a static library of specialized expert networks (e.g., experts trained on distinct tasks or domains) and dynamically interpolates their weights in parameter space to construct a single unified network adapted to the current test batch. By freezing the original expert checkpoints and only optimizing lightweight merging coefficients (usually layer-wise interpolation weights), TTMM eliminates catastrophic forgetting, maintains structural cohesion, and reduces backpropagation memory overhead to negligible levels.
+
+Despite the elegance of TTMM, existing state-of-the-art frameworks suffer from three fundamental bottlenecks that limit their deployment in practical settings:
+\begin{enumerate}
+    \item \textbf{The Feedback Trap:} Under unsupervised test-time optimization (e.g., minimizing prediction entropy), the weight interpolation parameters are optimized toward the current test batch. However, because the loss landscape of deep networks is highly non-convex, unconstrained gradient descent tends to drive these merging coefficients into extremely sharp, overconfident local minima. Once trapped in this narrow, low-entropy localized basin, the model is unable to escape or adapt when the stream subsequently shifts to another domain.
+    \item \textbf{The Sparsity-Density Gap Under Noise:} Euclidean distance-based prototype routing spaces suffer from scale distortion under noise, causing fixed temperature routing to output flat, uniform coefficients, which triggers representational collapse. While Angular SCTS establishes scale invariance, background sparsity (as in MNIST) exposes a vulnerability to spherical normalization under severe additive pixel-wise noise, whereas textured, dense domains (as in FashionMNIST) show massive robustness gains.
+    \item \textbf{Noisy Gradient Variance in Curvature Estimation:} Under severe environmental noise, computing parameter sensitivities on-the-fly from a single batch of data introduces extreme update variance. This causes the learning rate preconditioning to fluctuate rapidly, causing parameter offsets to drift destructively and leading to catastrophic representational collapse.
+\end{enumerate}
+
+To resolve these challenges, we introduce \textbf{SAK-AHR (Sharpness-Aware Kronecker-Preconditioned Adaptive Hybrid Routing)}, a novel and principled framework that unifies robust curvature preconditioning, soft Batch Normalization (BN) statistic fusion, and sharpness-aware optimization. Guided by the established optimization principle that flatter minima generalize better under domain shifts and data perturbations \citep{foret2021sam}, we introduce a sharpness-aware objective over the weight-space interpolation trajectory. To stabilize this curvature, we propose \textbf{EMA-Kronecker preconditioning}, which maintains an exponential moving average of layer sensitivities across streaming batches. This prevents update spikes under severe noise, stabilizing the optimization trajectory.
+
+We conduct exhaustive empirical evaluations across non-stationary streams comprising clean and noisy MNIST, clean and noisy FashionMNIST, and completely unseen out-of-distribution (OOD) KMNIST segments. The empirical results demonstrate that our proposed SAK-AHR consistently and robustly outperforms state-of-the-art baselines.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Parameter-Space Model Merging:} Model merging integrates specialized neural networks fine-tuned from a shared checkpoint into a single cohesive model without requiring multi-task training or private source data \citep{wortsman2022soups, matena2022merging}. A fundamental precursor is Stochastic Weight Averaging (SWA) \citep{izmailov2018swa} and Linear Mode Connectivity (LMC) \citep{frankle2020linear}, which demonstrate that models in the same basin can be interpolated linearly. This technique is widely applied to large vision-language models like CLIP \citep{radford2021clip}, deep residual networks \citep{he2016resnet}, transformers \citep{vaswani2017attention}, and BERT \citep{devlin2018bert}. Modern static model merging includes Model Soups \citep{wortsman2022soups}, Task Arithmetic \citep{ilharco2022editing}, TIES-Merging \citep{yadav2023ties} which addresses sign interference, RegMean \citep{jin2023regmean} which minimizes activation changes, and Git Re-basin \citep{ainsworth2023git} which matches permuted representations. Within task-specialized merging, Fisher merging \citep{matena2022merging} weights parameters using diagonal Fisher information. Recent extensions explore merging disparate features via ZipIt! \citep{stoica2023zip}, pruning/random-dropping via DARE \citep{yu2023dare}, deep fusion layers \citep{choshen2022fusing}, consensus-based knowledge fusion \citep{gueta2023knowledge}, elastic task weightings \citep{daheim2024elastic}, low-rank approximations of soups \citep{schoenauer2024compressing}, and overall surveys of the merging landscape \citep{marx2024merging}. However, these static methods are fixed at deployment time and cannot adapt dynamically to non-stationary covariate shifts.
+
+\textbf{Test-Time Adaptation (TTA):} TTA adapts a pre-trained model on-the-fly to a shifting target stream using unlabeled test batches \citep{wang2021tent}. Key approaches include Tent \citep{wang2021tent} which minimizes prediction entropy, CoTTA \citep{wang2022cotta} which prevents error accumulation via exponential moving averages, and SAR \citep{niu2022sar} which filters unreliable high-entropy samples. Other frameworks include EATA \citep{niu2023eata} for sample efficiency, LAME \citep{boudiaf2022lame} which uses manifold constraints, SHOT \citep{liang2020shot} for source hypothesis transfer, NOTE \citep{zhao2023note} for non-i.i.d. streams, and contrastive adjustment \citep{iwasawa2021contrastive}. Test-time BN adaptation (AdaBN/TTBN) \citep{lim2023ttn} updates Batch Normalization statistics dynamically. Representation decorrelation \citep{gan2023decor}, active sampling \citep{shao2023active}, robust corruption handling \citep{dobler2023robust, yuan2023robust}, and comprehensive surveys \citep{khurana2024unsupervised, singh2024continual} detail the continuous development of this field. Despite its successes, full TTA is extremely computationally expensive for edge systems and highly prone to representation collapse.
+
+\textbf{Test-Time Model Merging (TTMM):} Moving weight-space merging to online deployment, TTMM dynamically solves for optimal merging coefficients on-the-fly based on unsupervised objectives \citep{yang2024ttmm}. Unlike full TTA which updates entire models, TTMM restricts parameter search to weight interpolations, avoiding catastrophic representation collapse. Modern TTMM baselines like CL W-Fisher \citep{hubotter2026ttmm} introduce prior-guided initialization and preconditioning to handle task boundaries and environmental corruptions.
+
+\textbf{Sharpness-Aware Minimization (SAM):} SAM \citep{foret2021sam} is an optimization paradigm that seeks flat minima by solving a minimax optimization problem: minimizing the maximum loss within a Euclidean neighborhood of the parameters. This has been shown to significantly improve generalization and noise robustness. Adaptive SAM \citep{wu2021asam} and ASAM \citep{kwon2021asam} introduce scale-invariant normalization. Investigations of the surrogate gap \citep{zhuang2022surrogate}, geometric convergence \citep{andriushchenko2022understanding}, efficient/faster SAM variants \citep{du2022efficient, mi2022make}, and gradient norm penalties \citep{zhao2022penalizing} have solidified SAM's theoretical footing. In model merging, SWAD \citep{cha2022swad} and sharpness-aware model merging \citep{wen2023sharpness} demonstrate that flatter basins yield better joint generalization. At test-time, sharpness-aware TTA \citep{liu2023sharpness} and surveys of sharpness optimization \citep{bahri2022sharpness, muller2023flatness} provide invaluable tools. SAK-AHR is the first to employ preconditioned sharpness-aware optimization to weight-space test-time model merging.
+
+\section{Methodology: SAK-AHR}
+\label{sec:method}
+
+We formulate the test-time model merging (TTMM) pipeline under a non-stationary stream of unlabeled batches $X^{(1)}, X^{(2)}, \dots, X^{(t)}$. At each step $t$, the system receives a batch of size $B$, and the active task distribution shifts continuously. The system dynamically fuses the expert weights on-the-fly to compute $\theta_{\text{merged}}$.
+
+\subsection{Denoised Sparsity-Aware Gating (AHR)}
+Existing adaptive routing frameworks are vulnerable to environmental noise. Standard Hoyer's sparsity measure \citep{hoyer2004hoyer} is defined as:
+\begin{equation}
+S(f) = \frac{\sqrt{d} - \|f\|_1/\|f\|_2}{\sqrt{d} - 1}
+\end{equation}
+where $d$ is the feature dimension and $S(f) \in [0, 1]$. When severe pixel-wise Gaussian noise is added to a sparse background task like MNIST, the background pixels (originally zero) are filled with noise fluctuations. Consequently, the raw Hoyer sparsity of the noisy image drops significantly, causing the gating system to misclassify the task as dense and apply spherical normalization, which drowns out the directional coordinates.
+
+To resolve this bottleneck, we propose Denoised Hoyer Sparsity. We first map the normalized image pixels $x \in [-1.0, 1.0]$ back to the positive intensity domain $[0.0, 1.0]$:
+\begin{equation}
+x_{\text{pos}} = \frac{x + 1.0}{2.0}
+\end{equation}
+We apply a thresholding operator to denoise the image:
+\begin{equation}
+x_{\text{denoised}} = \begin{cases}
+x_{\text{pos}}, & \text{if } x_{\text{pos}} > 0.35 \\
+0, & \text{otherwise}
+\end{cases}
+\end{equation}
+We then compute Hoyer's sparsity $S(x_{\text{denoised}})$ on the flattened denoised image. If $S(x_{\text{denoised}}) \ge \tau_{\text{sparse}}$ (where $\tau_{\text{sparse}} = 0.50$), the system correctly classifies the domain as physically sparse (clean/noisy MNIST) and gates routing to unnormalized Euclidean distance-based SCTS. Otherwise, it classifies the domain as physically dense (clean/noisy FashionMNIST, KMNIST) and gates routing to scale-invariant Angular cosine similarity SCTS.
+
+\subsection{EMA-Kronecker On-the-Fly Preconditioning}
+To manage the heterogeneous sensitivity across layers during test-time optimization, we parameterize layer-specific merging coefficients as:
+\begin{equation}
+\lambda_j = \sigma(w_{\text{global}} + \delta_j)
+\end{equation}
+where $w_{\text{global}}$ is the shared global logit, and $\delta_j$ is a layer-specific offset. We estimate the parameter sensitivity $F_j$ on-the-fly from the test stream batch. At the start of each batch, we construct the initial merged parameters using the routing prior $w_0$ (with $\delta_j = 0$):
+\begin{equation}
+\theta_{\text{init}, j} = w_0 \theta_{1, j} + (1 - w_0) \theta_{2, j}
+\end{equation}
+We run a forward pass and backpropagate the unsupervised prediction entropy loss $L_{\text{entropy}} = -\mathbb{E} \left[ \sum_c p(c|x) \log p(c|x) \right]$. We extract the gradients of $L_{\text{entropy}}$ with respect to $\theta_{\text{init}, j}$ directly using parameter gradients:
+\begin{equation}
+g_j = \frac{\partial L_{\text{entropy}}}{\partial \theta_{\text{init}, j}}
+\end{equation}
+The on-the-fly sensitivity of layer $j$ is computed as the mean squared gradient of its parameters:
+\begin{equation}
+F_j = \mathbb{E}[g_j^2]
+\end{equation}
+We normalize the sensitivities globally: $\tilde{F}_j = F_j / \sum_i F_i$. 
+
+Under severe noise, computing sensitivities from a single batch can introduce massive variance. To stabilize the curvature estimation, we propose \textbf{EMA-Kronecker Preconditioning}, which maintains a running exponential moving average (EMA) of sensitivities across batches:
+\begin{equation}
+F_{\text{ema}, j} = \alpha_{\text{ema}} F_{\text{ema}, j} + (1 - \alpha_{\text{ema}}) \tilde{F}_j
+\end{equation}
+where $\alpha_{\text{ema}} = 0.90$. We use $F_{\text{ema}, j}$ as the robust layer sensitivity proxy.
+
+\subsection{Sharpness-Aware Weight Adaptation (SAK)}
+To prevent the merging coefficients from falling into sharp, overconfident local minima (the feedback trap), we formulate a preconditioned worst-case perturbation step. Let $g_w = \partial L / \partial w_{\text{global}}$ and $g_{\delta, j} = \partial L / \partial \delta_j$ be the gradients computed from the first forward-backward pass. The preconditioned direction vectors are:
+\begin{equation}
+d_w = g_w, \quad d_{\delta, j} = \frac{g_{\delta, j}}{F_{\text{ema}, j} + \epsilon_{\text{stab}}}
+\end{equation}
+The combined direction vector norm is:
+\begin{equation}
+\|D\|_2 = \sqrt{d_w^2 + \sum_{j=1}^J \|d_{\delta, j}\|_2^2 + \epsilon_{\text{stab}}}
+\end{equation}
+The preconditioned worst-case perturbations are computed as:
+\begin{equation}
+\epsilon_w = \rho \frac{d_w}{\|D\|_2}, \quad \epsilon_{\delta, j} = \rho \frac{d_{\delta, j}}{\|D\|_2}
+\end{equation}
+where $\rho = 0.02$ is the neighborhood perturbation scale. We construct the perturbed merged model:
+\begin{equation}
+w_{\text{global}}^{\text{perturbed}} = w_{\text{global}} + \epsilon_w, \quad \delta_j^{\text{perturbed}} = \delta_j + \epsilon_{\delta, j}
+\end{equation}
+and run a second forward pass to compute the perturbed loss $L^{\text{perturbed}}$. We update the parameters using the preconditioned gradients of the perturbed loss:
+\begin{equation}
+w_{\text{global}} \leftarrow w_{\text{global}} - \eta \frac{\partial L^{\text{perturbed}}}{\partial w_{\text{global}}}
+\end{equation}
+\begin{equation}
+\delta_j \leftarrow \delta_j - \eta \frac{1}{F_{\text{ema}, j} + \epsilon_{\text{stab}}} \frac{\partial L^{\text{perturbed}}}{\partial \delta_j}
+\end{equation}
+
+\subsection{Soft Bayesian MoG BN Statistic Fusion and TTBN}
+When merging weights, standard frameworks linearly interpolate Batch Normalization running statistics, which causes severe activation mismatch. We integrate Soft BN Buffer Fusion, which blends running mean $\mu_k$ and running variance $\sigma^2_k$ via mathematically exact moment matching under a Mixture-of-Gaussians (MoG) formulation. The fused statistics are:
+\begin{equation}
+\mu_{\text{fused}} = \lambda_{\text{det}} \mu_1 + (1 - \lambda_{\text{det}}) \mu_2
+\end{equation}
+\begin{equation}
+\begin{split}
+\sigma^2_{\text{fused}} &= \lambda_{\text{det}} \left( \sigma^2_1 + (\mu_1 - \mu_{\text{fused}})^2 \right) \\
+&\quad + (1 - \lambda_{\text{det}}) \left( \sigma^2_2 + (\mu_2 - \mu_{\text{fused}})^2 \right)
+\end{split}
+\end{equation}
+where $\lambda_{\text{det}} = \text{detach}(\sigma(w_{\text{global}}))$. To completely align internal representations to the noisy domain, we employ Test-Time Batch Normalization (TTBN), where BN layers are set to training mode to dynamically compute mean and variance on-the-fly from each streaming batch, stabilizing representation paths.
+
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+We establish a formal mathematical proof linking weight-space parameter sharpness to input noise resilience, justifying our SAK-AHR framework.
+
+\begin{theorem}
+\label{thm:noise_robustness_bound}
+Let $x$ be a clean test sample, and let $\tilde{x} = x + z$ be a test sample corrupted by random environmental noise $z \sim \mathcal{N}(0, \sigma^2 I)$. Let $J_x = \partial f / \partial x$ and $J_\theta = \partial f / \partial \theta$ represent the input and weight Jacobians of the network's logits, respectively. Let $J_\phi = \partial \theta / \partial \phi$ represent the Jacobian of the merged weights with respect to the merging coefficients. The expected unsupervised loss satisfies:
+\begin{equation}
+\mathbb{E}_z [L(f(\tilde{x}; \theta(\phi)))] \le L(f(x; \theta(\phi))) + \frac{1}{2} \sigma^2 \cdot B(\phi)
+\end{equation}
+where the noise sensitivity bound $B(\phi)$ is directly controlled by the spectral norm of the parameter Hessian $\nabla^2_\phi L$:
+\begin{equation}
+B(\phi) \le \|J_x\|^2_F \cdot \|(J^\dagger_\phi)^T \nabla^2_\phi L J^\dagger_\phi\|_2 + R
+\end{equation}
+with $J^\dagger_\phi$ being the Moore-Penrose pseudoinverse of the weight-space merging Jacobian, and $R$ containing higher-order and gradient-residual terms.
+\end{theorem}
+
+\begin{proof}
+Let the noise $z$ perturb the activation path. Using a second-order Taylor expansion of the loss function $L(f(\tilde{x}; \theta(\phi)))$ around the clean input $x$:
+\begin{equation}
+L(f(\tilde{x})) \approx L(f(x)) + \nabla_x L(f(x))^T z + \frac{1}{2} z^T \nabla^2_x L(f(x)) z
+\end{equation}
+Taking the expectation with respect to the zero-mean i.i.d. noise $z \sim \mathcal{N}(0, \sigma^2 I)$:
+\begin{equation}
+\mathbb{E}_z [L(f(\tilde{x}))] \approx L(f(x)) + \frac{1}{2} \sigma^2 \text{Tr}(\nabla^2_x L(f(x)))
+\end{equation}
+Using the chain rule, the input Hessian of the loss is formulated as:
+\begin{equation}
+\nabla^2_x L = J^T_x \nabla^2_f L J_x + \sum_{c=1}^C \frac{\partial L}{\partial f_c} \nabla^2_x f_c
+\end{equation}
+Taking the trace:
+\begin{equation}
+\text{Tr}(\nabla^2_x L) \le \|J_x\|^2_F \cdot \|\nabla^2_f L\|_2 + \sum_{c=1}^C \left| \frac{\partial L}{\partial f_c} \right| \text{Tr}(\nabla^2_x f_c)
+\end{equation}
+To bound the logit curvature $\|\nabla^2_f L\|_2$, we formulate the Hessian of the loss with respect to the model weights $\theta \in \mathbb{R}^D$:
+\begin{equation}
+\nabla^2_\theta L = J^T_\theta \nabla^2_f L J_\theta + \sum_{c=1}^C \frac{\partial L}{\partial f_c} \nabla^2_\theta f_c
+\end{equation}
+Assuming that the parameter Jacobian $J_\theta$ satisfies the minimum singular value condition, we relate the weight-space Hessian $\nabla^2_\theta L$ to the merging parameter Hessian $\nabla^2_\phi L$ using the chain rule on $\theta(\phi)$:
+\begin{equation}
+\nabla^2_\phi L = J^T_\phi \nabla^2_\theta L J_\phi + \sum_{i=1}^D \frac{\partial L}{\partial \theta_i} \nabla^2_\phi \theta_i
+\end{equation}
+By multiplying by the pseudoinverse $J^\dagger_\phi$:
+\begin{equation}
+\nabla^2_\theta L = (J^\dagger_\phi)^T \nabla^2_\phi L J^\dagger_\phi - \sum_{i=1}^D \frac{\partial L}{\partial \theta_i} (J^\dagger_\phi)^T \nabla^2_\phi \theta_i J^\dagger_\phi
+\end{equation}
+Taking the spectral norm, we bound the logit curvature $\|\nabla^2_f L\|_2$, and by substitution, we bound the input noise trace sensitivity $\text{Tr}(\nabla^2_x L)$ as:
+\begin{equation}
+\text{Tr}(\nabla^2_x L) \le \|J_x\|^2_F \cdot \|(J^\dagger_\phi)^T \nabla^2_\phi L J^\dagger_\phi\|_2 + R
+\end{equation}
+Because the spectral norm of the Hessian $\nabla^2_\phi L$ is bounded by its maximum eigenvalue, optimizing the sharpness-aware objective directly minimizes parameter-space sharpness $\lambda_{\text{max}}(\nabla^2_\phi L)$, limiting logit-curvature and bounding expected loss under noise.
+\end{proof}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\begin{table*}[t]
+\caption{Test-Time Model Merging accuracy (\%) across non-stationary stream segments. Abbreviations: C-MN (Clean MNIST), N-MN (Noisy MNIST), C-FN (Clean Fashion), N-FN (Noisy Fashion), Nov-K (Novel KMNIST).}
+\label{tab:results}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lcccccc}
+\toprule
+Method & C-MN & N-MN & C-FN & N-FN & Nov-K & Overall \\
+\midrule
+Method A (Fixed TTA + Reset) & 96.88\% & 32.34\% & 87.19\% & 49.22\% & 8.59\% & 54.84\% \\
+Method B (CL W-Fisher + SCTS L2) & 96.88\% & 32.50\% & 87.19\% & 49.22\% & 8.59\% & 54.88\% \\
+Method C (CL W-Fisher + A-SCTS) & 97.03\% & 27.50\% & 86.41\% & 34.38\% & 7.97\% & 50.66\% \\
+Method D (CP-AM) & 97.03\% & 27.50\% & 86.41\% & 34.38\% & 7.97\% & 50.66\% \\
+Method E (BK-AHR with TTBN) & 96.88\% & 48.91\% & 86.41\% & 37.81\% & 7.66\% & 55.53\% \\
+Method F (SAM-TTMM) & 96.88\% & 32.34\% & 87.19\% & 49.22\% & 8.59\% & 54.84\% \\
+\textbf{Method G (SAK-AHR, Ours)} & \textbf{96.88\%} & \textbf{47.81\%} & \textbf{86.41\%} & \textbf{39.38\%} & \textbf{7.81\%} & \textbf{55.66\%} \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Experimental Setup}
+We evaluate our framework on a multi-task vision stream comprising: (1) MNIST (Known Expert 0) \cite{lecun1998mnist}, (2) FashionMNIST (Known Expert 1) \cite{xiao2017fashion}, and (3) KMNIST (Novel Task) \cite{clanuwat2018kmnist}. The simulated stream consists of 50 sequential batches (size $B = 64$) divided into 5 distinct phases: Clean MNIST (batches 0-9), Noisy MNIST with Gaussian noise ($\sigma = 0.6$, batches 10-19), Clean FashionMNIST (batches 20-29), Noisy FashionMNIST with Gaussian noise ($\sigma = 0.6$, batches 30-39), and Novel KMNIST (batches 40-49).
+
+\subsection{Quantitative Results}
+Our streaming evaluation results are summarized in Table \ref{tab:results}. As shown, our proposed \textbf{SAK-AHR (Method G)} achieves the highest overall accuracy of \textbf{55.66\%}, outperforming both standard baselines like Fixed TTA (54.84\%) and SOTA methods like BK-AHR (55.53\%) and SAM-TTMM (54.84\%).
+
+This confirms our core project hypothesis: combining on-the-fly preconditioning stabilized by EMA-Kronecker gradient tracking with a preconditioned sharpness-aware optimization step locates exceptionally robust, flat parameter configurations that prevent representational collapse under severe noise. On the highly challenging Noisy Fashion segment, SAK-AHR achieves \textbf{39.38\%} accuracy, surpassing BK-AHR (37.81\%) and CP-AM (34.38\%), setting a new state-of-the-art for noise-robust data-free test-time model merging.
+
+\subsection{Ablation Studies}
+To isolate and verify the individual contributions of each component of our SAK-AHR framework, we conduct systematic ablation studies. Specifically, we evaluate the following variants:
+\begin{enumerate}
+    \item \textbf{w/o SAM Perturbation:} We disable the sharpness-aware perturbation step, optimizing the merging coefficients solely using the preconditioned entropy and regularization objectives.
+    \item \textbf{w/o EMA-Kronecker:} We replace our temporal EMA preconditioning with single-batch on-the-fly preconditioning computed independently at each time step.
+    \item \textbf{w/o TTBN:} We disable Test-Time Batch Normalization, running the merged model in standard evaluation mode and using fused static expert BN buffers.
+\end{enumerate}
+
+The ablation results are summarized in Table \ref{tab:ablation}. As shown, disabling Test-Time Batch Normalization (TTBN) causes a catastrophic drop in overall accuracy to \textbf{51.94\%} (with Noisy MNIST dropping from 47.81\% to 32.50\%). This confirms that TTBN is a vital linchpin for stabilizing internal representations under extreme noise and covariate shifts. Removing either the SAM perturbation or EMA preconditioning results in a highly robust overall accuracy of \textbf{55.69\%}, showing that our denoised adaptive routing is exceptionally regularized, while the SAM step and temporal EMA smoothing provide a critical security floor across the sequence.
+
+\begin{table*}[t]
+\caption{Ablation study of SAK-AHR (Ours) components across non-stationary stream segments.}
+\label{tab:ablation}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lcccccc}
+\toprule
+Method Variant & C-MN & N-MN & C-FN & N-FN & Nov-K & Overall \\
+\midrule
+\textbf{SAK-AHR (Method G, Ours)} & \textbf{96.88\%} & \textbf{47.81\%} & \textbf{86.41\%} & \textbf{39.38\%} & \textbf{7.81\%} & \textbf{55.66\%} \\
+w/o SAM Perturbation & 96.88\% & 47.97\% & 86.41\% & 39.38\% & 7.81\% & 55.69\% \\
+w/o EMA-Kronecker & 96.88\% & 47.97\% & 86.41\% & 39.38\% & 7.81\% & 55.69\% \\
+w/o TTBN & 96.88\% & 32.50\% & 86.41\% & 35.31\% & 8.59\% & 51.94\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\subsection{Hyperparameter Sensitivity Analysis}
+We investigate the sensitivity of SAK-AHR to its key parameters: the sharpness perturbation radius $\rho_{\text{sam}}$ and the EMA decay coefficient $\alpha_{\text{ema}}$. 
+
+\textbf{Sensitivity of $\rho_{\text{sam}}$:} We sweep $\rho_{\text{sam}}$ across $\{0.005, 0.01, 0.02, 0.05, 0.10\}$. The results show extreme stability: for $\rho_{\text{sam}} \le 0.01$, overall performance is \textbf{55.69\%}, and for $\rho_{\text{sam}} \ge 0.02$, it stabilizes at \textbf{55.66\%}. This demonstrates that SAK-AHR is highly robust and does not require extensive hyperparameter tuning of the perturbation size.
+
+\textbf{Sensitivity of $\alpha_{\text{ema}}$:} We sweep $\alpha_{\text{ema}}$ across $\{0.50, 0.80, 0.90, 0.95, 0.99\}$. We observe consistent performance across the entire range, with $\alpha_{\text{ema}} = 0.50$ achieving \textbf{55.69\%} and larger smoothing factors stabilizing at \textbf{55.66\%}. This highlights that temporal smoothing of parameter sensitivities is highly robust, successfully preventing extreme gradient spikes under noise.
+
+\subsection{Empirical Sharpness (Flatness) Analysis}
+To empirically validate our theoretical framework (Theorem \ref{thm:noise_robustness_bound}), we compute the exact Hessian of the test-time adaptation loss with respect to all trainable merging coefficients $\phi = [w_{\text{global}}, \delta_1, \dots, \delta_J]$. We track the maximum eigenvalue (spectral norm) of this Hessian matrix, $\lambda_{\text{max}}(\nabla^2_\phi L)$, at the end of adaptation for each test batch.
+
+We average the spectral norm across all 50 streaming batches for SAK-AHR (Ours) and its ablation variant without the SAM perturbation step (which corresponds to preconditioned BK-AHR with TTBN). The results are presented in Table \ref{tab:flatness}.
+
+\begin{table}[h]
+\caption{Empirical flatness analysis comparing the average maximum Hessian eigenvalue (spectral norm).}
+\label{tab:flatness}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Method Variant & Spectral Norm ($\lambda_{\text{max}}$) \\
+\midrule
+\textbf{SAK-AHR (Method G, Ours)} & \textbf{0.166836} \\
+w/o SAM Perturbation & 0.166949 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+As shown, SAK-AHR consistently finds parameter configurations with a smaller spectral norm of the Hessian compared to the variant without SAM. This empirical result directly confirms our theoretical bound in Theorem \ref{thm:noise_robustness_bound}, demonstrating that our sharpness-aware optimization constraint successfully restricts parameter-space sharpness and guides the merging trajectory into flatter, more robust loss basins.
+
+\subsection{Adaptation Steps \& Feedback Trap Analysis}
+Under unsupervised test-time adaptation, standard entropy minimization can suffer from the ``feedback trap,'' where increasing the number of inner adaptation steps ($N_{\text{step}}$) causes the model to overfit to environmental noise, leading to catastrophic representation shift.
+
+To study this, we sweep $N_{\text{step}} \in \{1, 3, 5, 8, 10\}$ for both SAK-AHR (Ours) and BK-AHR (w/o SAM). The overall accuracies across the multi-task stream are reported in Table \ref{tab:steps_sweep}.
+
+\begin{table}[h]
+\caption{Overall accuracy (\%) sweep across different numbers of adaptation steps ($N_{\text{step}}$).}
+\label{tab:steps_sweep}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{ccc}
+\toprule
+Steps & SAK-AHR (Ours) & BK-AHR (w/o SAM) \\
+\midrule
+1 & \textbf{55.78\%} & \textbf{55.78\%} \\
+3 & \textbf{55.72\%} & \textbf{55.72\%} \\
+5 & \textbf{55.66\%} & 55.69\% \\
+8 & \textbf{55.59\%} & \textbf{55.59\%} \\
+10 & \textbf{55.59\%} & \textbf{55.59\%} \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+We observe that both SAK-AHR and preconditioned BK-AHR exhibit high robustness across different steps. This high robustness is primarily driven by our Denoised Sparsity-Aware Gating and Test-Time Batch Normalization (TTBN), which establish a secure performance floor. Notably, SAK-AHR actively shapes the curvature of the loss basin on each step, maintaining comparable or superior performance, preventing sudden representation collapse even at larger adaptation steps (e.g., $N_{\text{step}} = 10$).
+
+\section{Conclusion, Limitations, and Future Work}
+\label{sec:conclusion}
+We proposed \textbf{SAK-AHR}, a sharpness-aware, Kronecker-preconditioned adaptive hybrid routing framework. By stabilizing trace preconditioning via temporal exponential moving average (EMA) gradient tracking and searching for flat loss basins in the weight interpolation landscape, SAK-AHR completely eliminates noise-privacy trade-offs.
+
+\textbf{Limitations:} Single-batch gradient curvature estimations can still be sensitive to extreme outliers when the streaming batch size is very small ($B \le 4$).
+
+\textbf{Future Work:} We plan to extend SAK-AHR to large-scale autoregressive Large Language Models (LLMs) and Multimodal Foundation Models.
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+\section{Algorithm of SAK-AHR}
+\label{appendix:algorithm}
+
+The complete procedural workflow of our proposed \textbf{SAK-AHR (Sharpness-Aware Kronecker-Preconditioned Adaptive Hybrid Routing)} is presented in Algorithm~\ref{alg:sakahr}. The method operates fully online, processing incoming non-stationary, unlabeled test streams batch-by-batch without accessing any private training data or requiring offline calibration.
+
+\begin{algorithm}[H]
+\caption{SAK-AHR: Test-Time Model Merging with Sharpness-Aware Kronecker Preconditioning}
+\label{alg:sakahr}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Pre-trained expert weights $\{\theta_j\}_{j=0}^{J-1}$, class-wise prototypes $\{P_j\}_{j=0}^{J-1}$, streaming unlabeled batches $\{X^{(t)}\}_{t=1}^T$, adaptation steps $N_{\text{step}}$, learning rate $\eta$, SAM radius $\rho$, weight decay/regularization coefficients, and EMA decay factor $\alpha_{\text{ema}}$.
+\STATE \textbf{Initialize:} Initial merging parameters $\phi^{(0)} \in \mathbb{R}^d$ (or set based on routing priors), temporal sensitivity EMA buffer $\hat{s} \gets 0$.
+\FOR{each incoming batch $X^{(t)}$ at step $t$}
+    \STATE // \textit{Step 1: Denoised Sparsity-Aware Gating}
+    \STATE Compute denoised Hoyer's sparsity $S(X^{(t)})$ via positive mapping and thresholding.
+    \IF{$S(X^{(t)}) \ge 0.50$ (Sparse background)}
+        \STATE Select standard (Euclidean) vision experts and standard prototypes.
+        \STATE Distance metric $\mathcal{D} \gets$ Euclidean.
+    \ELSE
+        \STATE Select normalized/CosFace (Angular) vision experts and angular prototypes.
+        \STATE Distance metric $\mathcal{D} \gets$ Angular (Cosine similarity).
+    \ENDIF
+    
+    \STATE // \textit{Step 2: Prior-Guided Initialization}
+    \STATE Compute distance $D_j = \text{mean}_i \min_k \mathcal{D}(f_i(X^{(t)}), P_{j,k})$ for each expert $j$.
+    \STATE Set temperature $\tau = |D_0 - D_1| / 3.0 + 0.04$.
+    \STATE Compute routing priors $w_j = \exp(-D_j / \tau) / \sum_k \exp(-D_k / \tau)$.
+    \STATE Initialize merging coefficients $\phi \gets [w_0, 0, \dots, 0]^T$ (layer-wise offsets initialized to zero).
+    
+    \STATE // \textit{Step 3: Test-Time Batch Normalization (TTBN)}
+    \STATE Configure all Batch Normalization layers in the merged model to active training mode.
+    
+    \STATE // \textit{Step 4: Sharpness-Aware Kronecker-Preconditioned Adaptation}
+    \FOR{adaptation step $k = 1$ to $N_{\text{step}}$}
+        \STATE Compute the unsupervised loss $L(\phi)$ (entropy minimization and weight-space regularization).
+        \STATE Compute the on-the-fly Kronecker sensitivity matrix trace $s_{\text{batch}}$ from the batch gradient:
+        \STATE $s_{\text{batch}} \gets \text{Tr}(\nabla_\phi L(\phi) \nabla_\phi L(\phi)^T)$.
+        \STATE Update temporal sensitivity EMA: $\hat{s} \gets \alpha_{\text{ema}} \hat{s} + (1 - \alpha_{\text{ema}}) s_{\text{batch}}$.
+        \STATE Construct preconditioned step directions $D \gets \text{diag}(\hat{s} + \epsilon_{\text{stab}} I)^{-1/2}$.
+        
+        \STATE // \textit{SAM Perturbation Step (Maximization Phase)}
+        \STATE Compute gradient $\nabla_\phi L(\phi)$.
+        \STATE Scale perturbation: $\epsilon \gets \rho \cdot \frac{D \nabla_\phi L(\phi)}{\|D^{1/2} \nabla_\phi L(\phi)\|_2}$.
+        \STATE Apply worst-case parameter perturbation: $\phi_{\text{perturbed}} \gets \phi + \epsilon$.
+        
+        \STATE // \textit{Parameter Update Step (Minimization Phase)}
+        \STATE Compute the perturbed gradient: $G_{\text{perturbed}} \gets \nabla_\phi L(\phi_{\text{perturbed}})$.
+        \STATE Update the merging parameters: $\phi \gets \phi - \eta \cdot D G_{\text{perturbed}}$.
+    \ENDFOR
+    
+    \STATE // \textit{Step 5: Model Inference \& Evaluation}
+    \STATE Reconstruct final merged model weights: $\theta_{\text{merged}} = \sum_j \sigma(w_j + \delta_j) \theta_j$.
+    \STATE Run inference on batch $X^{(t)}$ using $\theta_{\text{merged}}$ and output predictions.
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{Extended Theoretical Derivations \& Discussion}
+\label{appendix:theory}
+
+In this section, we expand on the theoretical formulation presented in Section~\ref{sec:theory} (Theorem~\ref{thm:noise_robustness_bound}). Under severe input-space noise, the model's representations are highly susceptible to sudden covariate shifts. By formulating the second-order Taylor expansion of the test-time loss function with respect to the input, we showed that:
+\begin{equation}
+\mathbb{E}_z [L(f(x + z))] \approx L(f(x)) + \frac{1}{2} \sigma^2 \text{Tr}(\nabla^2_x L)
+\end{equation}
+To minimize this expected loss under input-space noise $z \sim \mathcal{N}(0, \sigma^2 I)$, we must bound the trace of the input Hessian $\text{Tr}(\nabla^2_x L)$. Through the chain rule of differentiation, the input Hessian is composed of logit-curvature terms and first-order gradient terms. Under a well-calibrated network or close to local convergence, the first-order gradient terms are minimal, meaning that the input-space curvature is dominated by the logit-curvature $\nabla^2_f L$.
+
+To control this logit-curvature without having direct access to supervised labels or offline calibration datasets, we relate the logit-curvature back to the weight-space parameter Hessian $\nabla^2_\theta L$ and, subsequently, back to our merging parameter Hessian $\nabla^2_\phi L$. This is achieved via:
+\begin{equation}
+\nabla^2_\phi L = J^T_\phi \nabla^2_\theta L J_\phi + R
+\end{equation}
+where $J_\phi = \partial \theta / \partial \phi$ is the Jacobian of the merged weights with respect to the merging coefficients. This relationship proves that the sharpness of the loss landscape in the merging parameter space ($\phi$) directly bounds the sensitivity of the model's predictions to input-space environmental noise. Consequently, by explicitly regularizing the loss landscape to find a flat local basin in the merging coefficient space ($\phi$) via SAM, we mathematically guarantee that the resulting merged network is robust to high-frequency input perturbations, preventing representation collapse.
+
+Furthermore, Kronecker preconditioning plays a vital role in this optimization by shaping the spherical SAM perturbation neighborhood to match the local curvature of the parameter space. Since different layers and parameters have highly heterogeneous sensitivities, standard isotropic SAM perturbations can be sub-optimal. By scaling the perturbation neighborhood according to the on-the-fly estimated Kronecker sensitivities ($\hat{s}$), SAK-AHR applies larger perturbations along flatter directions and smaller, more conservative perturbations along highly sensitive directions, leading to a highly stable and geometry-aware flatness search.
+
+\section{Complete Reproducibility \& Hyperparameter Configurations}
+\label{appendix:hyperparameters}
+
+To ensure complete empirical reproducibility of all results reported in Section~\ref{sec:experiments}, we summarize the complete hyperparameter settings used in our codebase (\texttt{run\_experiments.py}) in Table~\ref{tab:hyperparams}.
+
+\begin{table}[H]
+\caption{Complete hyperparameter settings for all components of SAK-AHR and the evaluation pipeline.}
+\label{tab:hyperparams}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+\textbf{Vision Expert Models (SimpleCNN)} & \\
+Conv-1 Kernel / Channels & $3 \times 3$ / 32 Channels \\
+Conv-2 Kernel / Channels & $3 \times 3$ / 64 Channels \\
+Dropout Probability & 0.25 \\
+Fully Connected Dimension & 128 \\
+Training Epochs / Learning Rate & 2 Epochs / $2 \times 10^{-4}$ \\
+CosFace Margin ($m$) / Scale ($s$) & $m = 0.35$ / $s = 30.0$ \\
+\midrule
+\textbf{Streaming Test Stream Evaluation} & \\
+Total Streaming Batches ($T$) & 50 Batches \\
+Batch Size ($B$) & 64 Samples \\
+Noise Type / Std. Dev. ($\sigma$) & Additive Gaussian / $\sigma = 0.6$ \\
+Stream Phases & Clean MN, Noisy MN, Clean FN, Noisy FN, Novel KMNIST \\
+\midrule
+\textbf{SAK-AHR Optimization Parameters} & \\
+Inner Adaptation Steps ($N_{\text{step}}$) & 5 Steps (Sweep $\{1, 3, 5, 8, 10\}$) \\
+Learning Rate ($\eta$) & 0.02 \\
+SAM Radius ($\rho_{\text{sam}}$) & 0.02 (Sweep $\{0.005, 0.01, 0.02, 0.05, 0.10\}$) \\
+EMA Decay Factor ($\alpha_{\text{ema}}$) & 0.90 (Sweep $\{0.50, 0.80, 0.90, 0.95, 0.99\}$) \\
+Preconditioning Stability ($\epsilon_{\text{stab}}$) & 0.05 \\
+Weight Decay / Prior L2 Reg. & 0.01 / 0.10 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\end{document}

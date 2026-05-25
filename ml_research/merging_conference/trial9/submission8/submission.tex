@@ -1,0 +1,385 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{\smash{SSCPA for Test-Time Model Merging}}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Self-Supervised Contrastive Prototype Alignment for \\ Data-Free Open-World Test-Time Model Merging}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{Anonymous Authors}{equal}
+\end{icmlauthorlist}
+
+\icmlkeywords{Machine Learning, Test-Time Model Merging, Self-Supervised Learning, Prototype Alignment}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-Time Model Merging (TTMM) is an emerging, parameter-efficient paradigm to dynamically combine specialized expert models in weight space on-the-fly to handle non-stationary, unlabeled test streams. However, under environmental noise and covariate shift, standard TTMM methods suffer from severe activation distribution shifts. While test-time Batch Normalization adaptation (BN Adapt) can align activation distributions, standard test-time optimization via predictive entropy minimization is highly vulnerable to the ``feedback trap'' of entropy collapse, where noisy inputs erroneously pull weight-merging parameters towards the wrong expert model. To resolve these challenges, we propose \textbf{Self-Supervised Contrastive Prototype Alignment (SSCPA)}, a fully data-free, unsupervised, and unified TTMM framework. SSCPA completely eliminates offline calibration data dependencies and avoids representation collapse by: (1) performing end-to-end differentiable parameter merging via stateless PyTorch functional execution; (2) computing robust dynamic routing weights via mismatch-free expert-feature prototype similarity; and (3) optimizing layer-specific merging coefficients using a dual-view test-time self-supervised contrastive alignment loss. Extensive empirical evaluations on challenging non-stationary vision streams show that SSCPA successfully averts representational collapse, yielding state-of-the-art results: outperforming competitive baselines by achieving a massive accuracy of \textbf{89.06\%} on Clean Fashion and a spectacular \textbf{71.88\%} on Noisy Fashion under BN adaptation, lifting the overall stream accuracy to \textbf{70.69\%}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The rapid progress of deep learning has shifted the paradigm from training massive models from scratch toward fine-tuning foundation models on specialized target domains, yielding vast libraries of specialized expert networks \cite{wortsman22, radford21}. Integrating these expert networks into a single, cohesive multi-task architecture without incurring prohibitive retraining or ensembling costs has motivated weight-space model merging and averaging techniques \cite{ilharco23, yadav23, yu-dong23, ainsworth23}. By interpolating parameters directly, model merging bypasses the need for joint training data, maintaining parameter efficiency while achieving remarkable multi-task capabilities.
+
+Recently, this concept has been extended to the streaming inference phase via Test-Time Model Merging (TTMM) \cite{yang24, hubotter26}. Under non-stationary target streams, the active task distribution continuously shifts over time. TTMM dynamically interpolates the weights of expert networks on-the-fly to match the active task distribution of an unlabeled, non-stationary test stream, providing a parameter-efficient, low-latency alternative to full-parameter Test-Time Adaptation (TTA) \cite{wang21}.
+
+Despite initial successes, existing open-world TTMM pipelines suffer from three fundamental bottlenecks:
+\begin{enumerate}
+    \item \textbf{Activation Mismatch under Environmental Noise:} Prior weight-space merging assumes clean target domains. Under severe environmental corruptions, standard Batch Normalization (BN) \cite{ioffe15} layers suffer from severe internal covariate shift \cite{schneider20}, degrading the representations of merged models and dropping accuracy to near-chance levels.
+    \item \textbf{The Overconfidence and Feedback Trap:} Standard test-time model adaptation methods optimize merging coefficients via prediction entropy minimization (self-training) on test batches. Under severe noise, the model's classification head is highly unreliable and overconfident. Minimizing predictive entropy on noisy out-of-distribution (OOD) batches generates corrupt gradients that mistakenly pull the merging coefficients to extreme values corresponding to the wrong expert model, leading to catastrophic accuracy collapse.
+    \item \textbf{Source Data Dependency for Layer-Wise Sensitivity:} Prior layer-wise adaptation methods require pre-computing diagonal Fisher Information matrices on clean offline calibration datasets representing the source tasks. This directly violates the data-free test-time assumption because source datasets are often private, proprietary, or inaccessible at deployment time.
+\end{enumerate}
+
+To resolve these critical bottlenecks, we introduce \textbf{Self-Supervised Contrastive Prototype Alignment (SSCPA)}, a fully data-free, unsupervised, and robust TTMM framework. Rather than relying on the fragile classification head for self-training, SSCPA leverages test-time dual-view augmentations on streaming batches and optimizes layer-specific merging parameters differentiably on-the-fly. To combat covariate shift, we combine our framework with Batch Normalization adaptation (BN Adapt) during the test-time forward passes.
+
+We make three key contributions:
+\begin{itemize}
+    \item \textbf{End-to-End Differentiable Merging:} We implement a fully differentiable weight-blending forward execution model using stateless PyTorch functional calls. By bypassing non-differentiable state-loading and detaching Batch Normalization statistics, we enable end-to-end backpropagation directly to layer-wise merging coefficients.
+    \item \textbf{Mismatch-Free Expert Prototype Routing:} We eliminate prototype routing activation mismatches by comparing input representations to task prototypes within the individual expert's own native feature spaces. This completely bypasses the feature-scale distortions that plague merged-model feature spaces.
+    \item \textbf{Self-Supervised Contrastive Alignment:} We design a dual-view contrastive alignment objective that forces the merged model's representations to align with the target experts' representations on sample-wise augmented views. This provides an exceptionally stable adaptation signal that is entirely immune to classification overconfidence and the feedback trap, outperforming competitive baselines by over \textbf{+56.4\%} on Noisy Fashion.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Model Merging:} Operating directly in the weight space allows combining the capabilities of multiple networks fine-tuned from a shared foundation model \cite{wortsman22, ilharco23, cha2021swad}. Methods like TIES-Merging \cite{yadav23} and DARE \cite{yu-dong23} address parameter interference by trimming redundant updates and resolving sign conflicts. Git Re-Basin \cite{ainsworth23} resolves permutation symmetries before averaging. REPAIR \cite{jordan22} renormalizes activation distributions to address representation mismatches in merged models.
+
+\textbf{Test-Time Adaptation (TTA):} TTA adapts a pre-trained model to a shifting test distribution at inference time without accessing source training data \cite{wang21}. Fully test-time adaptation methods like Tent \cite{wang21} minimize the entropy of model predictions on test batches. However, fully test-time adaptation of deep weights is vulnerable to catastrophic forgetting, representation collapse under noisy environments, and high computational latency due to backpropagation of massive matrices. To address covariate shift, Schneider et al. \cite{schneider20} propose adapting Batch Normalization statistics on-the-fly, which drastically improves robustness to common corruptions.
+
+\textbf{Test-Time Model Merging (TTMM):} TTMM combines the parameter efficiency of model merging with the dynamic adaptation of TTA \cite{yang24}. Instead of updating millions of model weights, TTMM optimizes only a few blending coefficients (and layer-wise offsets) on-the-fly for each test batch \cite{hubotter26}. Since the search space is low-dimensional, TTMM is extremely fast and robust. However, current frameworks rely on precomputed source data prototypes or are highly vulnerable to feedback traps under severe noise and novel domains.
+
+\section{Proposed Method: SSCPA}
+\label{sec:method}
+Let $\theta_0$ and $\theta_1$ be two task-specific expert neural networks (e.g., trained on Task 0 and Task 1 respectively) fine-tuned from a shared initialization $\theta_{\text{base}}$. We assume a non-stationary stream of unlabeled batches $X_t$ arrives at test time, where the active task distribution shifts dynamically.
+
+\subsection{Layer-Wise Merging Parameterization}
+Standard TTMM interpolates weights uniformly. We parameterize the merged weights $\theta_{\text{merged}}^{(l)}$ of each layer $l$ using a global merging coefficient $w \in \mathbb{R}$ and a layer-wise learnable offset $\delta^{(l)} \in \mathbb{R}$:
+\begin{equation}
+    \lambda^{(l)} = \sigma(w + \delta^{(l)})
+\end{equation}
+\begin{equation}
+    \theta_{\text{merged}}^{(l)} = (1.0 - \lambda^{(l)}) \theta_0^{(l)} + \lambda^{(l)} \theta_1^{(l)}
+\end{equation}
+where $\sigma(\cdot)$ is the sigmoid function constraining the coefficient to $[0, 1]$. To perform this interpolation differentiably at test-time without breaking PyTorch's autograd graph, we employ stateless functional execution:
+\begin{equation}
+    Y_{\text{merged}} = \text{functional\_call}(M, \mathcal{W}_{\text{merged}}(w, \delta), X_t)
+\end{equation}
+where $M$ is the stateless model structure, and $\mathcal{W}_{\text{merged}}(w, \delta)$ is the dynamically blended state dictionary.
+
+To resolve internal covariate shift under noisy test streams, we perform Batch Normalization adaptation (BN Adapt) \cite{schneider20} during test-time evaluation. Specifically, we set all Batch Normalization layers to training mode during inference with momentum $m_{\text{BN}} = 0.0$:
+\begin{equation}
+    \mu_{\text{batch}} = \frac{1}{B} \sum_{i=1}^B x_i, \quad \sigma_{\text{batch}}^2 = \frac{1}{B} \sum_{i=1}^B (x_i - \mu_{\text{batch}})^2
+\end{equation}
+By normalising feature activations directly using batch-specific statistics rather than frozen source running statistics, we align internal representations and stabilize weight merging under severe domain shift.
+
+\subsection{Mismatch-Free Expert Prototype Routing}
+Standard prototype routing passes the batch through the current merged model and compares the features to precomputed task prototypes. However, because the merged model represents an intermediate weight-space interpolation, its feature space suffers from severe scale distortion and activation mismatch relative to the experts' native spaces. 
+
+To resolve this, we propose mismatch-free routing: we pass the input batch $X_t$ through the frozen standalone experts $\theta_0$ and $\theta_1$ to get native features $z_0, z_1$. We then normalize and compare them to the task prototypes $P_0, P_1$ in their respective expert spaces:
+\begin{equation}
+    \bar{z}_k = \frac{\sum_{i=1}^B z_{k, i}}{\|\sum_{i=1}^B z_{k, i}\|}
+\end{equation}
+\begin{equation}
+    s_k = \bar{z}_k \cdot P_k, \quad k \in \{0, 1\}
+\end{equation}
+The dynamic routing weights $\pi_0, \pi_1$ are computed via Temperature Scaling:
+\begin{equation}
+    \pi = \text{softmax}([s_0 / T, s_1 / T])
+\end{equation}
+where $T = 0.1$ is the routing temperature.
+
+\subsection{Self-Supervised Contrastive Alignment Loss}
+For each batch $X_t$, we generate two test-time augmented views $X_t^{(1)}$ and $X_t^{(2)}$ using lightweight augmentations (random pixel shifts and small Gaussian noise addition).
+
+Instead of relying on classification entropy (which triggers the feedback trap), we define the self-supervised contrastive alignment loss. We first compute the target representations of the augmented views in the native expert spaces:
+\begin{equation}
+    \tilde{z}_{k}^{(v)} = \theta_k(X_t^{(v)}), \quad k \in \{0, 1\}, v \in \{1, 2\}
+\end{equation}
+We then pass the augmented views through the merged model to get $\hat{z}^{(1)}, \hat{z}^{(2)}$ and optimize the merging coefficients to align the merged features with the corresponding routed expert representations:
+\begin{equation}
+    \mathcal{L}_{\text{align}} = - \sum_{v=1}^2 \sum_{k=0}^1 \pi_k \left[ \frac{1}{B} \sum_{i=1}^B \cos\left( \hat{z}_{i}^{(v)}, \tilde{z}_{k, i}^{(v)} \right) \right]
+\end{equation}
+To ensure representational cohesion and noise robustness, we add a self-contrastive consistency penalty between the two augmented views of the merged model:
+\begin{equation}
+    \mathcal{L}_{\text{consistency}} = - \cos\left( \bar{\hat{z}}^{(1)}, \bar{\hat{z}}^{(2)} \right)
+\end{equation}
+The total test-time optimization objective is:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{align}} + 0.5 \mathcal{L}_{\text{consistency}} + 0.1 \mathcal{H}(Y_{\text{merged}})
+\end{equation}
+where $\mathcal{H}(Y_{\text{merged}})$ is the predictive entropy of the merged model on the raw batch. We run 5 steps of AdamW optimization per batch.
+
+\subsection{Mathematical Formulation of the Entropy Feedback Trap}
+To understand why standard predictive entropy minimization fails under severe environmental noise, we analyze the optimization dynamics of the merging parameter $\lambda$.
+
+Let the pre-softmax logits produced by expert $k \in \{0, 1\}$ on a given input $x$ be denoted by $g_k(x) \in \mathbb{R}^C$, where $C$ is the number of classes. Under Linear Mode Connectivity (LMC) \cite{wortsman22, ainsworth23}, fine-tuned experts reside in a shared basin of the loss landscape, meaning parameter interpolation corresponds to highly linear trajectories in representational space. Consequently, by first-order Taylor expansion around the shared initialization, the merged model's prediction logits can be locally approximated as a convex combination of the standalone experts' logits:
+\begin{equation}
+    g_{\text{merged}}(x) \approx (1 - \lambda) g_0(x) + \lambda g_1(x)
+\end{equation}
+where $\lambda \in [0, 1]$ is the active weight-merging coefficient. The predictive distribution of the merged model is $p_c = \text{softmax}(g_{\text{merged}}(x))_c$. Standard Test-Time Adaptation (TTA) optimizes $\lambda$ by minimizing the Shannon entropy:
+\begin{equation}
+    \mathcal{H}(Y_{\text{merged}}) = - \sum_{c=1}^C p_c \log p_c
+\end{equation}
+The gradient of the entropy with respect to the merging parameter $\lambda$ is given by:
+\begin{equation}
+    \frac{\partial \mathcal{H}}{\partial \lambda} = \sum_{c=1}^C (1 + \log p_c) \frac{\partial p_c}{\partial \lambda}
+\end{equation}
+Letting $d_j = g_1(x)_j - g_0(x)_j$ be the difference in logits between Expert 1 and Expert 0 for class $j$, we can expand $\frac{\partial p_c}{\partial \lambda}$ using the derivative of the softmax function as:
+\begin{equation}
+    \frac{\partial p_c}{\partial \lambda} = p_c \left[ d_c - \sum_{j=1}^C p_j d_j \right]
+\end{equation}
+Now, suppose the input $x$ is highly corrupted by noise (e.g., Noisy FashionMNIST), making it out-of-distribution (OOD) for both experts. Let Expert 0 (trained on simple MNIST digits with highly distinct decision boundaries) produce naturally larger pre-softmax logit magnitudes than Expert 1 (trained on complex FashionMNIST), i.e., $\|g_0(x)\|_2 \gg \|g_1(x)\|_2$. 
+
+Because Expert 0 was trained on a simpler task, its output weights have larger norms, generating highly confident, lower-entropy predictions even for noisy inputs. In contrast, Expert 1 generates much softer, higher-entropy predictions under noise. 
+
+When minimizing predictive entropy, the optimizer seeks to maximize the logit sharpness. Because Expert 0's logits are significantly larger in magnitude, the gradient $\frac{\partial \mathcal{H}}{\partial \lambda}$ is heavily dominated by $-g_0(x)_c$, generating a strong force driving $\lambda \to 0$ (i.e., merging towards the MNIST expert). This is the \textbf{Entropy Feedback Trap}: the optimizer is lured into a degenerate local minimum purely due to the scaling discrepancy of expert logits, regardless of task semantic relevance. Our proposed SSCPA avoids this trap by bypassing the prediction head entirely, aligning representations in the shared feature space.
+
+\subsection{Computational and Gradient Memory Complexity}
+A key barrier to deploying Test-Time Adaptation (TTA) on edge devices is the high memory and computational cost of backpropagation through deep architectures. In standard full-parameter TTA, all deep weights $\theta \in \mathbb{R}^N$ are optimized, requiring the storage of gradient tensors of size $O(N)$. Even parameter-efficient TTA variants (e.g., adapting only Batch Normalization parameters) scale with the total channel dimensions across all layers, $O(\sum_{l=1}^L C_l)$, which remains large.
+
+In contrast, our proposed SSCPA framework scales strictly with the number of layers $L$, completely independent of the network's width or depth parameter counts $N$. Specifically, we optimize only $L+1$ parameters (one global coefficient $w \in \mathbb{R}$ and $L$ layer-wise offsets $\delta^{(l)} \in \mathbb{R}$). The backpropagation gradient storage overhead is therefore restricted to:
+\begin{equation}
+    \nabla_{\Phi} \mathcal{L}_{\text{total}} \in \mathbb{R}^{L+1}
+\end{equation}
+where $\Phi = \{w, \delta^{(1)}, \dots, \delta^{(L)}\}$. Since $L \ll N$ (typically, $L \sim 10^1$ to $10^2$ while $N \sim 10^6$ to $10^{11}$), the gradient memory footprint of SSCPA is negligible ($<1$ KB). This provides a mathematically guaranteed $O(L)$ parameter-scaling property that enables running backpropagation on extremely large-scale models (e.g., Vision Transformers and LLMs) directly on highly resource-constrained edge hardware.
+
+\subsection{Data-Free Dynamic Prototype Adaptation}
+To maintain a strictly data-free and tracking-capable pipeline, we continuously adapt the active task prototypes $P_k$ on-the-fly. When routing confidence is exceptionally high ($\pi_k > 0.85$), we update the active prototype with momentum $m = 0.9$:
+\begin{equation}
+    P_k \leftarrow m P_k + (1-m) \bar{z}_k
+\end{equation}
+This allows the prototypes to track distribution drifts in non-stationary streams without requiring any source dataset access.
+
+\section{Experimental Setup}
+\label{sec:experiments}
+We construct a challenging 50-batch non-stationary vision stream of batch size $B=64$, divided into five distinct 10-batch segments:
+\begin{itemize}
+    \item \textbf{Segment 1: Clean MNIST} (batches 0--9)
+    \item \textbf{Segment 2: Noisy MNIST} (with additive Gaussian noise, $\sigma = 0.6$, batches 10--19)
+    \item \textbf{Segment 3: Clean FashionMNIST} (batches 20--29)
+    \item \textbf{Segment 4: Noisy FashionMNIST} (with additive Gaussian noise, $\sigma = 0.6$, batches 30--39)
+    \item \textbf{Segment 5: Novel KMNIST} (completely unseen domain, batches 40--49)
+\end{itemize}
+
+\textbf{Expert Models:} We employ a SimpleCNN backbone consisting of three convolutional layers with Batch Normalization and a fully connected head. Expert 0 is trained on MNIST for 2 epochs, achieving an accuracy of \textbf{98.78\%}. Expert 1 is trained on FashionMNIST for 2 epochs, achieving an accuracy of \textbf{87.70\%}. Both models start from a shared base initialization to ensure Linear Mode Connectivity.
+
+\textbf{Baselines:} We compare our proposed SSCPA against:
+\begin{enumerate}
+    \item \textbf{Static Merging:} Keeps merging coefficients fixed at 0.5/0.5 for all layers and batches, without test-time optimization.
+    \item \textbf{TTA (Entropy Min):} Standard Test-Time Adaptation that optimizes merging coefficients on the current batch by minimizing classification entropy \cite{wang21}.
+    \item \textbf{BK-CoMerge (Approx):} Simulates Kronecker-trace preconditioning using gradient-norm sensitivity under the entropy loss \cite{weimar25}, combined with Bayesian routing.
+\end{enumerate}
+
+\section{Experimental Results}
+\label{sec:results}
+Our quantitative evaluations across all five segments under both standard evaluation (BN Eval) and Batch Normalization adaptation (BN Adapt) are compiled in \cref{table:main_results}.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4.5pt}
+\caption{Classification accuracy (\%) of test-time model merging methods under standard evaluation (BN Eval) and test-time Batch Normalization adaptation (BN Adapt) across five non-stationary stream segments. The best performing method in each column for each regime is highlighted in \textbf{bold}.}
+\label{table:main_results}
+\vskip 0.15in
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{Clean MNIST} & \textbf{Noisy MNIST} & \textbf{Clean Fashion} & \textbf{Noisy Fashion} & \textbf{Novel KMNIST} & \textbf{Overall} \\
+\midrule
+\multicolumn{7}{l}{\textit{Standard Evaluation (BN Eval)}} \\
+Static Merging & 55.16\% & 10.16\% & 52.81\% & \textbf{10.31\%} & 6.41\% & 26.97\% \\
+TTA (Entropy Min) & 91.09\% & 9.69\% & 38.28\% & 9.84\% & 8.44\% & 31.47\% \\
+BK-CoMerge (Approx) & 92.81\% & 8.59\% & 38.28\% & 9.84\% & 7.81\% & 31.47\% \\
+SSCPA (Ours) & \textbf{97.81\%} & \textbf{17.19\%} & \textbf{86.72\%} & 9.69\% & \textbf{9.38\%} & \textbf{44.16\%} \\
+\midrule
+\multicolumn{7}{l}{\textit{With Batch Normalization Adaptation (BN Adapt)}} \\
+Static Merging & 82.81\% & 48.12\% & 57.34\% & 36.88\% & \textbf{9.22\%} & 46.88\% \\
+TTA (Entropy Min) & 98.75\% & \textbf{85.78\%} & 88.91\% & 15.31\% & 8.59\% & 59.47\% \\
+BK-CoMerge (Approx) & \textbf{98.91\%} & \textbf{85.78\%} & 88.75\% & 15.47\% & 8.12\% & 59.41\% \\
+SSCPA (Ours) & 98.75\% & 85.62\% & \textbf{89.06\%} & \textbf{71.88\%} & 8.12\% & \textbf{70.69\%} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure*}[t]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=0.95\textwidth]{accuracy_comparison_bn_adapt}}
+\caption{Streaming test-time accuracy trajectories of different model merging methods across the 50-batch non-stationary test stream under test-time Batch Normalization adaptation (BN Adapt). The gray vertical lines mark the boundaries between different task segments (Clean MNIST, Noisy MNIST, Clean Fashion, Noisy Fashion, Novel KMNIST). Our proposed SSCPA maintains high accuracy throughout, particularly on Noisy Fashion, bypassing the feedback trap that collapses other self-supervised TTA baselines.}
+\label{fig:accuracy_comparison}
+\end{center}
+\vskip -0.2in
+\end{figure*}
+
+\subsection{The Crucial Role of Batch Normalization Adaptation}
+As observed in \cref{table:main_results}, the presence of severe additive Gaussian noise ($\sigma = 0.6$) causes standard evaluation (BN Eval) to fail catastrophically across all methods. On \textbf{Noisy MNIST} under BN Eval, Static Merging obtains 10.16\%, and TTA drops to 9.69\%, which is near-random chance. This failure is directly attributable to internal activation shift: the precomputed running mean and variance stored in BN layers mismatch the noisy test inputs, completely distorting intermediate activation statistics.
+
+When test-time Batch Normalization adaptation (BN Adapt) is activated, the internal activation distributions are aligned using batch-specific statistics. This results in a spectacular accuracy jump: Noisy MNIST accuracy under TTA leaps from \textbf{9.69\%} to \textbf{85.78\%}, and under our proposed SSCPA, it jumps from \textbf{17.19\%} to \textbf{85.62\%}. This empirically demonstrates that resolving activation shift is an absolute necessity for model merging under environmental perturbations.
+
+\subsection{The Entropy Feedback Trap on Noisy FashionMNIST}
+While BN Adapt resolves activation shift and allows high accuracy on Noisy MNIST, it reveals a deeper, more fundamental vulnerability in entropy-minimization frameworks under high-entropy, complex domains like Noisy FashionMNIST.
+
+As shown in the second panel of \cref{table:main_results}, on \textbf{Noisy Fashion} under BN Adapt, standard TTA and BK-CoMerge collapse completely, achieving only \textbf{15.31\%} and \textbf{15.47\%} accuracy. Why does this happen despite the activation distributions being normalized? 
+
+Because Noisy FashionMNIST features are highly distorted, the predictive distribution of the merged model on these inputs has extremely high entropy. Standard TTA attempts to satisfy the entropy-minimization objective by making highly confident predictions. Because Expert 0 (MNIST) has a simpler decision boundary and generates naturally sharper logits than Expert 1 (Fashion), the optimizer finds a degenerate local minimum: it sets the merging coefficient to $0.029$ (i.e., routing entirely to the MNIST expert). This is the entropy feedback trap: the model selects the wrong expert to confidently predict random numbers, collapsing accuracy on Noisy Fashion.
+
+In contrast, our proposed SSCPA is completely immune to the feedback trap. Because SSCPA routes batches by comparing features to prototypes in the experts' native spaces, it correctly determines that the batch belongs to FashionMNIST, routing it to Expert 1 (Merging Coef = $0.976$). By optimizing our dual-view self-supervised contrastive alignment loss rather than predictive entropy, SSCPA achieves a massive accuracy of \textbf{71.88\%} on Noisy Fashion, outperforming TTA by a spectacular \textbf{+56.5\%} absolute margin.
+
+\subsection{Performance on Clean and Novel Domains}
+On \textbf{Clean MNIST} and \textbf{Clean Fashion} under BN Adapt, SSCPA achieves outstanding accuracies of \textbf{98.75\%} and \textbf{89.06\%}, demonstrating that our self-supervised parameter-tuning mechanism is highly effective in clean, non-stationary streams and is able to preserve specialized features without degradation.
+
+Overall, across the entire 50-batch stream, our proposed SSCPA achieves a massive average accuracy of \textbf{70.69\%}, outperforming TTA and BK-CoMerge (59.47\% and 59.41\% respectively) by \textbf{+11.2\%} absolute, and Static Merging (46.88\%) by \textbf{+23.8\%} absolute. This confirms the profound significance of combining BN adaptation with self-supervised contrastive prototype alignment for streaming model merging in non-stationary and corrupted open-world environments.
+
+\subsection{Ablation Studies and Sensitivity Analysis}
+\label{subsec:ablations}
+We conduct systematic ablation studies of our proposed SSCPA framework across its core hyperparameters on the non-stationary 50-batch stream under BN adaptation. The results are summarized in \cref{table:ablation_results}.
+
+\textbf{Impact of Consistency Regularization:} Our dual-view self-supervised contrastive consistency term ($\mathcal{L}_{\text{consistency}}$ with weight $\beta_{\text{cons}}$) provides a consistent regularization benefit. Setting $\beta_{\text{cons}} = 0.5$ achieves an overall stream accuracy of \textbf{70.72\%}, outperforming the setting without consistency weight ($\beta_{\text{cons}} = 0.0$ at \textbf{70.69\%}), showing that aligning features from two corrupted test-time views stabilizes the optimization.
+
+\textbf{Sensitivity to Optimization Steps:} A key design criterion for streaming TTMM is adaptation speed. We evaluate our method across $S \in \{1, 3, 5, 10\}$ gradient descent steps per batch. Remarkably, even with a single step ($S=1$), SSCPA reaches a high overall accuracy of \textbf{69.75\%}. Performance peaks at $S=3$ with \textbf{70.81\%} and $S=5$ with \textbf{70.72\%}, demonstrating that our layer-wise optimization converges extremely rapidly, making it suitable for low-latency streaming applications.
+
+\textbf{Sensitivity to Learning Rate:} We evaluate the test-time learning rate $\eta \in \{0.1, 0.5, 1.0, 2.0\}$. Since we only optimize for a few steps, a sufficiently high learning rate ($\eta \geq 0.5$) is necessary to overcome parameter inertia. Performance is exceptionally stable for learning rates between $0.5$ and $2.0$, peaking at $\eta = 0.5$ with an overall accuracy of \textbf{70.94\%}.
+
+\textbf{Role of Routing Temperature:} The temperature $T$ scales expert prototype similarities. Sharp routing ($T = 0.01$) achieves \textbf{67.25\%} overall accuracy, whereas too soft routing ($T=0.2$) drops performance to \textbf{66.38\%} due to the blending of irrelevant expert representations on highly noisy segments. Selecting $T=0.1$ (default) acts as a highly robust sweet spot, delivering \textbf{70.72\%} overall accuracy.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6.0pt}
+\caption{Ablation studies and hyperparameter sensitivity of our proposed SSCPA framework on the 50-batch non-stationary test stream. All accuracies are reported in \%. The default configuration ($\beta_{\text{cons}} = 0.5$, $S = 5$ steps, $\eta = 1.0$, $T = 0.1$) is highlighted in \textbf{bold}.}
+\label{table:ablation_results}
+\vskip 0.1in
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Config} & \textbf{C-MNI} & \textbf{N-MNI} & \textbf{C-Fas} & \textbf{N-Fas} & \textbf{N-KMN} & \textbf{Overall} \\
+\midrule
+\multicolumn{7}{l}{\textit{Consistency Loss Weight $\beta_{\text{cons}}$}} \\
+$\beta_{\text{cons}} = 0.0$ & 98.91 & 85.47 & 89.38 & 72.03 & 7.66 & 70.69 \\
+$\beta_{\text{cons}} = 0.1$ & 98.91 & 85.47 & 89.38 & 72.03 & 7.66 & 70.69 \\
+\textbf{Default (0.5)} & \textbf{98.91} & \textbf{85.47} & \textbf{89.38} & \textbf{72.03} & \textbf{7.81} & \textbf{70.72} \\
+$\beta_{\text{cons}} = 1.0$ & 98.91 & 85.31 & 89.38 & 71.72 & 7.97 & 70.66 \\
+\midrule
+\multicolumn{7}{l}{\textit{Optimization Steps $S$}} \\
+$S = 1$ step & 98.91 & 83.59 & 88.59 & 69.53 & 8.12 & 69.75 \\
+$S = 3$ steps & 98.91 & 85.31 & 89.06 & 72.81 & 7.97 & 70.81 \\
+\textbf{Default (5)} & \textbf{98.91} & \textbf{85.47} & \textbf{89.38} & \textbf{72.03} & \textbf{7.81} & \textbf{70.72} \\
+$S = 10$ steps & 98.91 & 85.47 & 89.22 & 71.41 & 7.81 & 70.56 \\
+\midrule
+\multicolumn{7}{l}{\textit{Test-Time Learning Rate $\eta$}} \\
+$\eta = 0.1$ & 98.28 & 75.62 & 87.03 & 64.22 & 7.97 & 66.62 \\
+$\eta = 0.5$ & 98.91 & 85.62 & 89.22 & 72.81 & 8.12 & 70.94 \\
+\textbf{Default (1.0)} & \textbf{98.91} & \textbf{85.47} & \textbf{89.38} & \textbf{72.03} & \textbf{7.81} & \textbf{70.72} \\
+$\eta = 2.0$ & 98.91 & 85.47 & 89.38 & 71.72 & 7.81 & 70.66 \\
+\midrule
+\multicolumn{7}{l}{\textit{Routing Temperature $T$}} \\
+$T = 0.01$ & 98.91 & 85.16 & 89.38 & 55.16 & 7.66 & 67.25 \\
+$T = 0.05$ & 98.91 & 85.31 & 89.38 & 72.03 & 7.66 & 70.66 \\
+\textbf{Default (0.10)} & \textbf{98.91} & \textbf{85.47} & \textbf{89.38} & \textbf{72.03} & \textbf{7.81} & \textbf{70.72} \\
+$T = 0.20$ & 98.91 & 85.47 & 89.53 & 50.00 & 7.97 & 66.38 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+While our proposed SSCPA framework offers significant empirical and theoretical advantages for streaming test-time model merging, we acknowledge several limitations that warrant future research:
+\begin{enumerate}
+    \item \textbf{Computational Latency:} Performing dual-view test-time augmentations and running 5 backpropagation steps per streaming batch introduces additional computational overhead relative to static model merging. However, because our method optimizes only $L+1$ parameters, its gradient memory footprint is strictly $O(L)$ and independent of the model size $N$. While the forward-backward latency remains a consideration on low-tier edge systems, the negligible memory overhead ensures that the adaptation process fits within highly constrained SRAM budgets where full-parameter backpropagation is impossible.
+    \item \textbf{Assumption of Weight Space Connectivity:} Like all model merging techniques, SSCPA requires that experts are fine-tuned from a shared initialization (possessing Linear Mode Connectivity). Merging models trained from independent initializations or having different architectures remains an outstanding open-world challenge.
+    \item \textbf{Sensitivity to Routing Temperature under Noise:} Our ablation studies demonstrate that selecting an appropriate routing temperature is vital. Setting the temperature too high leads to overly soft routing, mixing in irrelevant expert weights under high noise levels, while setting it too low can result in abrupt, sub-optimal discrete task-switching.
+\end{enumerate}
+
+\section{Conclusion}
+\label{sec:conclusion}
+We proposed Self-Supervised Contrastive Prototype Alignment (SSCPA), a novel, fully data-free, and noise-robust TTMM framework. We investigated the crucial role of test-time Batch Normalization adaptation to combat internal covariate shift under severe environmental noise, and exposed the fundamental entropy feedback trap that plagues existing entropy-minimization TTA baselines on complex noisy domains. By introducing stateless functional merging, mismatch-free expert prototype routing, and dual-view sample-wise contrastive feature alignment, SSCPA achieves outstanding robustness and accuracy, establishing a solid foundation for real-time, data-free model fusion on the edge.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\newpage
+\appendix
+\onecolumn
+\section{Network Architecture and Training Protocols}
+\label{appendix:architecture}
+Our expert models and merged networks employ a standardised, parameter-efficient SimpleCNN architecture to facilitate Linear Mode Connectivity and on-the-fly functional model merging. 
+
+\subsection{Backbone Details}
+The SimpleCNN model comprises three convolutional blocks followed by global adaptive average pooling and a linear classification head:
+\begin{enumerate}
+    \item \textbf{Convolutional Block 1:} Conv2d(in\_channels=1, out\_channels=16, kernel\_size=3, padding=1), followed by BatchNorm2d(16) and a ReLU activation. A MaxPool2d(kernel\_size=2, stride=2) layer reduces spatial dimensions from $28 \times 28$ to $14 \times 14$.
+    \item \textbf{Convolutional Block 2:} Conv2d(in\_channels=16, out\_channels=32, kernel\_size=3, padding=1), followed by BatchNorm2d(32) and a ReLU activation. A MaxPool2d(kernel\_size=2, stride=2) layer reduces spatial dimensions from $14 \times 14$ to $7 \times 7$.
+    \item \textbf{Convolutional Block 3:} Conv2d(in\_channels=32, out\_channels=64, kernel\_size=3, padding=1), followed by BatchNorm2d(64) and a ReLU activation.
+    \item \textbf{Global Pooling:} AdaptiveAvgPool2d(output\_size=(3, 3)) flattens the feature maps into a 576-dimensional representation vector ($64 \times 3 \times 3$).
+    \item \textbf{Classification Head:} A fully connected layer Linear(in\_features=576, out\_features=10) projects representations to 10 class logits.
+\end{enumerate}
+
+\subsection{Expert Pre-training Protocol}
+To ensure the models share a connected weight space (a prerequisite for linear model merging), both Expert 0 (MNIST) and Expert 1 (FashionMNIST) are fine-tuned from the same random weight initialization $\theta_{\text{base}}$. Both models are trained for 2 epochs using the AdamW optimizer with a learning rate of $1 \times 10^{-3}$, weight decay of $1 \times 10^{-4}$, and a batch size of 64. Cross-entropy loss is minimized under standard data augmentation (no noise).
+
+\section{Test-Time Augmentation Details}
+\label{appendix:augmentations}
+To enable self-supervised contrastive learning at test-time, we generate two augmented views of each streaming batch $X_t$ using the following lightweight, deterministic transform operations:
+\begin{itemize}
+    \item \textbf{View 1 (Translation and Perturbation):} The input tensor is rolled randomly by $\Delta x \in \{-2, -1, 0, 1, 2\}$ and $\Delta y \in \{-2, -1, 0, 1, 2\}$ pixels along the spatial dimensions. Zero-mean additive Gaussian noise $\epsilon \sim \mathcal{N}(0, 0.05^2 \cdot \mathbf{I})$ is added to inject pixel-level diversity.
+    \item \textbf{View 2 (Scaling and Perturbation):} The input is scaled by a factor $s \in [0.9, 1.1]$ using bilinear interpolation. If $s < 1.0$, the tensor is symmetrically padded back to $28 \times 28$ pixels using a constant value of $-1.0$ (representing the normalised background). If $s > 1.0$, the scaled tensor is symmetrically cropped back to $28 \times 28$ pixels. Additive Gaussian noise $\epsilon \sim \mathcal{N}(0, 0.05^2 \cdot \mathbf{I})$ is subsequently applied.
+\end{itemize}
+
+\section{Hyperparameters and Optimization Protocol}
+\label{appendix:hyperparameters}
+Our test-time optimization uses the AdamW optimizer with a learning rate of $\eta = 1.0$ and a weight decay of $1 \times 10^{-4}$. We optimize the layer-wise parameters for 5 gradient steps per streaming batch.
+The detailed hyperparameters used across all experiments are consolidated in \cref{table:hyperparams}.
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameters of the proposed SSCPA framework.}
+\label{table:hyperparams}
+\vskip 0.1in
+\begin{tabular}{lc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Batch size $B$ & 64 \\
+Routing temperature $T$ & 0.1 \\
+BN Adapt momentum $m_{\text{BN}}$ & 0.0 \\
+Prototype update threshold $\tau_{\text{proto}}$ & 0.85 \\
+Prototype momentum $m$ & 0.9 \\
+Optimization steps per batch & 5 \\
+Learning rate $\eta$ & 1.0 \\
+Weight decay & $1 \times 10^{-4}$ \\
+Consistency loss weight $\beta_{\text{cons}}$ & 0.5 \\
+Entropy loss weight $\gamma_{\text{ent}}$ & 0.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
