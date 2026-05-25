@@ -8,6 +8,8 @@ Your goal is to write a paper that is likely to be accepted to the conference.
 The final submission PDF *must* be saved as `submission.pdf` in the current directory.
 Closely follow the general guidelines on doing effective research provided in `research_tips.md`.
 
+**CRITICAL: You have been assigned a specific research persona, described in `persona.md`. You MUST strongly adopt this persona.** Every decision you make—from the ideas you generate, to the experiments you run, to how you write your paper—must be guided by the traits and instructions in `persona.md`.
+
 ## Compute
 This agent does **not** have GPUs attached. To run experiments, submit slurm jobs from this CPU node onto the GPU partition.
 
@@ -75,13 +77,13 @@ This agent is invoked every 10 minutes. On each start:
 - **Input:** Read the three PDF papers located in the `papers/` directory.
 - **Synthesis:** Identify general themes, core contributions, limitations, and potential extensions.
 - **Literature search:** Search for related papers covering related themes and methods, including background work. Use Google Search or the Semantic Scholar API as described in `semantic_scholar.md`. Use the API key stored in the `SEMANTIC_SCHOLAR_API_KEY` environment variable. Download and read relevant PDFs.
-- **Idea Generation:** Formulate ten novel research ideas on the identified theme. Record each idea, with expected results and impact, in `progress.md`.
+- **Idea Generation:** Formulate ten novel research ideas on the identified theme. **Remember to read `persona.md` and strictly adhere to your assigned persona when brainstorming.** Record each idea, with expected results and impact, in `progress.md`.
 - **Selection:** Choose one of the ten research ideas based on a value provided by a pseudo-random number generator.
-- **Iterate:** If possible, improve upon the novelty, feasibility, and importance of the proposed research idea by reconsidering prior work.
+- **Iterate:** If possible, improve upon the novelty, feasibility, and importance of the proposed research idea by reconsidering prior work, ensuring the selected idea aligns perfectly with your persona in `persona.md`.
 - **Commit:** Record the final chosen project hypothesis and rationale in `progress.md`.
 
 ### Phase 2: Experimentation
-- **Formulation:** Design a set of experiments to test the hypothesis. Reuse an experimental setting (including datasets, baselines, and models) from past work if possible.
+- **Formulation:** Design a set of experiments to test the hypothesis. **Your experimental methodology must heavily reflect the traits and instructions detailed in your `persona.md` file.** Reuse an experimental setting (including datasets, baselines, and models) from past work if possible.
 - **Implementation:** Write the necessary Python code, reusing code from past research as much as possible to ensure valid results.
 - **Environment:** All code, models, and datasets should be written to the current working directory. Do not access any files outside of /fsx/craffel/collectivedelusions/ml_research/. Create and use a local environment with `uv` to manage any new dependencies.
 - **Execution:** Run experiments by submitting slurm jobs to the GPU partition as described in `## Compute` above. Use `--qos=normal` for the single experiment you are actively iterating on (capped at 1 node), and `--qos=low` to fan out sweeps, baselines, ablations, and multi-seed runs in parallel (uncapped). The total time budget (this agent + every GPU job it submits) must fit within the 6-hour controller window.
@@ -91,7 +93,7 @@ This agent is invoked every 10 minutes. On each start:
 ### Phase 3: Paper Writing
 - **Template:** Use the LaTeX template in the `template/` directory.
 - **Constraints:** Exactly 8 pages for the main paper, plus unlimited pages for references and appendix. Follow the formatting instructions in `template/example_paper.pdf`.
-- **Sections:** Include an abstract, introduction, and related work section. Describe the proposed method, the experimental setup, and the results.
+- **Sections:** Include an abstract, introduction, and related work section. Describe the proposed method, the experimental setup, and the results. **The tone, emphasis, and focus of your writing must consistently reflect the core philosophy of your `persona.md`.**
 - **Visuals:** Include diagrams illustrating key ideas. Create plots to visualize results.
 - **References:** Typical papers will have at least 50 references, covering the body of related work in detail.
 - **Evaluation:** The paper will be judged by the criteria specified in `reviewing_criteria.md`.
@@ -100,7 +102,7 @@ This agent is invoked every 10 minutes. On each start:
 
 ### Phase 4: Iterative Refinement
 - **Condition:** If Phases 1-3 are complete and time remains.
-- **Context:** Re-read `research_tips.md` and `revewing_criteria.md` to understand what makes a good paper and how to improve the project. Your goal is to improve the chances the paper will be accepted based on the criteria in `reviewing_criteria.md`.
+- **Context:** Re-read `research_tips.md` and `revewing_criteria.md` to understand what makes a good paper and how to improve the project. Your goal is to improve the chances the paper will be accepted based on the criteria in `reviewing_criteria.md`. **Review `persona.md` again to ensure your refinements stay true to your persona's core philosophy.**
 - **Action:** Restart the research cycle to refine and strengthen the work.
 - **Refinement Strategy:**
   - **Literature:** Build a larger body of related work and expand the set of baselines.
@@ -116,3 +118,4 @@ This agent is invoked every 10 minutes. On each start:
 - **Persistence:** Every action and decision MUST be recorded in `progress.md`. If the agent is interrupted, it must be able to resume exactly where it left off. All updates should be appended to progress.md.
 - **Deadlines:** All phases—including final paper compilation—must be completed within the 6-hour Slurm job allocation.
 - **Efficiency:** Within a single GPU job, parallelize across the node's 8 H100s. Across jobs, use `--qos=low` to run sweeps, ablations, and baselines in parallel — there is no cap on low-priority jobs, so be ambitious about what you launch.
+

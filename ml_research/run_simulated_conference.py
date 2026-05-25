@@ -76,11 +76,15 @@ def log(msg: str) -> None:
 
 # --- file staging ---------------------------------------------------------
 
-def seed_reference_files(dest: Path) -> None:
+def seed_reference_files(dest: Path, persona: Path | None = None) -> None:
     """Copy reference files from skeleton/ into dest (excluding runtime files)."""
     dest.mkdir(parents=True, exist_ok=True)
     for entry in SKELETON_DIR.iterdir():
         if entry.name in RUNTIME_NAMES:
+            continue
+        if entry.name == "personas":
+            if persona is not None:
+                shutil.copy2(persona, dest / "persona.md")
             continue
         target = dest / entry.name
         if entry.is_dir():
@@ -492,10 +496,14 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     trial_dir.mkdir(parents=True, exist_ok=True)
     seed_reference_files(trial_dir)  # so metareview can run at trial root
 
+    personas_dir = SKELETON_DIR / "personas"
+    available_personas = list(personas_dir.glob("*.md")) if personas_dir.is_dir() else []
+
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
         sub_dir.mkdir(exist_ok=True)
-        seed_reference_files(sub_dir)
+        persona = random.choice(available_personas) if available_personas else None
+        seed_reference_files(sub_dir, persona=persona)
         papers_dir = sub_dir / "papers"
         papers_dir.mkdir(exist_ok=True)
         for p in input_papers:
