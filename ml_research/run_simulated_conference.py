@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import random
 import re
 import shutil
 import subprocess
@@ -82,8 +83,8 @@ def seed_reference_files(dest: Path, persona: Path | None = None) -> None:
     for entry in SKELETON_DIR.iterdir():
         if entry.name in RUNTIME_NAMES:
             continue
-        if entry.name == "personas":
-            if persona is not None:
+        if entry.name in ("research_personas", "reviewer_personas"):
+            if persona is not None and entry.name == persona.parent.name:
                 shutil.copy2(persona, dest / "persona.md")
             continue
         target = dest / entry.name
@@ -496,13 +497,13 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     trial_dir.mkdir(parents=True, exist_ok=True)
     seed_reference_files(trial_dir)  # so metareview can run at trial root
 
-    personas_dir = SKELETON_DIR / "personas"
-    available_personas = list(personas_dir.glob("*.md")) if personas_dir.is_dir() else []
+    research_personas_dir = SKELETON_DIR / "research_personas"
+    available_research_personas = list(research_personas_dir.glob("*.md")) if research_personas_dir.is_dir() else []
 
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
         sub_dir.mkdir(exist_ok=True)
-        persona = random.choice(available_personas) if available_personas else None
+        persona = random.choice(available_research_personas) if available_research_personas else None
         seed_reference_files(sub_dir, persona=persona)
         papers_dir = sub_dir / "papers"
         papers_dir.mkdir(exist_ok=True)
@@ -531,23 +532,38 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     review_script = SKELETON_DIR / "run_reviewing_agent.slurm"
     review_budget = parse_time_limit_seconds(review_script)
     log(f"===== trial {trial}: launching reviewing agents =====")
+    
+    reviewer_personas_dir = SKELETON_DIR / "reviewer_personas"
+    available_reviewer_personas = list(reviewer_personas_dir.glob("*.md")) if reviewer_personas_dir.is_dir() else []
+    
     review_slots: list[ManagedSlot] = []
     skipped = 0
     review_idx = 0
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
-        if not (sub_dir / "submission.pdf").exists():
+        sub_pdf = sub_dir / "submission.pdf"
+        if not sub_pdf.exists():
             log(f"[t{trial}/sub{z}] no submission.pdf — skipping review")
             skipped += 1
             continue
-        state = SubmissionState(label=f"t{trial}/sub{z}-rev", workdir=sub_dir)
-        slot = ManagedSlot(
-            state, f"review-t{trial}-s{z}", review_script, review_budget,
-            startup_offset_sec=review_idx * STARTUP_STAGGER_SEC,
-        )
-        review_slots.append(slot)
-        review_idx += 1
-    log(f"trial {trial}: submitted {len(review_slots)} review jobs (skipped {skipped})")
+            
+        for rev_num in range(1, 4):
+            rev_dir = sub_dir / f"reviewer{rev_num}"
+            rev_dir.mkdir(exist_ok=True)
+            
+            persona = random.choice(available_reviewer_personas) if available_reviewer_personas else None
+            seed_reference_files(rev_dir, persona=persona)
+            shutil.copy2(sub_pdf, rev_dir / "submission.pdf")
+            
+            state = SubmissionState(label=f"t{trial}/sub{z}-rev{rev_num}", workdir=rev_dir)
+            slot = ManagedSlot(
+                state, f"review-t{trial}-s{z}-r{rev_num}", review_script, review_budget,
+                startup_offset_sec=review_idx * STARTUP_STAGGER_SEC,
+            )
+            review_slots.append(slot)
+            review_idx += 1
+
+    log(f"trial {trial}: submitted {len(review_slots)} review jobs (skipped {skipped} submissions)")
     if review_slots:
         run_phase(f"trial {trial} review", review_slots)
 
