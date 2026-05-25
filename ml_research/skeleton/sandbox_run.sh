@@ -19,7 +19,8 @@ WRAPPER_BIN_DIR="$SCRIPT_DIR/bin"                  # tag-enforcing wrappers
 mkdir -p "$SANDBOX_HOME"
 
 exec "$BWRAP" \
-  --unshare-pid \
+  --unshare-all \
+  --share-net \
   --as-pid-1 \
   --new-session \
   --die-with-parent \
@@ -40,18 +41,11 @@ exec "$BWRAP" \
   --ro-bind /var/lib/sss/pipes /var/lib/sss/pipes \
   --bind "$SANDBOX_HOME" "$REAL_HOME" \
   --ro-bind "$REAL_HOME/.local" "$REAL_HOME/.local" \
-  --bind "$REAL_HOME/.claude" "$REAL_HOME/.claude" \
-  --bind "$REAL_HOME/.claude.json" "$REAL_HOME/.claude.json" \
-  --tmpfs "$REAL_HOME/.claude/projects" \
-  --tmpfs "$REAL_HOME/.claude/sessions" \
-  --tmpfs "$REAL_HOME/.claude/backups" \
-  --tmpfs "$REAL_HOME/.claude/shell-snapshots" \
-  --tmpfs "$REAL_HOME/.claude/session-env" \
-  --tmpfs "$REAL_HOME/.claude/cache" \
-  --tmpfs "$REAL_HOME/.claude/downloads" \
-  --tmpfs "$REAL_HOME/.claude/plugins" \
-  --bind /dev/null "$REAL_HOME/.claude/history.jsonl" \
+  --bind "$REAL_HOME/.gemini" "$REAL_HOME/.gemini" \
+  --tmpfs "$REAL_HOME/.gemini/history" \
+  --tmpfs "$REAL_HOME/.gemini/tmp" \
   --bind "$WORK" "$WORK" \
+  --ro-bind /fsx/craffel/miniconda3 /fsx/craffel/miniconda3 \
   --ro-bind /admin/slurm /admin/slurm \
   --ro-bind "$SLURM_BIN_DIR" /run/slurm-real/bin \
   --ro-bind "$WRAPPER_BIN_DIR/sbatch"  "$SLURM_BIN_DIR/sbatch" \

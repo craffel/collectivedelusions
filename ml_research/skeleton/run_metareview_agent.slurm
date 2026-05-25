@@ -10,6 +10,10 @@
 #SBATCH -e %x_%j.err
 #SBATCH --time=1:00:00
 
+source ~/.bashrc
+source "$CONDA_ROOT/etc/profile.d/conda.sh"
+source activate gemini
+
 echo "Starting Metareview Agent Job: $SLURM_JOB_ID"
 echo "Allocated Node: $(hostname)"
 
@@ -20,9 +24,9 @@ echo "Allocated Node: $(hostname)"
 export AGENT_ID="$SLURM_JOB_ID"
 export AGENT_NODE_CAP=0
 
-echo "[$(date)] Invoking claude..."
+echo "[$(date)] Invoking gemini..."
 
 # Run the agent autonomously inside a bwrap sandbox (only CWD is visible).
-CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 stdbuf -oL -eL "$SKELETON_DIR/sandbox_run.sh" /admin/home/craffel/.local/bin/claude --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions --model "claude-opus-4-7" -p "Follow the instructions in metareview_plan.md" | stdbuf -oL jq --unbuffered -rj -f "$SKELETON_DIR/format_log.jq"
+stdbuf -oL -eL "$SKELETON_DIR/sandbox_run.sh" /fsx/craffel/miniconda3/envs/gemini/bin/gemini --yolo --debug --model "gemini-3.5-flash" --prompt "Follow the instructions in metareview_plan.md"
 
-echo "[$(date)] claude-cli invocation finished."
+echo "[$(date)] gemini invocation finished."

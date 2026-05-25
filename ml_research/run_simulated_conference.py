@@ -13,10 +13,15 @@ For each trial:
   - Reviewing agents run for each submission that produced submission.pdf.
   - One metareview agent runs at the trial root and produces accepted_papers/.
 
-While slurm jobs are in flight a background monitor thread polls every
-POLL_INTERVAL_SECONDS and logs notable events: progress.md updates, GPU job
-launches/conclusions, controller iteration markers, submission/review file
-appearance.
+hopper-cpu nodes are AWS spot instances, so controllers can be preempted
+(exit code 0:10 / NODE_FAIL / PREEMPTED). The orchestrator detects this,
+deducts the elapsed time from the remaining budget, cancels any GPU jobs
+orphaned by the dead controller, and resubmits the agent until either it
+exits cleanly or the budget is exhausted.
+
+A background monitor thread polls every POLL_INTERVAL_SECONDS and logs
+notable events across all attempts: progress.md updates, GPU job launches
+and conclusions, controller iteration markers, and artifact appearance.
 
 Usage:
     run_simulated_conference.py <output_dir> <num_trials> <seed1.pdf> <seed2.pdf> <seed3.pdf>
@@ -39,9 +44,15 @@ SKELETON_DIR = REPO_DIR / "skeleton"
 NUM_SUBMISSIONS = 10
 POLL_INTERVAL_SECONDS = 30
 
+# Don't bother resubmitting if less than this many seconds remain after a preemption.
+MIN_RESUBMIT_SEC = 600
+
+# Per-submission delay before the first claude invocation. Spaces them out so
+# many processes on one node don't all clobber each other writing to ~/.claude.json.
+STARTUP_STAGGER_SEC = 15
+
 # Items in skeleton/ that must NOT land inside an agent's CWD. (Keeping them
-# outside $WORK is what makes the slurm wrappers tamper-proof — see
-# research_plan.md and skeleton/sandbox_run.sh.)
+# outside $WORK is what makes the slurm wrappers tamper-proof.)
 RUNTIME_NAMES = {
     "bwrap",
     "sandbox_run.sh",
@@ -78,20 +89,64 @@ def seed_reference_files(dest: Path) -> None:
             shutil.copy2(entry, target)
 
 
+# --- slurm time parsing ---------------------------------------------------
+
+def parse_slurm_time(spec: str) -> int:
+    """Parse a slurm time string to seconds.
+
+    Accepts the formats slurm itself accepts: M, M:S, H:M:S, D-H, D-H:M, D-H:M:S.
+    """
+    if "-" in spec:
+        days_str, rest = spec.split("-", 1)
+        days = int(days_str)
+    else:
+        days, rest = 0, spec
+    parts = [int(p) for p in rest.split(":")]
+    if len(parts) == 1:
+        return days * 86400 + parts[0] * 60
+    if len(parts) == 2:
+        if days > 0:
+            return days * 86400 + parts[0] * 3600 + parts[1] * 60
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    raise ValueError(f"can't parse slurm time {spec!r}")
+
+
+def parse_time_limit_seconds(slurm_script: Path) -> int:
+    text = slurm_script.read_text()
+    m = re.search(r"^#SBATCH\s+(?:--time=|-t\s+)(\S+)", text, re.MULTILINE)
+    if not m:
+        raise ValueError(f"could not find #SBATCH --time in {slurm_script}")
+    return parse_slurm_time(m.group(1))
+
+
 # --- slurm helpers --------------------------------------------------------
 
-def submit_with_wait(workdir: Path, jobname: str, slurm_script: Path) -> subprocess.Popen:
+def submit_with_wait(
+    workdir: Path,
+    jobname: str,
+    slurm_script: Path,
+    time_limit_minutes: int,
+    startup_offset_sec: int = 0,
+) -> subprocess.Popen:
     """Submit a slurm job with `sbatch --wait`; return its Popen.
 
-    The first line of `<workdir>/<jobname>.sbatch.log` is the "Submitted batch job N"
-    notice that we later scrape to recover the controller's slurm job id.
+    --time on the CLI overrides the #SBATCH --time directive in the script,
+    so we can shrink the budget for retries after a preemption.
+
+    `startup_offset_sec` is plumbed through as the AGENT_STARTUP_OFFSET env
+    var; the slurm script sleeps that many seconds before its first claude
+    invocation to avoid 10 agents racing for ~/.claude.json on the same node.
     """
     log_path = workdir / f"{jobname}.sbatch.log"
+    export = f"ALL,SKELETON_DIR={SKELETON_DIR},AGENT_STARTUP_OFFSET={startup_offset_sec}"
     cmd = [
         "sbatch", "--wait",
         f"--chdir={workdir}",
         f"--job-name={jobname}",
-        f"--export=ALL,SKELETON_DIR={SKELETON_DIR}",
+        f"--time={time_limit_minutes}",
+        f"--export={export}",
         str(slurm_script),
     ]
     fp = open(log_path, "w")
@@ -126,26 +181,84 @@ def squeue_me() -> list[tuple[str, str, str, str]]:
     return rows
 
 
-def sacct_final_state(jobid: str) -> str:
+def sacct_summary(jobid: str) -> dict[str, object]:
+    """Best-effort {state, elapsed_sec, exit_code} for a job from sacct.
+
+    Uses -P (parsable) so the State string is not truncated, e.g. we get the
+    full "CANCELLED by 150016" instead of "CANCELLED+".
+    """
     try:
         out = subprocess.run(
-            ["sacct", "-X", "-n", "-j", jobid, "-o", "State"],
+            ["sacct", "-X", "-n", "-P", "-j", jobid, "-o", "State,ElapsedRaw,ExitCode"],
             capture_output=True, text=True, timeout=20, check=False,
         ).stdout
     except subprocess.TimeoutExpired:
-        return "UNKNOWN"
+        return {}
     line = out.strip().splitlines()[0] if out.strip() else ""
-    return line.strip() or "UNKNOWN"
+    parts = line.split("|")
+    if len(parts) >= 3:
+        elapsed = int(parts[1]) if parts[1].strip().isdigit() else 0
+        return {
+            "state": parts[0].strip(),
+            "elapsed_sec": elapsed,
+            "exit_code": parts[2].strip(),
+        }
+    return {}
+
+
+def is_preemption(state: str, exit_code: str) -> bool:
+    """Detect AWS-spot preemption of a hopper-cpu controller.
+
+    Manifests as ExitCode 0:10 (SIGUSR1 from the slurm prolog/preemption hook)
+    or one of the explicit slurm states for involuntary termination.
+    """
+    if state.startswith(("NODE_FAIL", "PREEMPTED", "BOOT_FAIL")):
+        return True
+    if exit_code == "0:10":
+        return True
+    return False
+
+
+def cancel_orphan_gpu_jobs(controller_jobid: str, label: str) -> None:
+    """Cancel any live GPU jobs whose comment ties them to a preempted controller."""
+    tag = f"agent-{controller_jobid}"
+    try:
+        out = subprocess.run(
+            ["squeue", "--me", "-h", "-o", "%i|%k|%t"],
+            capture_output=True, text=True, timeout=20, check=False,
+        ).stdout
+    except subprocess.TimeoutExpired:
+        return
+    to_cancel: list[str] = []
+    for line in out.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) == 3 and parts[1] == tag:
+            to_cancel.append(parts[0])
+    if not to_cancel:
+        return
+    log(f"[{label}] cancelling {len(to_cancel)} orphan GPU job(s) from preempted "
+        f"controller {controller_jobid}: {','.join(to_cancel)}")
+    subprocess.run(["scancel", *to_cancel], capture_output=True, check=False)
 
 
 # --- per-submission state -------------------------------------------------
 
 @dataclass
+class Attempt:
+    jobname: str
+    sbatch_log: Path
+    jobid: str | None = None
+    final_state: str = ""
+    elapsed_sec: int = 0
+    exit_code: str = ""
+    rc: int = -1
+
+
+@dataclass
 class SubmissionState:
     label: str
     workdir: Path
-    sbatch_log: Path  # path to the orchestrator's sbatch.log for this controller
-    controller_jobid: str | None = None
+    attempts: list[Attempt] = field(default_factory=list)
     progress_mtime: float = 0.0
     iterations_seen: int = 0
     submission_pdf_seen: bool = False
@@ -154,11 +267,97 @@ class SubmissionState:
     gpu_jobs_active: set[str] = field(default_factory=set)
     gpu_jobs_done: set[str] = field(default_factory=set)
 
+    def __post_init__(self) -> None:
+        # Baseline progress.md mtime now so the seeded copy doesn't read as an update.
+        p = self.workdir / "progress.md"
+        try:
+            self.progress_mtime = p.stat().st_mtime
+        except FileNotFoundError:
+            pass
+
+
+# --- managed slot (handles preemption + resubmission) ---------------------
+
+class ManagedSlot:
+    """Runs one submission's lifecycle: submit, wait, detect preemption, resubmit."""
+
+    def __init__(
+        self,
+        state: SubmissionState,
+        jobname_base: str,
+        slurm_script: Path,
+        time_budget_sec: int,
+        allow_resubmit: bool = True,
+        startup_offset_sec: int = 0,
+    ) -> None:
+        self.state = state
+        self.jobname_base = jobname_base
+        self.slurm_script = slurm_script
+        self.remaining_sec = time_budget_sec
+        self.allow_resubmit = allow_resubmit
+        self.startup_offset_sec = startup_offset_sec
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(
+            target=self._lifecycle, daemon=True, name=f"slot-{self.state.label}",
+        )
+        self.thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+    def _lifecycle(self) -> None:
+        while self.remaining_sec >= MIN_RESUBMIT_SEC:
+            idx = len(self.state.attempts)
+            jobname = self.jobname_base if idx == 0 else f"{self.jobname_base}-r{idx}"
+            sbatch_log = self.state.workdir / f"{jobname}.sbatch.log"
+            time_min = max(1, self.remaining_sec // 60)
+            attempt = Attempt(jobname=jobname, sbatch_log=sbatch_log)
+            # Append before submitting so the Monitor can discover the jobid early.
+            self.state.attempts.append(attempt)
+            # Stagger only the first attempt — retries are already de-synchronized
+            # because each happens after a different elapsed time.
+            offset = self.startup_offset_sec if idx == 0 else 0
+            log(f"[{self.state.label}] submitting attempt #{idx+1} "
+                f"({jobname}, --time={time_min}m, startup_offset={offset}s)")
+            proc = submit_with_wait(
+                self.state.workdir, jobname, self.slurm_script, time_min,
+                startup_offset_sec=offset,
+            )
+            attempt.rc = proc.wait()
+            attempt.jobid = read_jobid(sbatch_log)
+            if not attempt.jobid:
+                log(f"[{self.state.label}] could not read jobid from {sbatch_log}; "
+                    "aborting slot")
+                return
+            summary = sacct_summary(attempt.jobid)
+            attempt.final_state = str(summary.get("state", "UNKNOWN"))
+            attempt.elapsed_sec = int(summary.get("elapsed_sec", 0))  # type: ignore[arg-type]
+            attempt.exit_code = str(summary.get("exit_code", ""))
+            log(f"[{self.state.label}] attempt #{idx+1} (job {attempt.jobid}) "
+                f"ended: state={attempt.final_state}, elapsed={attempt.elapsed_sec}s, "
+                f"exit_code={attempt.exit_code}, rc={attempt.rc}")
+            if not self.allow_resubmit:
+                return
+            if not is_preemption(attempt.final_state, attempt.exit_code):
+                return
+            # Preempted. Deduct elapsed and try again on a fresh node.
+            self.remaining_sec -= attempt.elapsed_sec
+            if self.remaining_sec < MIN_RESUBMIT_SEC:
+                log(f"[{self.state.label}] preempted, but only "
+                    f"{self.remaining_sec}s left; not resubmitting")
+                return
+            cancel_orphan_gpu_jobs(attempt.jobid, self.state.label)
+            log(f"[{self.state.label}] preempted; resubmitting with "
+                f"{self.remaining_sec // 60}m remaining")
+
 
 # --- monitor thread -------------------------------------------------------
 
 class Monitor(threading.Thread):
-    """Background polling thread that emits events for one phase of one trial."""
+    """Polls slot states and emits per-submission progress events."""
 
     def __init__(self, submissions: list[SubmissionState], stop_event: threading.Event):
         super().__init__(daemon=True, name="trial-monitor")
@@ -185,12 +384,14 @@ class Monitor(threading.Thread):
 
     def _refresh_jobids(self) -> None:
         for s in self.submissions:
-            if s.controller_jobid:
-                continue
-            jid = read_jobid(s.sbatch_log)
-            if jid:
-                s.controller_jobid = jid
-                log(f"[{s.label}] controller slurm job id = {jid}")
+            for a in s.attempts:
+                if a.jobid:
+                    continue
+                jid = read_jobid(a.sbatch_log)
+                if jid:
+                    a.jobid = jid
+                    idx = s.attempts.index(a) + 1
+                    log(f"[{s.label}] attempt #{idx} got slurm jobid = {jid}")
 
     def _poll_progress(self, s: SubmissionState) -> None:
         p = s.workdir / "progress.md"
@@ -218,25 +419,29 @@ class Monitor(threading.Thread):
             log(f"[{s.label}] accepted_papers/ created with {len(pdfs)} PDF(s)")
 
     def _poll_iterations(self, s: SubmissionState) -> None:
-        if not s.controller_jobid:
-            return
-        candidates = list(s.workdir.glob(f"*_{s.controller_jobid}.out"))
-        if not candidates:
-            return
-        try:
-            text = candidates[0].read_text(errors="ignore")
-        except OSError:
-            return
-        sleeps = text.count("Sleeping for 10 minutes")
-        if sleeps > s.iterations_seen:
-            s.iterations_seen = sleeps
-            log(f"[{s.label}] completed iteration #{sleeps} (claude invocation finished)")
+        total = 0
+        for a in s.attempts:
+            if not a.jobid:
+                continue
+            for out_file in s.workdir.glob(f"*_{a.jobid}.out"):
+                try:
+                    text = out_file.read_text(errors="ignore")
+                except OSError:
+                    continue
+                total += text.count("Sleeping for 10 minutes")
+        if total > s.iterations_seen:
+            s.iterations_seen = total
+            log(f"[{s.label}] completed iteration #{total} "
+                "(gemini invocation finished)")
 
     def _poll_gpu_jobs(self) -> None:
         rows = squeue_me()
-        ctrl_map: dict[str, SubmissionState] = {
-            s.controller_jobid: s for s in self.submissions if s.controller_jobid
-        }
+        # Map every known controller jobid (any attempt) back to its slot.
+        ctrl_map: dict[str, SubmissionState] = {}
+        for s in self.submissions:
+            for a in s.attempts:
+                if a.jobid:
+                    ctrl_map[a.jobid] = s
         active_now: dict[str, set[str]] = {s.label: set() for s in self.submissions}
         for jobid, comment, state, jobname in rows:
             if not comment.startswith("agent-"):
@@ -250,36 +455,36 @@ class Monitor(threading.Thread):
             active_now[s.label].add(jobid)
             if jobid not in s.gpu_jobs_active:
                 s.gpu_jobs_active.add(jobid)
-                log(f"[{s.label}] launched GPU job {jobid} (name={jobname}, state={state})")
-        # Disappearance from squeue = job concluded.
+                log(f"[{s.label}] launched GPU job {jobid} "
+                    f"(name={jobname}, state={state})")
+        # Anything missing from this round = concluded.
         for s in self.submissions:
             concluded = s.gpu_jobs_active - active_now[s.label]
             for jobid in concluded:
-                final = sacct_final_state(jobid)
+                summary = sacct_summary(jobid)
+                final = summary.get("state", "UNKNOWN")
                 log(f"[{s.label}] GPU job {jobid} concluded ({final})")
                 s.gpu_jobs_active.discard(jobid)
                 s.gpu_jobs_done.add(jobid)
 
 
-# --- phase runners --------------------------------------------------------
+# --- phase runner ---------------------------------------------------------
 
-def run_phase(
-    phase_label: str,
-    submissions_and_procs: list[tuple[SubmissionState, subprocess.Popen]],
-) -> None:
-    """Wait for all sbatch --wait procs in this phase; run a Monitor concurrently."""
-    states = [s for s, _ in submissions_and_procs]
+def run_phase(label: str, slots: list[ManagedSlot]) -> None:
+    states = [s.state for s in slots]
     stop = threading.Event()
     monitor = Monitor(states, stop)
     monitor.start()
-    for s, p in submissions_and_procs:
-        rc = p.wait()
-        if rc != 0:
-            log(f"[{s.label}] sbatch --wait exited rc={rc}")
+    for slot in slots:
+        slot.start()
+    for slot in slots:
+        slot.join()
     stop.set()
     monitor.join(timeout=10)
-    log(f"===== {phase_label}: done =====")
+    log(f"===== {label}: done =====")
 
+
+# --- per-trial flow -------------------------------------------------------
 
 def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     trial_dir = output_dir / f"trial{trial}"
@@ -295,55 +500,56 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
         papers_dir.mkdir(exist_ok=True)
         for p in input_papers:
             shutil.copy2(p, papers_dir / p.name)
-    log(f"trial {trial}: seeded {NUM_SUBMISSIONS} submissions with {len(input_papers)} input paper(s)")
+    log(f"trial {trial}: seeded {NUM_SUBMISSIONS} submissions with "
+        f"{len(input_papers)} input paper(s)")
 
     # ----- Phase 1: research -----
-    log(f"===== trial {trial}: launching {NUM_SUBMISSIONS} research agents =====")
-    research: list[tuple[SubmissionState, subprocess.Popen]] = []
+    research_script = SKELETON_DIR / "run_research_agent.slurm"
+    research_budget = parse_time_limit_seconds(research_script)
+    log(f"===== trial {trial}: launching {NUM_SUBMISSIONS} research agents "
+        f"(budget={research_budget // 60}m each) =====")
+    research_slots: list[ManagedSlot] = []
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
-        jobname = f"research-t{trial}-s{z}"
-        state = SubmissionState(
-            label=f"t{trial}/sub{z}",
-            workdir=sub_dir,
-            sbatch_log=sub_dir / f"{jobname}.sbatch.log",
+        state = SubmissionState(label=f"t{trial}/sub{z}", workdir=sub_dir)
+        slot = ManagedSlot(
+            state, f"research-t{trial}-s{z}", research_script, research_budget,
+            startup_offset_sec=(z - 1) * STARTUP_STAGGER_SEC,
         )
-        proc = submit_with_wait(sub_dir, jobname, SKELETON_DIR / "run_research_agent.slurm")
-        research.append((state, proc))
-    run_phase(f"trial {trial} research", research)
+        research_slots.append(slot)
+    run_phase(f"trial {trial} research", research_slots)
 
     # ----- Phase 2: reviewing -----
+    review_script = SKELETON_DIR / "run_reviewing_agent.slurm"
+    review_budget = parse_time_limit_seconds(review_script)
     log(f"===== trial {trial}: launching reviewing agents =====")
-    review: list[tuple[SubmissionState, subprocess.Popen]] = []
+    review_slots: list[ManagedSlot] = []
     skipped = 0
+    review_idx = 0
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
         if not (sub_dir / "submission.pdf").exists():
             log(f"[t{trial}/sub{z}] no submission.pdf — skipping review")
             skipped += 1
             continue
-        jobname = f"review-t{trial}-s{z}"
-        state = SubmissionState(
-            label=f"t{trial}/sub{z}-rev",
-            workdir=sub_dir,
-            sbatch_log=sub_dir / f"{jobname}.sbatch.log",
+        state = SubmissionState(label=f"t{trial}/sub{z}-rev", workdir=sub_dir)
+        slot = ManagedSlot(
+            state, f"review-t{trial}-s{z}", review_script, review_budget,
+            startup_offset_sec=review_idx * STARTUP_STAGGER_SEC,
         )
-        proc = submit_with_wait(sub_dir, jobname, SKELETON_DIR / "run_reviewing_agent.slurm")
-        review.append((state, proc))
-    log(f"trial {trial}: submitted {len(review)} review jobs (skipped {skipped})")
-    if review:
-        run_phase(f"trial {trial} review", review)
+        review_slots.append(slot)
+        review_idx += 1
+    log(f"trial {trial}: submitted {len(review_slots)} review jobs (skipped {skipped})")
+    if review_slots:
+        run_phase(f"trial {trial} review", review_slots)
 
     # ----- Phase 3: metareview -----
+    meta_script = SKELETON_DIR / "run_metareview_agent.slurm"
+    meta_budget = parse_time_limit_seconds(meta_script)
     log(f"===== trial {trial}: launching metareview =====")
-    jobname = f"metareview-t{trial}"
-    meta_state = SubmissionState(
-        label=f"t{trial}/meta",
-        workdir=trial_dir,
-        sbatch_log=trial_dir / f"{jobname}.sbatch.log",
-    )
-    proc = submit_with_wait(trial_dir, jobname, SKELETON_DIR / "run_metareview_agent.slurm")
-    run_phase(f"trial {trial} metareview", [(meta_state, proc)])
+    meta_state = SubmissionState(label=f"t{trial}/meta", workdir=trial_dir)
+    meta_slot = ManagedSlot(meta_state, f"metareview-t{trial}", meta_script, meta_budget)
+    run_phase(f"trial {trial} metareview", [meta_slot])
 
     accepted = trial_dir / "accepted_papers"
     if not accepted.is_dir():
@@ -382,6 +588,12 @@ def main() -> None:
 
     log(f"orchestrator starting; output={output_dir}, trials={args.num_trials}")
     for trial in range(1, args.num_trials + 1):
+        existing = output_dir / f"trial{trial}" / "accepted_papers"
+        existing_pdfs = sorted(existing.glob("*.pdf")) if existing.is_dir() else []
+        if len(existing_pdfs) == 3:
+            log(f"===== trial {trial}: skipping — {existing} already has 3 accepted PDFs =====")
+            input_papers = existing_pdfs
+            continue
         accepted = run_trial(trial, output_dir, input_papers)
         pdfs = sorted(accepted.glob("*.pdf"))
         if not pdfs:
