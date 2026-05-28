@@ -495,7 +495,6 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     trial_dir = output_dir / f"trial{trial}"
     log(f"===== trial {trial}: setting up {trial_dir} =====")
     trial_dir.mkdir(parents=True, exist_ok=True)
-    seed_reference_files(trial_dir)  # so metareview can run at trial root
 
     research_personas_dir = SKELETON_DIR / "research_personas"
     available_research_personas = list(research_personas_dir.glob("*.md")) if research_personas_dir.is_dir() else []
@@ -532,10 +531,10 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     review_script = SKELETON_DIR / "run_reviewing_agent.slurm"
     review_budget = parse_time_limit_seconds(review_script)
     log(f"===== trial {trial}: launching reviewing agents =====")
-    
+
     reviewer_personas_dir = SKELETON_DIR / "reviewer_personas"
     available_reviewer_personas = list(reviewer_personas_dir.glob("*.md")) if reviewer_personas_dir.is_dir() else []
-    
+
     review_slots: list[ManagedSlot] = []
     skipped = 0
     review_idx = 0
@@ -546,15 +545,15 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
             log(f"[t{trial}/sub{z}] no submission.pdf — skipping review")
             skipped += 1
             continue
-            
+
         for rev_num in range(1, 4):
             rev_dir = sub_dir / f"reviewer{rev_num}"
             rev_dir.mkdir(exist_ok=True)
-            
+
             persona = random.choice(available_reviewer_personas) if available_reviewer_personas else None
             seed_reference_files(rev_dir, persona=persona)
             shutil.copy2(sub_pdf, rev_dir / "submission.pdf")
-            
+
             state = SubmissionState(label=f"t{trial}/sub{z}-rev{rev_num}", workdir=rev_dir)
             slot = ManagedSlot(
                 state, f"review-t{trial}-s{z}-r{rev_num}", review_script, review_budget,
@@ -571,11 +570,32 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     meta_script = SKELETON_DIR / "run_metareview_agent.slurm"
     meta_budget = parse_time_limit_seconds(meta_script)
     log(f"===== trial {trial}: launching metareview =====")
-    meta_state = SubmissionState(label=f"t{trial}/meta", workdir=trial_dir)
+
+    meta_dir = trial_dir / "metareview"
+    meta_dir.mkdir(exist_ok=True)
+    seed_reference_files(meta_dir)
+
+    for z in range(1, NUM_SUBMISSIONS + 1):
+        sub_dir = trial_dir / f"submission{z}"
+        if not (sub_dir / "submission.pdf").exists():
+            continue
+
+        meta_sub_dir = meta_dir / f"submission{z}"
+        meta_sub_dir.mkdir(exist_ok=True)
+        shutil.copy2(sub_dir / "submission.pdf", meta_sub_dir / "submission.pdf")
+
+        for rev_num in range(1, 4):
+            rev_file = sub_dir / f"reviewer{rev_num}" / "review.md"
+            if rev_file.exists():
+                meta_rev_dir = meta_sub_dir / f"reviewer{rev_num}"
+                meta_rev_dir.mkdir(exist_ok=True)
+                shutil.copy2(rev_file, meta_rev_dir / "review.md")
+
+    meta_state = SubmissionState(label=f"t{trial}/meta", workdir=meta_dir)
     meta_slot = ManagedSlot(meta_state, f"metareview-t{trial}", meta_script, meta_budget)
     run_phase(f"trial {trial} metareview", [meta_slot])
 
-    accepted = trial_dir / "accepted_papers"
+    accepted = meta_dir / "accepted_papers"
     if not accepted.is_dir():
         sys.exit(f"trial {trial}: metareview did not produce {accepted}")
     pdfs = sorted(accepted.glob("*.pdf"))
@@ -612,7 +632,7 @@ def main() -> None:
 
     log(f"orchestrator starting; output={output_dir}, trials={args.num_trials}")
     for trial in range(1, args.num_trials + 1):
-        existing = output_dir / f"trial{trial}" / "accepted_papers"
+        existing = output_dir / f"trial{trial}" / "metareview" / "accepted_papers"
         existing_pdfs = sorted(existing.glob("*.pdf")) if existing.is_dir() else []
         if len(existing_pdfs) == 3:
             log(f"===== trial {trial}: skipping — {existing} already has 3 accepted PDFs =====")

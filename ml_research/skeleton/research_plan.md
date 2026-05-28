@@ -38,9 +38,9 @@ Submit with `sbatch my_experiment.slurm`; check status with `squeue`; cancel wit
 The cluster has two QoS levels you can target. They behave very differently for this agent's cap policy:
 
 - **`--qos=normal`** — higher scheduling priority, but **you are capped at 1 GPU node running or pending at a time**. Good for the single experiment you are actively iterating on.
-- **`--qos=low`** — lower scheduling priority (may queue longer; can be preempted), but **no per-agent cap**. Use this for everything else: hyperparameter sweeps, ablations, baselines, scaling-law curves, multi-seed runs, robustness checks. You can have dozens of `--qos=low` jobs queued or running simultaneously.
+- **`--qos=low`** — lower scheduling priority (may queue longer; can be preempted), but **no per-agent cap**. Use this for everything else: hyperparameter sweeps, ablations, baselines, scaling, multi-seed runs, robustness checks. **Be ambitious**—you can have dozens of `--qos=low` jobs queued or running simultaneously.
 
-**Be ambitious.** A common failure mode for time-pressured research is shrinking the experiment to fit a single normal-priority node. Don't. When you have a sweep or a set of baselines to run, fan them out as `--qos=low` jobs in parallel — there is no cap, and a high-quality paper almost always has more than one experiment in it. Plan to use `--qos=normal` for the one foreground job you're babysitting, and `--qos=low` for the rest of the experimental program.
+**Be ambitious.** A common failure mode for time-pressured research is shrinking the experiment to fit a single normal-priority node. Don't. Be ambitious with compute—there is no cap, and paper quality tends to improve the more compute is spent.
 
 ### Slurm restrictions enforced for this agent
 `sbatch`, `squeue`, and `scancel` are wrappers in front of the real slurm commands. They enforce:
@@ -50,7 +50,7 @@ The cluster has two QoS levels you can target. They behave very differently for 
   [sbatch-wrapper] Refusing: agent <ID> has N non-low-priority node(s) running/pending; this would add M (cap=1). For larger fan-out, submit with --qos=low (no per-agent cap).
   ```
   and `sbatch` exits with code 2 and no job is queued. Either wait for your current normal job to finish, `scancel` it, or resubmit the new one with `--qos=low`.
-- **`--qos=low` jobs are unlimited.** The cap does not apply to them. Use this for parallel sweeps.
+- **`--qos=low` jobs are unlimited.** The cap does not apply to them.
 - **All jobs you submit are auto-tagged** with `--comment=agent-<your_id>`. Do not pass your own `--comment` — it will be stripped.
 - **`squeue` only shows your own tagged jobs.** Other users' jobs and any of your own jobs not submitted through this wrapper will be invisible.
 - **`scancel` only acts on your own tagged jobs.** Bulk/filter flags are rejected outright:
@@ -103,7 +103,7 @@ This agent is invoked every 10 minutes. On each start:
 ### Phase 4: Iterative Refinement
 - **Condition:** If Phases 1-3 are complete and time remains.
 - **Context:** Re-read `research_tips.md` and `revewing_criteria.md` to understand what makes a good paper and how to improve the project. Your goal is to improve the chances the paper will be accepted based on the criteria in `reviewing_criteria.md`. **Review `persona.md` again to ensure your refinements stay true to your persona's core philosophy.**
-- **Action:** Restart the research cycle to refine and strengthen the work.
+- **Action:** Restart the research cycle to refine and strengthen the work. **Be ambitious. Take significant steps to improve the work.**
 - **Refinement Strategy:**
   - **Literature:** Build a larger body of related work and expand the set of baselines.
   - **Core hypothesis:** Reconsider, refine, and expand the main hypothesis.
@@ -111,7 +111,7 @@ This agent is invoked every 10 minutes. On each start:
   - **Methodology:** Improve the proposed methodology in light of initial experimental results.
   - **Experimentation:** Expand the range of experimental settings, hyperparameters, and ablation studies.
   - **Writing:** Substantially improve the quality, clarity, and technical depth of the written paper.
-- **State Management:** Update `progress.md` to begin again at Phase 1, ensuring that previous insights are preserved and used to inform the next iteration.
+- **State Management:** Update `progress.md` to write down a concrete set of steps that you will take to improve the paper before proceeding, then update `progress.md` as you complete each step.
 - **Requirements:** DO NOT declare the paper "finished" if time remains. There are always ways to improve the paper. Find them and take action.
 
 ## Critical Requirements
