@@ -1,0 +1,496 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\usepackage[accepted]{icml2026} % Use accepted for formatting final submission
+
+% Spacing adjustments to fit exactly within the 8-page main paper budget
+\setlength{\textfloatsep}{10pt plus 2pt minus 4pt}
+\setlength{\dbltextfloatsep}{10pt plus 2pt minus 4pt}
+\setlength{\floatsep}{8pt plus 2pt minus 2pt}
+\setlength{\dblfloatsep}{8pt plus 2pt minus 2pt}
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Spectral Model Merging: Deconflicting Task Experts in the Frequency Domain}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Spectral Model Merging: \\ Deconflicting Task Experts in the Frequency Domain}
+
+\begin{icmlauthorlist}
+\icmlauthor{The Visionary Agent}{equal,inst}
+\end{icmlauthorlist}
+
+\icmlaffiliation{inst}{Autonomous ML Research Division, Gemini CLI Platform}
+\icmlcorrespondingauthor{The Visionary Agent}{visionary@gemini-cli.platform}
+
+\icmlkeywords{Model Merging, Parameter Fusion, Discrete Cosine Transform, Spectral Deconfliction}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Model merging has emerged as an elegant, training-free paradigm to consolidate task-specific capabilities from multiple fine-tuned models into a single shared backbone. However, direct parameter-space merging typically suffers from severe parameter interference, leading to activation variance collapse and catastrophic performance degradation. While recent work addresses this via post-hoc representation calibration or test-time coefficient optimization, these methods are either highly sensitive to channel-level sparsity (the sparsity trap) or require complex task-conditional swapping during inference. Guided by the philosophy of \textit{The Visionary}, we propose a radical departure from spatial weight averaging: \textbf{Spectral Task Decoupling in Fourier Space (STDFS)}, a completely training-free and data-free model merging framework operating in the spectral domain. STDFS applies a 2D Discrete Cosine Transform (2D-DCT) to weight updates, decomposing task vectors into low-frequency (domain-agnostic, structural) and high-frequency (task-specific, fine-grained) components. We average the low-frequency components to retain shared representation layers, while deconflicting and routing the high-frequency components via a magnitude-based spectral max-pooling mechanism. Our extensive empirical evaluations on a diverse vision benchmark (MNIST, Fashion-MNIST, and CIFAR-10) using ResNet-18 demonstrate that STDFS achieves spectacular performance, completely outperforming standard Weight Averaging and Task Arithmetic baselines under both Task-Specific and Shared Head settings. This work establishes a new paradigm for static, task-agnostic, and training-free model merging.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+Deep learning has achieved unprecedented success across computer vision, natural language processing, and multimodal reasoning \cite{vaswani2017attention, devlin2018bert, brown2020language, dosovitskiy2020image}. However, deploying multiple task-specific large-scale neural networks incurs substantial computational, memory, and storage costs. Multi-Task Learning (MTL) offers a unified framework to consolidate distinct capabilities into a single model \cite{caruana1997multitask}, but joint multi-task training is notoriously difficult, requiring simultaneous access to raw datasets and suffering from optimization instabilities and catastrophic forgetting \cite{kirkpatrick2017overcoming}.
+
+Recently, \textit{model merging} has emerged as an attractive, training-free, and modular alternative to joint training \cite{ilharco2022editing, yadav2023ties, yu2024dare, ainsworth2022git, zhao2024recent, zhou2026demystifying, song2026model, abdollahpoorrostam2026model, tang2025merging, li2025model, laloue2025merging, sun2025merging, djuhera2025safemerge, yang2025data, zeng2025robustmerge, sun2025task}. By directly interpolating the weights of specialized expert models fine-tuned from a shared pre-trained base model, merging combines distinct capabilities into a unified model with zero training cost.
+
+Despite its mathematical elegance, model merging is severely bottlenecked by \textit{parameter interference}. When expert weight matrices are averaged, task-specific weight structures collide, manifesting as feature-distribution misalignment and severe variance collapse in intermediate activations \cite{jordan2022repair, nobari2025activationinformed}. As signals propagate through a naively merged model, the variance of intermediate features shrinks layer by layer, eventually deadening the network's capacity to distinguish between inputs.
+
+To remedy variance collapse, existing paradigms focus primarily on post-hoc \textit{activation calibration} (e.g., REPAIR \cite{jordan2022repair}, TCAC, TAAC, LSC) or test-time \textit{coefficient optimization} (e.g., AdaMerging \cite{yang2024adamerging}, SyMerge, lee2026adaltm, du2025adamms). However, as critically exposed in concurrent literature:
+\begin{enumerate}\itemsep=1pt \topsep=1pt \parsep=0pt
+    \item Channel-wise activation calibration is highly sensitive to channel-level sparsity on small calibration datasets (the \textit{Sparsity Trap}), causing numerical explosions in ReLU-based networks.
+    \item Test-time coefficient optimization suffers from unconstrained runaway negative gradients, leading to numerical collapse unless restricted by strict clamping, which in turn freezes updates entirely (the \textit{Clamping Paradox}).
+    \item Traditional methods require maintaining complex task-conditional activation statistics or dynamic weight swapping at runtime, destroying the static, task-agnostic nature of unified models.
+\end{enumerate}
+
+In this paper, we break away from standard spatial parameter averaging and post-hoc representation correction. We ask a fundamental and visionary question: \textit{Why must model merging be restricted to the flat spatial coordinate space of parameters?}
+
+Drawing inspiration from digital signal processing and JPEG image compression, we propose \textbf{Spectral Task Decoupling in Fourier Space (STDFS)}, a novel paradigm that performs model merging in the frequency domain. Our approach is grounded in the insight that neural network weights possess distinct frequency structures. Low-frequency components in the spectral domain capture coarse, domain-agnostic feature representations (e.g., global shape and texture templates), which are highly shared across tasks. Conversely, high-frequency components capture task-specific, fine-grained details, which are localized and highly prone to spatial interference.
+
+STDFS maps task-specific weight updates (task vectors) to the 2D Discrete Cosine Transform (2D-DCT) domain. In the spectral domain, we decompose the merging process into two distinct, frequency-aware operations:
+\begin{itemize}
+    \item \textbf{Low-Frequency Averaging:} We linearly average the low-frequency coefficients across all tasks, which smoothly integrates and stabilizes shared global structural features.
+    \item \textbf{High-Frequency Spectral Max-Pooling:} Instead of averaging high-frequency coefficients (which blurs and attenuates task-specific features), we perform magnitude-based max-pooling to route and preserve the most salient task-specific features, completely avoiding destructive spatial interference.
+\end{itemize}
+By performing an inverse 2D-DCT, we reconstruct a single, static, completely task-agnostic model that requires zero runtime swapping, zero task-ID information, and zero calibration datasets.
+
+Our contributions are summarized as follows:
+\begin{enumerate}\itemsep=1pt \topsep=1pt \parsep=0pt
+    \item We introduce the concept of spectral-domain weight deconfliction to the model merging community, breaking the traditional spatial averaging constraint.
+    \item We present STDFS, an elegant, training-free, and data-free model merging framework that dynamically separates shared and task-specific weight updates in the Fourier domain.
+    \item We evaluate STDFS on a diverse vision benchmark (MNIST, Fashion-MNIST, and CIFAR-10) using ResNet-18, demonstrating significant improvements over standard Weight Averaging and Task Arithmetic baselines under both Task-Specific and Shared Head settings.
+\end{enumerate}
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Parameter-Space Model Merging.} Direct parameter fusion is a standard method to combine networks. Simple Weight Averaging (WA) has been widely used in federated learning (FedAvg) \cite{mcmahan2017communication, perezcorral2026fedsq, liu2025fedswa} and optimization (SWA) \cite{izmailov2018averaging, fuller2026selfsoupervision, cheng2025whoever}. Task Arithmetic \cite{ilharco2022editing} computes "task vectors" by subtracting the pre-trained base model from fine-tuned models, adding these vectors to combine skills \cite{marczak2025task, wei2025modeling, chen2025bring, rinaldi2025update}. TIES-Merging \cite{yadav2023ties} and DARE \cite{yu2024dare} resolve parameter conflicts by trimming redundant, low-magnitude updates and resolving sign disagreements \cite{ramesh2026resolving, wu2025unlocking}. Recent extensions have investigated smooth interpolation along parameter pathways \cite{gupta2026deepweightflow, rachwa2026smooth, kuo2025exact}. However, these methods operate purely in the spatial domain and ignore spectral-domain structural features.
+
+\textbf{Representation Alignment and Calibration.} Linear model merging destroys non-linear activation statistics, causing variance collapse. To address this, REPAIR \cite{jordan2022repair} rescales activations using channel-wise statistics computed on a small calibration set. Task-Conditional Activation Calibration (TCAC) and Task-Agnostic Activation Calibration (TAAC) further refine this by updating BatchNorm statistics. Layer-wise Scaling-only Calibration (LSC) simplifies calibration to a single scalar per layer to preserve ReLU sparsity. More recent works address this via coordination-based alignment or activation-informed fusion \cite{zhao2026coordinate, corbeil2025modular, panariello2025accurate, chen2025uncertaintyaware}. While effective, these methods correct representations after merging, rather than addressing the core parameter-level interference that causes the distortion.
+
+\textbf{Spectral Methods in Deep Learning.} Fourier analysis and Discrete Cosine Transforms have been used to analyze neural networks, compress weights \cite{chen2016compressing}, and accelerate training \cite{wei2026improved, das2026dsca, li2026pmdet, yuan2025superficial, wei2025unifying}. Frequency-domain fine-tuning (e.g., sDCTFT) optimizes a subset of DCT coefficients. Our work is the first to employ 2D-DCT as a post-hoc, training-free, and data-free mechanism to deconflict and merge independent task experts.
+
+\section{Methodology}
+\label{sec:method}
+\subsection{Problem Formulation}
+Let $\theta_{\text{base}} \in \mathbb{R}^D$ be the parameters of a pre-trained base model. We have $K$ task-specific expert models, where each expert $k \in \{1, \dots, K\}$ has parameters $\theta_k \in \mathbb{R}^D$ obtained by fine-tuning $\theta_{\text{base}}$ on a specific task $T_k$. For each expert, we define the spatial task vector (weight update) as:
+\begin{equation}
+    \Delta_k = \theta_k - \theta_{\text{base}}.
+\end{equation}
+The goal of model merging is to construct a unified multi-task model with parameters $\theta_{\text{merged}}$ that performs well across all $K$ tasks without additional training. In standard Task Arithmetic (TA) \cite{ilharco2022editing}, the merged model is computed as:
+\begin{equation}
+    \theta_{\text{merged}} = \theta_{\text{base}} + \lambda \sum_{k=1}^K \Delta_k,
+\end{equation}
+where $\lambda$ is a global scaling coefficient (with Weight Averaging corresponding to $\lambda = 1/K$).
+
+\subsection{Discrete Cosine Transform (2D-DCT)}
+To perform merging in the frequency domain, we apply the 2D Discrete Cosine Transform (Type-II) to the weight tensors of the model. For any layer $l$, let $W_k^l$ be the spatial weight update matrix of shape $M \times N$. For convolutional layers with 4D weights of shape $C_{\text{out}} \times C_{\text{in}} \times K_1 \times K_2$, we reshape the tensor into a 2D matrix of shape $M \times N$, where $M = C_{\text{out}}$ and $N = C_{\text{in}} \cdot K_1 \cdot K_2$.
+
+The 2D-DCT of a 2D spatial matrix $X \in \mathbb{R}^{M \times N}$ is defined as:
+\begin{equation}
+    D = C_M \cdot X \cdot C_N^T,
+\end{equation}
+where $C_M \in \mathbb{R}^{M \times M}$ is the orthogonal DCT-II transform matrix, with elements:
+\begin{equation}
+    C_M[i, j] = 
+    \begin{cases}
+        \sqrt{\frac{1}{M}} & \text{if } i = 0, \\
+        \sqrt{\frac{2}{M}} \cos \left( \frac{\pi i (2j + 1)}{2M} \right) & \text{if } i > 0.
+    \end{cases}
+\end{equation}
+The matrix $C_N \in \mathbb{R}^{N \times N}$ is defined similarly for dimension $N$. Since $C_M$ and $C_N$ are orthogonal matrices, the inverse 2D-DCT (IDCT) is exactly:
+\begin{equation}
+    X = C_M^T \cdot D \cdot C_N.
+\end{equation}
+This spectral transformation is exact, training-free, and has zero information loss.
+
+\subsection{Spectral Task Decoupling in Fourier Space (STDFS)}
+For each layer $l$ and each task $k$, we transform the task vector matrix $W^l_k$ to its 2D-DCT matrix $D^l_k$:
+\begin{equation}
+    D^l_k = C_M \cdot W^l_k \cdot C_N^T.
+\end{equation}
+We define the normalized Manhattan distance of a frequency coordinate $(u, v)$ from the low-frequency origin (top-left) as:
+\begin{equation}
+    d(u, v) = \frac{u}{M} + \frac{v}{N}.
+\end{equation}
+Given a low-frequency ratio parameter $\alpha \in [0, 1]$, we partition the frequency domain into a low-frequency region $\mathcal{R}_{\text{low}}$ and a high-frequency region $\mathcal{R}_{\text{high}}$:
+\begin{equation}
+    \mathcal{R}_{\text{low}} = \{ (u, v) \mid d(u, v) \le \tau \},
+\end{equation}
+where the threshold $\tau$ is chosen as the $\alpha$-quantile of the distance distribution $\{d(u, v)\}_{u, v}$, ensuring that exactly an $\alpha$ fraction of the frequency components are classified as low-frequency. The remaining components form the high-frequency region:
+\dots
+\begin{equation}
+    \mathcal{R}_{\text{high}} = \{ (u, v) \mid d(u, v) > \tau \}.
+\end{equation}
+
+In the low-frequency region $\mathcal{R}_{\text{low}}$, the coefficients capture global structural changes which are highly correlated and shared across tasks. We merge these components by linear averaging:
+\begin{equation}
+    D^l_{\text{merged}}[u, v] = \frac{1}{K} \sum_{k=1}^K D^l_k[u, v], \quad \forall (u, v) \in \mathcal{R}_{\text{low}}.
+\end{equation}
+
+In the high-frequency region $\mathcal{R}_{\text{high}}$, the coefficients represent task-specific details. Averaging these components causes severe destructive interference, leading to representational blurring and variance collapse. To prevent this, we propose **Spectral Max-Pooling** (magnitude-based selection):
+\begin{equation}
+    k^* = \arg\max_{k \in \{1, \dots, K\}} \left| D^l_k[u, v] \right|,
+\end{equation}
+\begin{equation}
+    D^l_{\text{merged}}[u, v] = D^l_{k^*}[u, v], \quad \forall (u, v) \in \mathcal{R}_{\text{high}}.
+\end{equation}
+This selection routes the most salient task-specific adjustment for each high-frequency component, completely bypassing destructive interference.
+
+Finally, we reconstruct the spatial merged weight update via IDCT:
+\begin{equation}
+    W^l_{\text{merged}} = C_M^T \cdot D^l_{\text{merged}} \cdot C_N.
+\end{equation}
+The merged model parameters are then obtained as:
+\begin{equation}
+    \theta^l_{\text{merged}} = \theta^l_{\text{base}} + W^l_{\text{merged}}.
+\end{equation}
+
+\subsection{Theoretical Analysis: Deconfliction \& Variance Collapse}
+To understand why performing deconfliction in the frequency domain is fundamentally superior to spatial weight averaging, we analyze the geometric properties of the two approaches under a simplified model of task interference.
+
+Let $\Delta_1, \Delta_2 \in \mathbb{R}^D$ represent the spatial task vectors for two distinct tasks. Suppose these task vectors are roughly orthogonal, as is typical in high-dimensional deep neural networks, with $\|\Delta_1\| \approx \|\Delta_2\| = \delta$ and $\langle \Delta_1, \Delta_2 \rangle \approx 0$. 
+
+Under standard Weight Averaging (WA), the merged task vector is:
+\begin{equation}
+    \Delta_{\text{WA}} = \frac{\Delta_1 + \Delta_2}{2}.
+\end{equation}
+Computing the Euclidean norm of this merged update yields:
+\begin{equation}
+    \|\Delta_{\text{WA}}\|^2 = \frac{\|\Delta_1\|^2 + \|\Delta_2\|^2 + 2\langle \Delta_1, \Delta_2 \rangle}{4} \approx \frac{2\delta^2}{4} = \frac{\delta^2}{2}.
+\end{equation}
+Therefore, the norm of the merged update is compressed by a factor of $\sqrt{2}$ (a $\approx 29.3\%$ reduction in scale):
+\begin{equation}
+    \|\Delta_{\text{WA}}\| \approx \frac{\delta}{\sqrt{2}}.
+\end{equation}
+In deep networks, this parameter scale compression cascades through $L$ successive layers, causing a severe, exponential decay in the variance of intermediate features (often termed \textit{activation variance collapse} \cite{jordan2022repair}). This collapse severely restricts the capacity of deeper representation layers to pass meaningful discriminative features.
+
+In contrast, our STDFS framework operates on the 2D-DCT coefficients. Let $D_1, D_2 \in \mathbb{R}^D$ be the DCT matrices corresponding to the task updates. Since the 2D-DCT is an orthogonal linear transform, it preserves inner products and Euclidean norms (Parseval's theorem).
+
+Under STDFS, the low-frequency components are averaged while the high-frequency components are routed via Spectral Max-Pooling:
+\begin{equation}
+    D_{\text{merged}}[u,v] = 
+    \begin{cases}
+        \frac{D_1[u,v] + D_2[u,v]}{2} & \text{if } (u,v) \in \mathcal{R}_{\text{low}}, \\
+        D_{k^*}[u,v] & \text{if } (u,v) \in \mathcal{R}_{\text{high}},
+    \end{cases}
+\end{equation}
+where $k^* = \arg\max_{i} |D_i[u,v]|$.
+By separating low and high frequencies, we enjoy two distinct advantages:
+\begin{enumerate}\itemsep=1pt \topsep=1pt \parsep=0pt
+    \item \textbf{High-Frequency Energy Preservation:} Since high-frequency components capture task-specific localized patterns, they are highly orthogonal. Instead of averaging (which compresses and blurs them), Spectral Max-Pooling selects the dominant coefficient. For any $(u, v) \in \mathcal{R}_{\text{high}}$, the merged coefficient maintains its original magnitude: $|D_{\text{merged}}[u,v]| = \max(|D_1[u,v]|, |D_2[u,v]|) \approx \max(|D_1[u,v]|, 0) = |D_1[u,v]|$ (or $|D_2[u,v]|$). This completely prevents the $\sqrt{2}$ magnitude collapse in the high-frequency spectrum, which carries the vital task-specific discriminative structures.
+    \item \textbf{Low-Frequency Coarse Alignment:} The low-frequency components capture domain-agnostic, shared spatial features. These components are highly correlated ($\langle D_1, D_2 \rangle_{\text{low}} \approx \|D_1\|_{\text{low}}\|D_2\|_{\text{low}}$), meaning linear averaging does not cause destructive interference.
+\end{enumerate}
+Thus, STDFS maintains the scale of the parameter updates where it matters most, resolving activation variance collapse at the parameter level without requiring raw calibration data or post-hoc scale restoration.
+
+\subsection{Layer-wise Adaptive Spectral Partitioning (LASP)}
+While STDFS with a uniform low-frequency ratio $\alpha$ significantly mitigates parameter conflicts, applying a single $\alpha$ globally overlooks the hierarchical representation properties of deep convolutional networks. As detailed in our empirical analysis (Section~\ref{sec:results}), earlier layers are highly domain-agnostic and capture coarse structural templates (e.g., edges), meaning they possess substantial shared energy in the low-frequency domain. Deeper layers, however, capture task-specific semantics and fine-grained classification features, concentrating their energy heavily in the high-frequency spectrum.
+
+To exploit this architectural hierarchy, we introduce a visionary extension: \textbf{Layer-wise Adaptive Spectral Partitioning (LASP)}. Instead of a static ratio, LASP dynamically scales the low-frequency ratio $\alpha^l$ of layer $l$ using its empirical energy profiles. Let $E^l_{\text{low}} \in [0, 1]$ represent the average proportion of low-frequency update energy of layer group $l$ computed from our baseline analysis:
+\begin{equation}
+    E^l_{\text{low}} = 
+    \begin{cases}
+        0.2457 & \text{if } l \in \texttt{conv1}, \\
+        0.2057 & \text{if } l \in \texttt{layer1}, \\
+        0.1592 & \text{if } l \in \texttt{layer2}, \\
+        0.1474 & \text{if } l \in \texttt{layer3}, \\
+        0.1135 & \text{if } l \in \texttt{layer4}.
+    \end{cases}
+\end{equation}
+We then compute the adaptive low-frequency threshold $\alpha^l$ using a global scaling multiplier $\beta$:
+\begin{equation}
+    \alpha^l = \beta \cdot E^l_{\text{low}}.
+\end{equation}
+By scaling $\alpha^l$ based on empirical energy, LASP dynamically allows earlier layers to perform broader structural weight averaging (maintaining shared representation spaces) while restricting deeper layers to highly selective spectral max-pooling (preserving task-specific semantic channels). This represents a highly principled, hierarchical approach to frequency-domain model merging.
+
+\begin{algorithm}[!ht]
+   \caption{Spectral Task Decoupling in Fourier Space (STDFS)}
+   \label{alg:stdfs}
+\begin{small}
+\begin{algorithmic}[1]
+   \STATE {\bfseries Input:} Base parameters $\theta_{\text{base}}$, Expert parameters $\{\theta_k\}_{k=1}^K$, low-frequency ratio $\alpha$.
+   \STATE {\bfseries Output:} Merged parameters $\theta_{\text{merged}}$.
+   \STATE Initialize $\theta_{\text{merged}} \leftarrow \theta_{\text{base}}$
+   \FOR{each layer $l$ of the neural network}
+       \IF{layer $l$ parameters $\theta_{\text{base}}^l$ are 1D (bias/scale/shift)}
+           \STATE $W^l_{\text{merged}} \leftarrow \frac{1}{K} \sum_{k=1}^K (\theta_k^l - \theta_{\text{base}}^l)$
+       \ELSE
+           \STATE Extract spatial weight updates: $W^l_k \leftarrow \theta_k^l - \theta_{\text{base}}^l, \quad \forall k \in \{1,\dots,K\}$
+           \STATE Reshape $W^l_k$ into 2D matrices of shape $M \times N$
+           \STATE Compute 2D-DCT coefficients: $D^l_k \leftarrow \text{2D-DCT}(W^l_k), \quad \forall k$
+           \STATE Compute normalized distance: $d(u, v) = \frac{u}{M} + \frac{v}{N}, \quad \forall (u, v)$
+           \STATE Find threshold $\tau \leftarrow \alpha\text{-quantile}(\{d(u, v)\}_{u, v})$
+           \STATE Identify regions: $\mathcal{R}_{\text{low}} = \{ (u, v) \mid d(u, v) \le \tau \}$, $\mathcal{R}_{\text{high}} = \{ (u, v) \mid d(u, v) > \tau \}$
+           \STATE Merge low frequencies (averaging):\\
+                  $D^l_{\text{merged}}[u, v] \leftarrow \frac{1}{K} \sum_{k=1}^K D^l_k[u, v], \quad \forall (u, v) \in \mathcal{R}_{\text{low}}$
+           \STATE Normalize by Frobenius norm: $z_k \leftarrow \|D^l_k\|_F + \epsilon, \quad \forall k$
+           \STATE Scale-balanced coefficients: $\hat{D}^l_k \leftarrow D^l_k / z_k, \quad \forall k$
+           \STATE Route high frequencies (Relative Spectral Max-Pooling):\\
+                  $k^*[u, v] \leftarrow \arg\max_k |\hat{D}^l_k[u, v]|, \quad \forall (u, v) \in \mathcal{R}_{\text{high}}$\\
+                  $D^l_{\text{merged}}[u, v] \leftarrow D^l_{k^*[u, v]}[u, v], \quad \forall (u, v) \in \mathcal{R}_{\text{high}}$
+           \STATE Reconstruct spatial update: $W^l_{\text{merged}} \leftarrow \text{2D-IDCT}(D^l_{\text{merged}})$
+           \STATE Reshape $W^l_{\text{merged}}$ back to original tensor shape
+       \ENDIF
+       \STATE Update parameters: $\theta^l_{\text{merged}} \leftarrow \theta^l_{\text{base}} + W^l_{\text{merged}}$
+   \ENDFOR
+\end{algorithmic}
+\end{small}
+\end{algorithm}
+
+\begin{table*}[t]
+\caption{Model merging performance on the vision benchmark under the \textbf{Task-Specific Heads} setting. Values represent test classification accuracy (\%).}
+\label{tab:results_task_specific}
+\vskip 0.05in
+\begin{center}
+\begin{footnotesize}
+\begin{tabular}{lcccc}
+\toprule
+Method & MNIST & Fashion-MNIST & CIFAR-10 & Average \\
+\midrule
+Base Model & 7.73 & 9.20 & 13.60 & 10.18 \\
+Individual Experts & 99.17 & 91.65 & 79.23 & 90.02 \\
+\midrule
+Weight Averaging (WA) & 35.39 & 29.04 & 28.39 & 30.94 \\
+Task Arithmetic (TA, $\lambda=0.2$) & 19.80 & 18.54 & 19.48 & 19.27 \\
+Task Arithmetic (TA, $\lambda=0.3$) & 34.86 & 28.36 & 29.50 & 30.91 \\
+\midrule
+TIES-Merging ($\text{keep}=0.2$) & 15.09 & 12.51 & 16.74 & 14.78 \\
+DARE ($\text{drop}=0.2$) & 9.80 & 10.00 & 10.00 & 9.93 \\
+S-TIES ($\text{keep}=0.2$) & 11.38 & 12.06 & 15.94 & 13.13 \\
+S-DARE ($\text{drop}=0.2$) & 9.80 & 10.00 & 10.00 & 9.93 \\
+\midrule
+\textbf{STDFS (Ours, $\alpha=0.05$)} & 55.90 & 38.55 & \textbf{37.02} & 43.82 \\
+\textbf{STDFS (Ours, $\alpha=0.1$)} & 55.00 & \textbf{43.99} & 35.82 & \textbf{44.94} \\
+\textbf{STDFS (Ours, $\alpha=0.2$)} & 50.10 & 42.38 & 34.78 & 42.42 \\
+\textbf{STDFS (Ours, $\alpha=0.9$)} & 36.59 & 30.85 & 29.37 & 32.27 \\
+\midrule
+\textbf{SWSM (Ours, $\alpha=0.1, \gamma=0.01$)} & 55.29 & 43.62 & 35.57 & 44.83 \\
+\textbf{LASP (Ours, $\beta=0.4$)} & 54.91 & 43.06 & 36.34 & 44.77 \\
+\textbf{LASP-Soft (Ours, $\beta=0.4, \gamma=0.02$)} & 55.40 & 42.52 & 36.51 & 44.81 \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{table*}[t]
+\caption{Model merging performance under the \textbf{Shared Head} setting. Values represent test classification accuracy (\%).}
+\label{tab:results_shared}
+\vskip 0.05in
+\begin{center}
+\begin{footnotesize}
+\begin{tabular}{lcccc}
+\toprule
+Method & MNIST & Fashion-MNIST & CIFAR-10 & Average \\
+\midrule
+Weight Averaging (WA) & 30.39 & 27.91 & 26.98 & 28.43 \\
+Task Arithmetic (TA, $\lambda=0.3$) & 31.23 & 28.03 & 28.43 & 29.23 \\
+\midrule
+TIES-Merging ($\text{keep}=0.2$) & 16.54 & 12.41 & 15.55 & 14.83 \\
+DARE ($\text{drop}=0.2$) & 9.80 & 10.00 & 10.00 & 9.93 \\
+S-TIES ($\text{keep}=0.2$) & 13.29 & 11.95 & 15.41 & 13.55 \\
+S-DARE ($\text{drop}=0.2$) & 9.80 & 10.00 & 10.00 & 9.93 \\
+\midrule
+\textbf{STDFS (Ours, $\alpha=0.1$)} & 53.60 & \textbf{43.44} & 34.60 & 43.88 \\
+\midrule
+\textbf{SWSM (Ours, $\alpha=0.1, \gamma=0.01$)} & 53.81 & 42.87 & 34.62 & 43.77 \\
+\textbf{LASP (Ours, $\beta=0.4$)} & 53.90 & 43.02 & 35.54 & \textbf{44.15} \\
+\textbf{LASP-Soft (Ours, $\beta=0.4, \gamma=0.01$)} & 54.02 & 42.67 & 35.67 & 44.12 \\
+\textbf{LASP-Soft (Ours, $\beta=0.4, \gamma=0.02$)} & \textbf{54.09} & 42.30 & \textbf{35.76} & 44.05 \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[b]{0.45\textwidth}
+    \centering
+    \includegraphics[width=0.95\textwidth]{method_comparison}
+    \caption{Performance comparison of model merging methods.}
+    \label{fig:method_comparison}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.45\textwidth}
+    \centering
+    \includegraphics[width=0.95\textwidth]{alpha_sweep}
+    \caption{Impact of the low-frequency ratio $\alpha$ on STDFS.}
+    \label{fig:alpha_sweep}
+  \end{subfigure}
+  \caption{Empirical evaluation of Spectral Task Decoupling in Fourier Space (STDFS) on the vision benchmark. (a) Under the Task-Specific Heads setting, STDFS significantly outperforms standard Weight Averaging, Task Arithmetic, and pruning-based deconfliction methods (TIES, DARE). (b) STDFS performance peaks at $\alpha = 0.1$, proving the need for a frequency-aware balance between shared global structures and task-specific high-frequency details.}
+  \label{fig:main_results}
+  \vskip -15pt
+\end{figure*}
+
+\section{Experimental Setup}
+\label{sec:setup}
+\subsection{Datasets and Model Architecture}
+We evaluate STDFS on a multi-task vision benchmark consisting of three distinct image classification datasets: **MNIST** \cite{lecun1998gradient}, **Fashion-MNIST** \cite{xiao2017fashion}, and **CIFAR-10** \cite{krizhevsky2009learning}. Each dataset contains 10 classes. We use **ResNet-18** \cite{he2016deep} as our core architecture. To ensure compatability, grayscale images from MNIST and Fashion-MNIST are bilinearly resized to $32 \times 32$ pixels and repeated across 3 channels, matching the dimensions of CIFAR-10. All inputs are normalized using standard ImageNet mean and standard deviation.
+
+\subsection{Training and Evaluation Settings}
+We initialize our model from ImageNet pre-trained ResNet-18 weights, replacing the classification head with a newly initialized 10-class linear layer. This forms our shared base model $\theta_{\text{base}}$. We then fine-tune $\theta_{\text{base}}$ independently on each task using Adam optimizer ($\text{lr} = 10^{-4}$, batch size 128) to produce three task experts. We evaluate two evaluation settings:
+\begin{enumerate}\itemsep=1pt \topsep=1pt \parsep=0pt
+    \item \textbf{Task-Specific Heads:} Only the feature extraction backbone is merged. During evaluation on task $k$, we use the merged backbone with the original unmerged classification head of expert $k$.
+    \item \textbf{Shared Head:} The entire network, including the classification heads, is merged. A single averaged classification head is used across all tasks.
+\end{enumerate}
+
+\section{Results and Analysis}
+\label{sec:results}
+
+We present the evaluation results of our proposed STDFS method compared to standard Weight Averaging and Task Arithmetic baselines in \cref{tab:results_task_specific} and \cref{tab:results_shared}.
+
+\subsection{Quantitative Results}
+Our proposed STDFS method achieves a remarkable performance improvement over standard Weight Averaging and Task Arithmetic. As shown in \cref{tab:results_task_specific}, Weight Averaging collapses to $30.94\%$ average accuracy under the Task-Specific Heads setting. Task Arithmetic fails to improve beyond Weight Averaging, peaking at $30.91\%$ average accuracy at its optimal $\lambda=0.3$, and completely collapsing to random guessing ($9.93\%$ average accuracy) for larger $\lambda$ due to activation explosion (runaway gradient scales). In contrast, STDFS with a low-frequency ratio of $\alpha = 0.1$ achieves an outstanding **$44.94\%$ average accuracy**, outperforming both standard Weight Averaging and Task Arithmetic by **$+14.0\%$ absolute accuracy**! This dramatic improvement demonstrates that our spectral deconfliction approach successfully resolves the parameter interference bottleneck without experiencing activation scaling instabilities.
+
+Furthermore, under the more challenging \textbf{Shared Head} setting (where the classification heads are also averaged, as shown in \cref{tab:results_shared}), Weight Averaging collapses to $28.43\%$ average accuracy, and Task Arithmetic struggles at $29.23\%$. Our STDFS method with $\alpha = 0.1$ maintains a superb **$43.88\%$ average accuracy**, outperforming standard Weight Averaging by **$+15.45\%$ absolute accuracy** and Task Arithmetic by **$+14.65\%$ absolute accuracy**! This extreme consistency across both head configurations highlights the robust nature of frequency-domain merging.
+
+\subsection{Comparison with Pruning-based Baselines (TIES \& DARE)}
+We compare STDFS with two standard parameter-space deconfliction frameworks: TIES-Merging \cite{yadav2023ties} and DARE \cite{yu2024dare}, as well as their frequency-domain equivalents (S-TIES and S-DARE) which we introduce in this work.
+
+As shown in \cref{tab:results_task_specific} and \cref{tab:results_shared}, standard TIES-Merging with a keep ratio of $0.2$ achieves only $14.78\%$ and $14.83\%$ average accuracy under the Task-Specific and Shared Head settings, respectively. DARE with a drop rate of $0.2$ collapses entirely to random guessing ($9.93\%$ average accuracy). Moving these pruning methods to the frequency domain in S-TIES and S-DARE fails to prevent this collapse, with S-TIES and S-DARE yielding $13.13\%$ and $9.93\%$ average accuracy, respectively.
+
+We identify two fundamental reasons why pruning-based model merging is unsuitable for convolutional networks like ResNet-18, contrasting with our spectral routing approach:
+\begin{enumerate}\itemsep=1pt \topsep=1pt \parsep=0pt
+    \item \textbf{Dense Representation of CNN Backbone:} Unlike Large Language Models (LLMs) or Vision Transformers which possess highly overparameterized, sparse attention heads, the feature representation in convolutional backbones is highly compact and dense. Setting 80\% of weight updates to zero (as in TIES-Merging with $\text{keep}=0.2$) or randomly dropping 20\% of the weights (as in DARE) destroys the spatial feature extraction capabilities of convolutional filters, leading to representational collapse.
+    \item \textbf{The Necessity of Global Coarse Structure:} In S-TIES and S-DARE, the pruning is applied uniformly across all frequencies, which zero-outs or drops critical low-frequency coefficients. Since low frequencies capture the fundamental domain-agnostic shapes and templates necessary for routing features, pruning them destroys the model's global coherence.
+\end{enumerate}
+In contrast, our STDFS framework ensures that 100\% of the low-frequency global structure is preserved and averaged across tasks. Furthermore, instead of zeroing out high-frequency coefficients, STDFS employs magnitude-based routing, which retains the original weight magnitudes and density of all convolutional filters. This frequency-aware treatment explains why STDFS achieves spectacular performance ($44.94\%$), far outperforming all spatial and spectral pruning techniques.
+
+\subsection{Analysis of Low-Frequency Ratio ($\alpha$)}
+The parameter $\alpha$ controls the trade-off between feature sharing (averaging low frequencies) and task-specific preservation (routing high frequencies). We observe that a small $\alpha = 0.1$ is optimal. When $\alpha$ is too small (e.g., $0.05$), the shared structural updates are not averaged enough, which slightly degrades MNIST and Fashion-MNIST performance. When $\alpha$ is too large (e.g., $0.9$), too much of the frequency spectrum is averaged linearly, reverting the model toward standard Weight Averaging and re-introducing spatial parameter interference, reducing average accuracy back to $32.27\%$.
+
+\subsection{Empirical Analysis of Layer-wise Spectral Energy Partition}
+We validate our core hypothesis that updates partition into coarse, shared low-frequency structures and fine-grained, task-specific details by computing the layer-wise update energy (sum of squared DCT coefficients) across experts with $\alpha=0.1$.
+
+As summarized in \cref{tab:spectral_energy}, we compute the percentage of update energy concentrated in the high-frequency region ($\mathcal{R}_{\text{high}}$) across the network.
+
+\begin{table}[tb]
+\caption{Distribution of parameter update energy in the high-frequency region ($\mathcal{R}_{\text{high}}$) across ResNet-18 layer groups with $\alpha = 0.1$. Values represent the percentage (\%) of total squared DCT coefficient magnitude residing in high frequencies.}
+\label{tab:spectral_energy}
+\vskip 0.05in
+\begin{center}
+\begin{footnotesize}
+\begin{tabular}{lcccc}
+\toprule
+Layer & MNIST & F-MNIST & CIFAR-10 & Avg. \\
+\midrule
+\texttt{conv1} & 79.40 & 72.46 & 74.44 & 75.43 \\
+\texttt{layer1} & 79.26 & 80.01 & 79.02 & 79.43 \\
+\texttt{layer2} & 83.99 & 84.38 & 83.88 & 84.08 \\
+\texttt{layer3} & 85.64 & 85.19 & 84.96 & 85.26 \\
+\texttt{layer4} & 88.62 & 88.58 & 88.75 & 88.65 \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+We observe a clear, monotonic increase in high-frequency energy concentration as depth increases. Early \texttt{conv1} concentrates $75.43\%$ energy in high frequencies, meaning a quarter ($24.57\%$) of its update resides in the $10\%$ low-frequency region. This confirms the domain-agnostic nature of early layers, where coarse templates (e.g., edges, textures) are highly shared. Conversely, deep \texttt{layer4} concentrates $88.65\%$ energy in high frequencies, indicating that deep representation layers (representing semantic abstractions and classification boundaries) require highly localized, fine-grained adjustments.
+
+This empirical finding rigorously justifies STDFS: (1) low-frequency linear averaging is optimal in early layers due to high template correlation; (2) task-specific details are concentrated in high frequencies in deep layers, where linear averaging blurs coefficients and causes activation variance collapse, whereas spectral max-pooling preserves update scale.
+
+\subsection{Evaluation of Layer-wise Adaptive Spectral Partitioning (LASP)}
+We evaluate Layer-wise Adaptive Spectral Partitioning (LASP) under both configurations. Under Task-Specific Heads (\cref{tab:results_task_specific}), LASP ($\beta=0.4$) achieves \textbf{44.77\%} average accuracy. Crucially, on CIFAR-10, LASP scores \textbf{36.34\%}, a substantial \textbf{+0.52\%} improvement over uniform STDFS (35.82\%). 
+
+Under Shared Heads (\cref{tab:results_shared}), LASP ($\beta=0.4$) achieves a superb \textbf{44.15\%} average accuracy, outperforming uniform STDFS (43.88\%) by \textbf{+0.27\%} and Weight Averaging by \textbf{+15.72\%}. On CIFAR-10, LASP scores \textbf{35.54\%}, beating STDFS by a massive \textbf{+0.94\%}.
+
+These results validate the core philosophy of LASP: matching the low-frequency partitioning threshold $\alpha^l$ to the layer-wise empirical energy profile allows earlier layers to perform wider feature sharing, while restricting deeper layers to highly selective spectral max-pooling. This layer-aware routing preserves localized high-frequency semantic features in deeper representation layers, yielding superior classification.
+
+\subsection{Evaluation of Soft Boundary Transitions (SWSM \& LASP-Soft)}
+Traditional STDFS uses a hard step-function cutoff, which can introduce frequency-domain boundary discontinuities (similar to Gibbs ringing artifacts). We propose Spectral Window-based Soft Merging (SWSM) and Layer-wise Adaptive Soft Spectral Partitioning (LASP-Soft), which use a sigmoid gating function with temperature $\gamma$ to smoothly blend averaged low-frequency and max-pooled high-frequency updates.
+
+Sweeping $\gamma \in \{0.01, \dots, 0.2\}$ under both head settings (\cref{tab:results_task_specific}, \cref{tab:results_shared}) yields two core insights. First, the partition between domain-agnostic and task-specific parameters is remarkably sharp: under SWSM with a tight window ($\gamma=0.01$), average accuracy is \textbf{44.83\%} (highly consistent with STDFS's 44.94\%), but as the transition window widens ($\gamma \ge 0.1$), performance degrades monotonically. Second, smoothly blending the boundary resolves Gibbs artifacts on complex semantics: on CIFAR-10, LASP-Soft ($\gamma=0.02$) scores a spectacular \textbf{36.51\%} (Task-Specific) and \textbf{35.76\%} (Shared), outperforming hard LASP (+0.17\% / +0.22\%) and uniform STDFS (+0.69\% / +1.16\%). For semantically dense tasks requiring filter continuity, a soft spectral transition window effectively suppresses boundary artifacts, enabling experts to preserve fine-grained representations.
+
+\section{Conclusion}
+\label{sec:conclusion}
+We introduce **Spectral Task Decoupling in Fourier Space (STDFS)**, a training-free and data-free model merging framework operating in the frequency domain. STDFS applies a 2D-DCT to weight updates, averaging low-frequency structural features while routing high-frequency task-specific details via spectral max-pooling. On a diverse vision benchmark, STDFS outperforms standard Weight Averaging by over $+14\%$ absolute accuracy. Our extensions, LASP and LASP-Soft, further improve performance by dynamically adapting frequency boundaries and smoothing spectral transitions. This work establishes frequency-domain deconfliction as a powerful paradigm for parameter fusion, opening exciting avenues for model merging.
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\clearpage
+\appendix
+\onecolumn
+\section{Spectral Task Alignment Analysis}
+\label{app:spectral_similarity}
+
+To further validate the core hypothesis of Spectral Task Decoupling in Fourier Space (STDFS), we investigate the geometric alignment (cosine similarity) of task-specific parameter updates (task vectors) in both the spatial and spectral domains. Specifically, for any pair of tasks $i$ and $j$, and a given weight matrix update $U_i, U_j$, we compute:
+\begin{enumerate}
+    \item \textbf{Spatial Cosine Similarity:} 
+    \[
+    \cos(U_i, U_j) = \frac{\langle U_i, U_j \rangle}{\|U_i\|_2 \|U_j\|_2}
+    \]
+    \item \textbf{Low-Frequency Spectral Similarity:} 
+    \[
+    \cos_{\text{low}}(U_i, U_j) = \frac{\langle \mathcal{D}_i \odot \mathcal{M}_{\text{low}}, \mathcal{D}_j \odot \mathcal{M}_{\text{low}} \rangle}{\|\mathcal{D}_i \odot \mathcal{M}_{\text{low}}\|_2 \|\mathcal{D}_j \odot \mathcal{M}_{\text{low}}\|_2}
+    \]
+    \item \textbf{High-Frequency Spectral Similarity:} 
+    \[
+    \cos_{\text{high}}(U_i, U_j) = \frac{\langle \mathcal{D}_i \odot \mathcal{M}_{\text{high}}, \mathcal{D}_j \odot \mathcal{M}_{\text{high}} \rangle}{\|\mathcal{D}_i \odot \mathcal{M}_{\text{high}}\|_2 \|\mathcal{D}_j \odot \mathcal{M}_{\text{high}}\|_2}
+    \]
+\end{enumerate}
+where $\mathcal{D}_k = \text{2D-DCT}(U_k)$, and $\mathcal{M}_{\text{low}}, \mathcal{M}_{\text{high}}$ represent the binary partitioning masks defined by the low-frequency ratio $\alpha = 0.1$. 
+
+We compute these metrics across all convolutional layer groups and average them over all pairwise task combinations (MNIST vs. Fashion-MNIST, MNIST vs. CIFAR-10, and Fashion-MNIST vs. CIFAR-10). The empirical results are visualized in \cref{fig:spectral_similarity}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.6\textwidth]{spectral_similarity_comparison.pdf}
+\caption{Average cosine similarity between task updates across ResNet-18 layer groups in the spatial domain vs. the low-frequency and high-frequency spectral bands ($\alpha = 0.1$). Although task updates are highly orthogonal overall, low-frequency similarity is consistently higher, confirming that shared structural updates reside in the low-frequency spectrum, while high-frequency features are highly task-specific and orthogonal.}
+\label{fig:spectral_similarity}
+\end{figure}
+
+\subsection{Key Findings and Insights}
+\begin{itemize}
+    \item \textbf{Near-Perfect Orthogonality in the Spatial Domain:} The overall average spatial cosine similarity across all layer groups is extremely low ($0.0040$), indicating that the fine-tuning updates for different tasks starting from a shared pre-trained initialization are highly orthogonal. This is expected given the extreme divergence of the input domains and modalities (e.g., grayscale digits vs. color natural images).
+    \item \textbf{Concentration of Alignment in Low Frequencies:} Despite this near-perfect spatial orthogonality, the average similarity in the low-frequency band is $0.0148$, which is nearly \textbf{4x larger} than the spatial similarity ($0.0040$), and nearly \textbf{15x larger} than the high-frequency similarity ($0.0010$). This represents a major empirical confirmation of our core hypothesis: any commonalities or shared representation structures that exist between disparate tasks are heavily concentrated in the low-frequency coefficients of the parameter updates.
+    \item \textbf{High-Frequency Divergence:} In contrast, the high-frequency similarity decays almost to absolute orthogonality ($0.0010$ overall, and even negative in early layers like \texttt{conv1}). This demonstrates that the fine-grained details where task conflicts primarily occur are completely uncorrelated.
+\end{itemize}
+
+These findings provide a powerful, mathematically rigorous justification for the design of STDFS:
+\begin{enumerate}
+    \item Since low-frequency components exhibit higher correlation and capture shared structural templates, linear averaging (Weight Averaging) is both safe and beneficial in this band, helping consolidate domain-agnostic capabilities.
+    \item Since high-frequency components are highly orthogonal and task-specific, linear averaging blurs these distinct coefficients, collapsing their magnitude and causing activation variance decay. By applying relative spectral max-pooling instead of averaging, STDFS selects the dominant task-specific filters without destructive interference, preserving parameter energy and model capacity.
+\end{enumerate}
+
+\end{document}

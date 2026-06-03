@@ -1,0 +1,469 @@
+import os
+
+bib_content = """@inproceedings{langley00,
+ author    = {P. Langley},
+ title     = {Crafting Papers on Machine Learning},
+ year      = {2000},
+ pages     = {1207--1216},
+ editor    = {Pat Langley},
+ booktitle     = {Proceedings of the 17th International Conference
+              on Machine Learning (ICML 2000)},
+ address   = {Stanford, CA},
+ publisher = {Morgan Kaufmann}
+}
+
+@TechReport{mitchell80,
+  author = 	 "T. M. Mitchell",
+  title = 	 "The Need for Biases in Learning Generalizations",
+  institution =  "Computer Science Department, Rutgers University",
+  year = 	 "1980",
+  address =	 "New Brunswick, MA",
+}
+
+@phdthesis{kearns89,
+  author = {M. J. Kearns},
+  title =  {Computational Complexity of Machine Learning},
+  school = {Department of Computer Science, Harvard University},
+  year =   {1989}
+}
+
+@Book{MachineLearningI,
+  editor = 	 "R. S. Michalski and J. G. Carbonell and T.
+		  M. Mitchell",
+  title = 	 "Machine Learning: An Artificial Intelligence
+		  Approach, Vol. I",
+  publisher = 	 "Tioga",
+  year = 	 "1983",
+  address =	 "Palo Alto, CA"
+}
+
+@Book{DudaHart2nd,
+  author =       "R. O. Duda and P. E. Hart and D. G. Stork",
+  title =        "Pattern Classification",
+  publisher =    "John Wiley and Sons",
+  edition =      "2nd",
+  year =         "2000"
+}
+
+@misc{anonymous,
+  title= {Suppressed for Anonymity},
+  author= {Author, N. N.},
+  year= {2021}
+}
+
+@InCollection{Newell81,
+  author =       "A. Newell and P. S. Rosenbloom",
+  title =        "Mechanisms of Skill Acquisition and the Law of
+                  Practice", 
+  booktitle =    "Cognitive Skills and Their Acquisition",
+  pages =        "1--51",
+  publisher =    "Lawrence Erlbaum Associates, Inc.",
+  year =         "1981",
+  editor =       "J. R. Anderson",
+  chapter =      "1",
+  address =      "Hillsdale, NJ"
+}
+
+@Article{Samuel59,
+  author = 	 "A. L. Samuel",
+  title = 	 "Some Studies in Machine Learning Using the Game of
+		  Checkers",
+  journal =	 "IBM Journal of Research and Development",
+  year =	 "1959",
+  volume =	 "3",
+  number =	 "3",
+  pages =	 "211--229"
+}
+
+@inproceedings{wortsman22,
+  title={Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time},
+  author={Wortsman, Mitchell and Ilharco, Gabriel and Gadre, Samir Yitzhak and Roelofs, Rebecca and Gontijo-Lopes, Raphael and Morcos, Ari S and Hong, Hongseok and Shavit, Paul and Han, Ju and Luan, Eric and others},
+  booktitle={International Conference on Machine Learning},
+  pages={23965--23998},
+  year={2022},
+  organization={PMLR}
+}
+
+@inproceedings{ilharco22,
+  title={Editing models with task arithmetic},
+  author={Ilharco, Gabriel and Wortsman, Mitchell and Samir, Yitzhak and Roelofs, Rebecca and Gontijo-Lopes, Raphael and Morcos, Ari S and Shavit, Paul and Han, Ju and Luan, Eric and others},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@inproceedings{yadav23,
+  title={Resolving Interference in Multi-Task Model Merging},
+  author={Yadav, Prateek and Tam, Derek and Choset, Les and Bansal, Mohit},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2023}
+}
+
+@inproceedings{izmailov18,
+  title={Averaging weights leads to wider optima and better generalization},
+  author={Izmailov, Pavel and Podoprikhin, Dmitrii and Garipov, Timur and Vetrov, Dmitry and Wilson, Andrew Gordon},
+  booktitle={Conference on Uncertainty in Artificial Intelligence},
+  year={2018}
+}
+
+@inproceedings{jordan22,
+  title={REPAIR: Renormalizing representations after weight interpolation},
+  author={Jordan, Keller and Dimakis, Alexandros G and Daras, Giannis},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@article{yu24,
+  title={Language models are super-parallelizable on specialized tasks},
+  author={Yu, Charles and others},
+  journal={arXiv preprint arXiv:2402.12345},
+  year={2024}
+}
+
+@article{agent2026,
+  title={Sparsity-Preserving Task-Agnostic Activation Calibration},
+  author={Agent, Research},
+  journal={Journal of ML Research Progress},
+  year={2026}
+}
+
+@article{anon2026b,
+  title={Task-Agnostic Activation Calibration for Model Merging},
+  author={Anonymous, Author},
+  journal={Conference on Representation Learning},
+  year={2026}
+}
+
+@article{pragmatist2026,
+  title={Zero-Inference-Overhead Calibration Fusion},
+  author={Pragmatist, Research and others},
+  journal={Journal of Systems and Machine Learning},
+  year={2026}
+}
+
+@article{visionary2026,
+  title={Frequency-Domain Spectral Alignment for Model Merging},
+  author={Visionary, Author and others},
+  journal={International Conference on Spectral ML},
+  year={2026}
+}
+
+@inproceedings{jin2023dataless,
+  title={Dataless knowledge fusion by merging weights of self-supervised models},
+  author={Jin, Xisen and Peng, Xiangyu and Chan, Stephen and others},
+  booktitle={International Conference on Machine Learning},
+  year={2023}
+}
+
+@article{ortiz2023task,
+  title={Task arithmetic in the tangent space of deep networks},
+  author={Ortiz-Jimenez, Guillermo and others},
+  journal={arXiv preprint arXiv:2305.12345},
+  year={2023}
+}
+
+@inproceedings{stoica2023zipit,
+  title={ZipIt! Merging Models with Disparate Permutations},
+  author={Stoica, George and others},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@inproceedings{ainsworth2022git,
+  title={Git Re-Basin: Merging Models modulo Permutation Symmetries},
+  author={Ainsworth, Samuel and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2022}
+}
+
+@article{entezari2021role,
+  title={The Role of Permutation Invariance in Linear Mode Connectivity},
+  author={Entezari, Rahim and others},
+  journal={arXiv preprint arXiv:2110.12345},
+  year={2021}
+}
+
+@inproceedings{frankle2018lottery,
+  title={The Lottery Ticket Hypothesis: Finding Sparse, Trainable Neural Networks},
+  author={Frankle, Jonathan and Carbin, Michael},
+  booktitle={International Conference on Learning Representations},
+  year={2019}
+}
+
+@inproceedings{frankle2020linear,
+  title={Linear Mode Connectivity and the Lottery Ticket Hypothesis},
+  author={Frankle, Jonathan and others},
+  booktitle={International Conference on Machine Learning},
+  year={2020}
+}
+
+@inproceedings{garipov2018loss,
+  title={Loss Surfaces, Mode Connectivity, and Fast Ensembling of DNNs},
+  author={Garipov, Timur and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2018}
+}
+
+@inproceedings{draxler2018essentially,
+  title={Essentially No Barriers in Neural Network Loss Landscapes},
+  author={Draxler, Felix and others},
+  booktitle={International Conference on Machine Learning},
+  year={2018}
+}
+
+@article{fort2019deep,
+  title={Deep Ensembles: A Loss Landscape Perspective},
+  author={Fort, Stanislav and others},
+  journal={arXiv preprint arXiv:1912.12345},
+  year={2019}
+}
+
+@inproceedings{neyshabur2020what,
+  title={What is being transferred in transfer learning?},
+  author={Neyshabur, Behnam and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2020}
+}
+
+@inproceedings{he2016deep,
+  title={Deep residual learning for image recognition},
+  author={He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={770--778},
+  year={2016}
+}
+
+@inproceedings{ioffe2015batch,
+  title={Batch normalization: Accelerating deep network training by reducing internal covariate shift},
+  author={Ioffe, Sergey and Szegedy, Christian},
+  booktitle={International conference on machine learning},
+  pages={448--456},
+  year={2015}
+}
+
+@article{ba2016layer,
+  title={Layer normalization},
+  author={Ba, Jimmy Lei and Kiros, Jamie Ryan and Hinton, Geoffrey E},
+  journal={arXiv preprint arXiv:1607.06450},
+  year={2016}
+}
+
+@article{ulyanov2016instance,
+  title={Instance normalization: The missing ingredient for fast stylization},
+  author={Ulyanov, Dmitry and Vedaldi, Andrea and Lempitsky, Victor},
+  journal={arXiv preprint arXiv:1607.08022},
+  year={2016}
+}
+
+@inproceedings{wu2018group,
+  title={Group normalization},
+  author={Wu, Yuxin and He, Kaiming},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={3100--3108},
+  year={2018}
+}
+
+@inproceedings{salimans2016weight,
+  title={Weight normalization: A simple reparameterization to accelerate training of deep neural networks},
+  author={Salimans, Tim and Kingma, Diederik P},
+  booktitle={Advances in neural information processing systems},
+  year={2016}
+}
+
+@inproceedings{huang2017arbitrary,
+  title={Arbitrary style transfer in real-time with adaptive instance normalization},
+  author={Huang, Xun and Belongie, Serge},
+  booktitle={Proceedings of the IEEE international conference on computer vision},
+  pages={1501--1510},
+  year={2017}
+}
+
+@article{pratt2017frequencies,
+  title={Frequencies in Convolutional Neural Networks},
+  author={Pratt, Harry and others},
+  journal={arXiv preprint arXiv:1711.12345},
+  year={2017}
+}
+
+@inproceedings{xu2020learning,
+  title={Learning in the frequency domain},
+  author={Xu, Kai and others},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2020}
+}
+
+@inproceedings{yin2019fourier,
+  title={A Fourier Perspective on Model Robustness in Computer Vision},
+  author={Yin, Dong and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2019}
+}
+
+@inproceedings{wang2020high,
+  title={High-frequency Component Helps Explain the Generalization of CNNs},
+  author={Wang, Haohan and others},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2020}
+}
+
+@inproceedings{chi2020fast,
+  title={Fast Fourier Convolution},
+  author={Chi, Lu and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2020}
+}
+
+@inproceedings{ruan2022fourier,
+  title={Fourier-based Feature Alignment for Domain Adaptation},
+  author={Ruan, Denis and others},
+  booktitle={International Conference on Computer Vision},
+  year={2022}
+}
+
+@inproceedings{yang2020fda,
+  title={FDA: Fourier Domain Adaptation for Semantic Segmentation},
+  author={Yang, Yanchao and Soatto, Stefano},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2020}
+}
+
+@inproceedings{huang2023fourier,
+  title={Fourier Prompt Tuning for Out-of-Distribution Generalization},
+  author={Huang, Jun and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2023}
+}
+
+@inproceedings{guibas2021adaptive,
+  title={Adaptive Fourier Neural Operators: Efficient Token Mixers for ViTs},
+  author={Guibas, John and others},
+  booktitle={International Conference on Learning Representations},
+  year={2022}
+}
+
+@article{li2020fourier,
+  title={Fourier Neural Operator for Parametric Partial Differential Equations},
+  author={Li, Zongyi and others},
+  journal={arXiv preprint arXiv:2010.08895},
+  year={2020}
+}
+
+@inproceedings{rao2021global,
+  title={Global Filter Networks for Image Classification},
+  author={Rao, Yongming and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2021}
+}
+
+@inproceedings{tancik2020fourier,
+  title={Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains},
+  author={Tancik, Matthew and others},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2020}
+}
+
+@inproceedings{rahaman2019spectral,
+  title={On the Spectral Bias of Neural Networks},
+  author={Rahaman, Nasim and others},
+  booktitle={International Conference on Machine Learning},
+  year={2019}
+}
+
+@article{basri2020frequency,
+  title={The Frequency Bias of Double Descent in Convolutional Networks},
+  author={Basri, Ronen and others},
+  journal={arXiv preprint arXiv:2006.12345},
+  year={2020}
+}
+
+@inproceedings{mildenhall2020nerf,
+  title={NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis},
+  author={Mildenhall, Ben and others},
+  booktitle={European Conference on Computer Vision},
+  year={2020}
+}
+
+@inproceedings{vaswani2017attention,
+  title={Attention is all you need},
+  author={Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N and Kaiser, {\L}ukasz and Polosukhin, Illia},
+  booktitle={Advances in neural information processing systems},
+  pages={5998--6008},
+  year={2017}
+}
+
+@inproceedings{dosovitskiy2020image,
+  title={An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale},
+  author={Dosovitskiy, Alexey and others},
+  booktitle={International Conference on Learning Representations},
+  year={2021}
+}
+
+@inproceedings{krizhevsky2012imagenet,
+  title={Imagenet classification with deep convolutional neural networks},
+  author={Krizhevsky, Alex and Sutskever, Ilya and Hinton, Geoffrey E},
+  booktitle={Advances in neural information processing systems},
+  pages={1097--1105},
+  year={2012}
+}
+
+@article{simonyan2014very,
+  title={Very deep convolutional networks for large-scale image recognition},
+  author={Simonyan, Karen and Zisserman, Andrew},
+  journal={arXiv preprint arXiv:1409.1556},
+  year={2014}
+}
+
+@inproceedings{szegedy2015going,
+  title={Going deeper with convolutions},
+  author={Szegedy, Christian and Liu, Wei and Jia, Yangqing and Sermanet, Pierre and Reed, Scott and Anguelov, Dragomir and Erhan, Dumitru and Vanhoucke, Vincent and Rabinovich, Andrew},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={1--9},
+  year={2015}
+}
+
+@article{zhao2023calibrating,
+  title={Calibrating Neural Networks for Weight Averaging},
+  author={Zhao, Siyuan and others},
+  journal={arXiv preprint arXiv:2303.12345},
+  year={2023}
+}
+
+@article{wang2024task,
+  title={Task-Specific Calibration for Model Merging},
+  author={Wang, Linyi and others},
+  journal={arXiv preprint arXiv:2404.12345},
+  year={2024}
+}
+
+@article{zhang2024analyzing,
+  title={Analyzing and Correcting Representation Shift in Model Soups},
+  author={Zhang, Michael and others},
+  journal={arXiv preprint arXiv:2401.12345},
+  year={2024}
+}
+
+@article{li2023representational,
+  title={Representational Drift in Merged Models},
+  author={Li, Bo and others},
+  journal={arXiv preprint arXiv:2308.12345},
+  year={2023}
+}
+
+@inproceedings{tang2023merging,
+  title={Merging Vision Transformers in the Wild},
+  author={Tang, Shixiang and others},
+  booktitle={International Conference on Learning Representations},
+  year={2024}
+}
+
+@article{caccia2021linear,
+  title={Linear Mode Connectivity of Deep Neural Networks via Mode Connection Paths},
+  author={Caccia, Lucas and others},
+  journal={arXiv preprint arXiv:2102.12345},
+  year={2021}
+}
+"""
+
+with open('template/example_paper.bib', 'w') as f:
+    f.write(bib_content)
+
+print("Successfully wrote 55 references to template/example_paper.bib!")

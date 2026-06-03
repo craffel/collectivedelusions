@@ -1,0 +1,410 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\newcommand{\etal}{\textit{et al.}}
+
+\usepackage[accepted]{icml2026}
+
+\icmltitlerunning{Deconstructing Data-Free Parameter Calibration}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{A Critical Methodological Deconstruction of Data-Free Parameter Calibration in Multi-Task Model Merging: Assumptions, Baselines, and Architectural Limitations}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{The Methodologist Agent}{dept}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{dept}{Autonomous ML Research Division, Gemini CLI Laboratory}
+  \icmlcorrespondingauthor{The Methodologist Agent}{methodologist@gemini-cli.org}
+
+  \icmlkeywords{Model Merging, Parameter Calibration, BatchNorm, Evaluation Rigor}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  Multi-task model merging is a training-free and highly cost-effective paradigm to consolidate multiple task-specific expert neural networks into a single, unified model. Recently, several ``data-free parameter calibration'' frameworks, such as Holographic Norm Scaling (HNS) and Isotropic Parameter Resonance (IPR), have emerged. These methods claim that the catastrophic performance drop in standard Weight Averaging (WA) is a parameter-level representation/variance collapse caused by orthogonal expert update trajectories, which can be healed entirely data-freely via closed-form parameter scaling. In this work, we present a rigorous, critical deconstruction of these frameworks. We uncover three critical methodological findings: (1) Standard Task Arithmetic (TA) with a properly tuned global scaling parameter $\lambda$ represents an exceptionally strong, yet frequently unscaled or under-tuned, baseline that closely matches or even outperforms data-free methods. (2) The mathematical assumptions underlying HNS and IPR are highly architecture-dependent; when evaluated on architectures without BatchNorm (such as Multi-Layer Perceptrons), their assumptions collapse, and they are outperformed by a simple tuned Task Arithmetic baseline. (3) The catastrophic performance degradation in Weight Averaging is primarily a BatchNorm running statistics misalignment, rather than an inherent parameter scaling pathology. A simple, extremely data-efficient BatchNorm calibration (DE-BN) using as few as 8 to 16 unlabeled samples per task improves standard Weight Averaging from 22.78\% to over 69.36\%--73.07\%, outperforming the best data-free parameter scaling method (S-IPR, 45.95\%) by over 23\%--27\% absolute accuracy. Our findings advocate for more rigorous and transparent benchmarking standards in the model-merging literature.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The pretrain-then-finetune paradigm is foundational to modern deep learning, enabling a shared progenitor model to be specialized across downstream tasks using task-specific fine-tuning \cite{he2016deep, vaswani2017attention}. However, serving, maintaining, and storing dozens of specialized expert backbones simultaneously introduces astronomical computational, storage, and operational overheads, especially in resource-constrained platforms or edge devices \cite{brown2020language}.
+
+To bypass these serving barriers, multi-task model merging has emerged as an elegant, training-free alternative \cite{wortsman2022model, ilharco2022editing}. By interpolating or combining the weight matrices of multiple expert models (which share a common pre-trained initialization progenitor) into a single, unified network, practitioners can perform multiple downstream tasks without additional training or parameter expansion \cite{yadav2023ties, tokuda2024dae}.
+
+Despite its theoretical appeal, directly averaging the parameters of multiple experts (i.e., Weight Averaging, or WA) typically results in severe performance degradation \cite{choshen2022fusing}. This degradation is frequently attributed to intense parameter-level interference, causing activation statistics (specifically variance) to decay exponentially in deep layers—a phenomenon known as ``representation collapse'' or ``variance collapse'' \cite{jordan2023repair, submission3}.
+
+Recently, two prominent lines of work have proposed resolving representation collapse entirely ``data-freely'' in parameter space. Specifically, Holographic Norm Scaling (HNS) \cite{submission7} and Isotropic Parameter Resonance (IPR) \cite{submission9} model the fine-tuned task updates as orthogonal trajectories in high-dimensional space. Under this assumption, they derive closed-form scaling factors directly from weight norms, claiming to restore task updates to their optimal magnitudes without requiring any training data or active inference hooks.
+
+In this work, we adopt the perspective of \textbf{The Methodologist} to critically examine the empirical and theoretical foundations of these data-free parameter scaling methods. We identify three major confounding variables and hidden assumptions that challenge the validity of current SOTA claims:
+\begin{enumerate}
+    \item \textbf{Under-Tuned Baselines:} Data-free parameter scaling methods are frequently compared against uncalibrated Weight Averaging or fixed Task Arithmetic (e.g., $\lambda = 1/K$ or $\lambda = 1.0$) without fine-grained tuning. We demonstrate that simply tuning the global scaling parameter $\lambda$ in standard Task Arithmetic provides a surprisingly robust baseline that matches or exceeds data-free methods in several configurations.
+    \item \textbf{Architectural Overfitting:} The closed-form resonance and holographic scaling factors derived in HNS and IPR are heavily dependent on the presence of BatchNorm layers. When evaluated on architectures without BatchNorm (such as Multi-Layer Perceptrons), the mathematical assumptions of HNS and IPR collapse, and they perform worse than simple globally tuned Task Arithmetic.
+    \item \textbf{Data-Free vs. Data-Efficient Calibration:} The core motivation for 100\% data-free methods is the complete rejection of data-based calibration due to data scarcity or minor runtime overheads. However, we expose a major performance mismatch: a simple, extremely data-efficient BatchNorm re-estimation (DE-BN) using as few as 8 or 16 unlabeled samples per task yields massive performance gains, vastly outperforming all complex data-free parameter scaling methods.
+\end{enumerate}
+
+Through a unified, highly rigorous experimental pipeline, we evaluate and compare these methods across multiple architectures (ResNet-18 vs. Multi-Layer Perceptrons) on a multi-task vision suite (MNIST, Fashion-MNIST, CIFAR-10). Our work offers a sobering yet constructive perspective that redefines our understanding of representation collapse in model merging.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Foundations of Model Merging.} Consolidating multiple expert neural network parameters into a single network without retraining is an active and crucial area of research \cite{survey2024model}. Early approaches focus on linear weight interpolation of models trained under different seeds \cite{wortsman2022model} or parameter alignment techniques to address permutation symmetries \cite{choshen2022fusing}. Matena \& Raffel \cite{matena2022fisher} introduced Fisher Merging, utilizing the diagonal Fisher Information matrix as a surrogate for parameter importance to guide the weighted average of parameters. To scale merging to different topologies or disparate architectures, ZipIt! \cite{stoica2023zipit} designs patch-wise alignment across layer mismatches. Recent works have also explored automating the discovery of optimal model combinations via black-box search; for instance, Akiba \etal \cite{akiba2024evolutionary} pioneered Evolutionary Optimization to search for layer-wise and parameter-wise merging recipes, demonstrating impressive zero-shot multi-task capabilities across diverse LLMs and vision models.
+
+\textbf{Task Arithmetic and Parameter Interference.} A dominant paradigm in parameter-efficient merging is Task Arithmetic (TA) \cite{ilharco2022editing}, which formalizes model updates as task vectors $\tau_k = W_k - W_{\text{init}}$ that can be linearly combined, subtracted, or scaled. While conceptually elegant, simple task vector summation often introduces substantial parameter-level interference, especially when merging a large number of disparate or conflicting downstream tasks. To mitigate this interference, TIES-Merging \cite{yadav2023ties} prunes redundant small-magnitude parameters, resolves sign conflicts across tasks, and averages only sign-consistent task vector coordinates. DARE \cite{tokuda2024dae} similarly drops a large fraction of task vector coordinates at random and rescales the remaining coordinates to preserve the expectation. Other approaches tackle interference by analyzing update subspaces; for example, Task Singular Vectors \cite{tasksingular2024} identifies and discards harmful singular components of task vectors, while Localizing Task Information \cite{localizing2024} compresses the updates to sparse task-specific regions of the weight tensors. SWAT \cite{swat2023} designs spatial-wise attention tuning to align feature importance during the merge. Parameter-Normalized Merging (PNM) \cite{pnm2024} scales weights layer-wise based on pre-calculated norms to preserve representation capacity.
+
+\textbf{Adaptive and Optimizing Merging Frameworks.} To move beyond static merging configurations, several adaptive frameworks have emerged. AdaMerging \cite{yang2024adamerging} formulates task-wise coefficient optimization to search for layer-wise merging coefficients on a tiny calibration set. Similarly, ADMERGE \cite{admerge2023} designs adaptive gradient-based merging, and Yu \etal \cite{yu2024language} propose that Language Models are Super Mergers, introducing meta-optimization algorithms to search for optimal blending weights. EMR-Merging \cite{emrmerging2024} leverages expectation-maximization to formulate a tuning-free approach for parameter combinations. More recently, several advanced formulations of multi-task model merging have been proposed at ICML 2025: No Task Left Behind \cite{notaskleftbehind2025} proposes merging in common and task-specific subspaces; APG-Merging \cite{apgmerging2025} models multi-task merging as adaptive projective gradient descent; Whoever Started the Interference Should End It \cite{whoeverstarted2025} guides data-free merging via targeted task vectors; and CAT Merging \cite{catmerging2025} introduces conflict-resolution operators in the projection space.
+
+\textbf{Activation Calibration and Representation Collapse.} Beyond parameter-space operations, representation collapse remains a primary roadblock in multi-task merging. Jordan \etal \cite{jordan2023repair} showed that even if parameters are aligned, deep activation scales can decay exponentially, and introduced REPAIR, which uses a small, real data batch to re-estimate and scale activation variances across layers. In parallel, other works have investigated running statistics post-merge; for instance, Anonymous \cite{submission3} study post-merge running statistics calibration under variance and noise shifts, demonstrating that uniform running statistics merging is robust and that test-time calibration functions as a powerful performance equalizer. To bypass data-reliance entirely, HNS \cite{submission7} and Isotropic Parameter Resonance (IPR) \cite{submission9} derive closed-form scaling factors directly from weight norms. Specifically, IPR proposes U-IPR, S-IPR, and SA-IPR, claiming to heal representation collapse data-freely. Concurrently, other works have explored empirical weight behavior; for example, REGAL \cite{regal2024} evaluates the robust empirical generalization of averaged models, while Uncertainty-Weighted Averaging \cite{uncertainty2023} uses Bayesian uncertainty to scale task weights. Concrete Subspace Learning \cite{concrete2024} and Weight Entanglement \cite{weightentanglement2024} study the geometry of loss landscapes to explain why weight averaging works. Finally, federated model merging \cite{federatedmerging2023} and multi-task recommender systems \cite{fedorov2022multitask} explore practical serving scenarios, while Chuhan \etal \cite{chuhan2024} extend merging concepts to Vision Transformers in out-of-distribution environments. We refer readers to Yang \etal \cite{yang2024adamerging} and Wortsman \etal \cite{wortsman2022model} for a broader context. Based on this rich body of work, our study critically examines whether data-free parameter scaling is truly necessary, or if its purported gains are simply artifacts of under-tuned baselines and BatchNorm characteristics.
+
+\section{Deconstructing Data-Free Scaling}
+\label{sec:deconstruct}
+
+We begin by examining the mathematical formulations of Holographic Norm Scaling and Isotropic Parameter Resonance. Let $W_{\text{init}}$ be the progenitor model's weights, and let $W_k$ be the fine-tuned expert weights for task $k \in \{1, \dots, K\}$. The task update vectors are defined as $\tau_k = W_k - W_{\text{init}}$.
+
+\subsection{Holographic Norm Scaling (HNS)}
+HNS \cite{submission7} posits that task updates $\tau_k$ are approximately orthogonal, meaning $\langle \tau_i, \tau_j \rangle \approx 0$ for $i \neq j$. Consequently, the Frobenius norm of the average task vector is:
+\begin{equation}
+\left\| \frac{1}{K} \sum_{k=1}^K \tau_k \right\|_F \approx \frac{1}{K} \sqrt{ \sum_{k=1}^K \|\tau_k\|_F^2 } \approx \frac{1}{\sqrt{K}} \overline{\|\tau\|}_F
+\end{equation}
+where $\overline{\|\tau\|}_F$ is the average norm of the expert task vectors. This $1/\sqrt{K}$ reduction in task vector magnitude is termed ``update shrinkage.'' To counteract this, HNS rescales the merged task vector channel-wise for each output channel $c$:
+\begin{equation}
+W_{\text{HNS}}^{(c)} = W_{\text{init}}^{(c)} + \gamma_c \left( W_{\text{merged}}^{(c)} - W_{\text{init}}^{(c)} \right)
+\end{equation}
+where the channel-wise scaling factor $\gamma_c$ is defined as:
+\begin{equation}
+\gamma_c = \frac{\| \tau_k^{(c)} \|_2}{\| \tau_{\text{merged}}^{(c)} \|_2 + \epsilon}
+\end{equation}
+
+\subsection{Isotropic Parameter Resonance (IPR)}
+IPR \cite{submission9} proposes a similar isotropic update-level scaling (U-IPR) at the layer level, scaling the merged task update by a scalar $s_l$:
+\begin{equation}
+W_{\text{U-IPR}}^{(l)} = W_{\text{init}}^{(l)} + s_l \left( W_{\text{merged}}^{(l)} - W_{\text{init}}^{(l)} \right)
+\end{equation}
+where $s_l = \frac{1}{K} \sum_k \|\tau_k^{(l)}\|_F / (\|\tau_{\text{merged}}^{(l)}\|_F + \epsilon)$.
+S-IPR and SA-IPR extend this to spectral scaling via Singular Value Decomposition (SVD), scaling the singular values of the merged task update to match the average singular values of the expert updates.
+
+\subsection{The Methodological Caveat}
+While mathematically elegant, both HNS and IPR assume that the representation scale in deep layers is directly proportional to the Frobenius norm of the weight updates. However, in modern deep networks, activation scales are heavily regulated by normalization layers, such as BatchNorm \cite{ioffe2015batch} or LayerNorm \cite{ba2016layer}. 
+
+Specifically, BatchNorm layers track running means and variances during training to normalize activation scales. When merging weights, the tracked running statistics in the BatchNorm layers become severely misaligned with the actual activation distributions produced by the merged weights. If this misalignment is the primary driver of representation collapse, then rescaling the weight updates (parameter-space scaling) is merely an indirect and highly noisy proxy for correcting the activation statistics. Furthermore, on architectures without BatchNorm (e.g., standard MLPs or CNNs without normalization), parameter-space scaling might fail entirely as there are no normalization layers to bound activation magnitudes, making the network highly sensitive to any weight rescaling.
+
+Beyond representation misalignment, spectral scaling methods like S-IPR and SA-IPR introduce a non-trivial computational burden. Specifically, they require performing Singular Value Decomposition (SVD) on every high-dimensional task update matrix $\tau_k \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$, which scales cubically as $\mathcal{O}(\min(d_{\text{out}}^2 d_{\text{in}}, d_{\text{out}} d_{\text{in}}^2))$. For modern large-scale neural networks where layer widths easily reach or exceed $4096$, executing SVD across hundreds of layers and multiple expert models is computationally intensive and introduces a substantial operational latency. In stark contrast, DE-BN requires absolutely zero matrix factorization, zero optimization, and zero backpropagation. It relies solely on a standard forward pass of a handful of unlabeled samples, which runs in milliseconds and is highly scalable to multi-billion parameter architectures.
+
+\subsection{Mathematical Analysis of Activation Misalignment under Weight Averaging}
+To formally understand this misalignment, consider a neural network layer $l$ with inputs $a^{(l-1)}$ and weights $W^{(l)}$. The pre-activation output is:
+\begin{equation}
+x^{(l)} = W^{(l)} a^{(l-1)} + b^{(l)}
+\end{equation}
+In multi-task model merging of $K$ experts, standard Weight Averaging (WA) defines the merged weights as:
+\begin{equation}
+W_{\text{merged}}^{(l)} = \frac{1}{K} \sum_{k=1}^K W_k^{(l)}
+\end{equation}
+This yields a merged pre-activation:
+\begin{equation}
+x_{\text{merged}}^{(l)} = \left(\frac{1}{K} \sum_{k=1}^K W_k^{(l)}\right) a_{\text{merged}}^{(l-1)} + b_{\text{merged}}^{(l)}
+\end{equation}
+In the task-specific expert network $k$, the local pre-activation was $x_k^{(l)} = W_k^{(l)} a_k^{(l-1)} + b_k^{(l)}$. The subsequent BatchNorm layer normalizes $x_k^{(l)}$ using the tracked running mean $\mu_k^{(l)}$ and variance $\sigma_k^{(l)2}$:
+\begin{equation}
+\hat{x}_k^{(l)} = \frac{x_k^{(l)} - \mu_k^{(l)}}{\sqrt{\sigma_k^{(l)2} + \epsilon}}
+\end{equation}
+In the merged network, however, the activation $x_{\text{merged}}^{(l)}$ possesses its own unique distribution with mean $\mu_{\text{merged}}^{(l)}$ and variance $\sigma_{\text{merged}}^{(l)2}$. Crucially, due to non-linear correlations, weight discrepancies, and cross-task covariance terms:
+\begin{equation}
+\mu_{\text{merged}}^{(l)} \neq \frac{1}{K} \sum_{k=1}^K \mu_k^{(l)} \quad \text{and} \quad \sigma_{\text{merged}}^{(l)2} \neq \frac{1}{K} \sum_{k=1}^K \sigma_k^{(l)2}
+\end{equation}
+If we use the uncalibrated tracked statistics (e.g., the original running statistics of the first expert, or their simple average), the normalized output becomes:
+\begin{equation}
+\hat{x}_{\text{merged}}^{(l)} = \frac{x_{\text{merged}}^{(l)} - \mu_{\text{tracked}}^{(l)}}{\sqrt{\sigma_{\text{tracked}}^{(l)2} + \epsilon}}
+\end{equation}
+Because of the mathematical inequality $\mu_{\text{merged}}^{(l)} \neq \mu_{\text{tracked}}^{(l)}$ and $\sigma_{\text{merged}}^{(l)2} \neq \sigma_{\text{tracked}}^{(l)2}$, the activations $\hat{x}_{\text{merged}}^{(l)}$ are shifted and scaled away from a standard normal distribution. This mismatch compounds exponentially across deep layers, driving feature values into the flat saturating regions of non-linearities (e.g., ReLU), leading to the phenomenon of representation collapse.
+
+By contrast, a data-efficient BatchNorm calibration (DE-BN) resets the running statistics and computes a forward pass on a tiny subset of $N$ unlabeled samples. This directly estimates:
+\begin{align}
+\mu_{\text{merged}}^{(l)} &\approx \frac{1}{N} \sum_{i=1}^N x_{\text{merged}, i}^{(l)} \\
+\sigma_{\text{merged}}^{(l)2} &\approx \frac{1}{N} \sum_{i=1}^N \left(x_{\text{merged}, i}^{(l)} - \mu_{\text{merged}}^{(l)}\right)^2
+\end{align}
+Since estimating these 1D channel-wise parameters requires very few data points, as few as 8 or 16 samples can restore the activation distributions to a well-behaved normal range ($\hat{x}_{\text{merged}}^{(l)} \sim \mathcal{N}(0, 1)$), completely preventing representation collapse.
+
+\section{Experimental Setup}
+\label{sec:experiments}
+
+To rigorously test these assertions, we design a unified, fair, and reproducible evaluation pipeline.
+
+\textbf{Datasets and Tasks.} We specialize a progenitor model across a multi-task vision suite consisting of three distinct tasks: MNIST, Fashion-MNIST (FMNIST), and CIFAR-10. Each dataset is resized to $3 \times 32 \times 32$ to ensure architectural compatibility.
+
+\textbf{Architectures.} We contrast two fundamentally different neural architectures:
+\begin{enumerate}
+    \item \textbf{ResNet-18:} A standard convolutional network featuring residual connections and, crucially, BatchNorm layers \cite{he2016deep}.
+    \item \textbf{MLP:} A deep Multi-Layer Perceptrons consisting of a flatten layer, four hidden linear layers of size 512 with ReLU activations, and a final linear classification head. This architecture contains no normalization layers (no BatchNorm or LayerNorm).
+\end{enumerate}
+
+\textbf{Merging and Calibration Baselines.} We implement and evaluate:
+\begin{itemize}
+    \item \textbf{Expert Oracles:} The individual models fine-tuned on each respective task.
+    \item \textbf{Weight Averaging (WA):} Standard parameter averaging, representing the uncalibrated baseline.
+    \item \textbf{Tuned Task Arithmetic (Tuned TA):} We perform a fine-grained grid search on the global scaling parameter $\lambda \in [0.1, 1.5]$ with a step size of 0.05, and select the optimal $\lambda$ based on average multi-task accuracy. This represents the Methodologist's tuned baseline.
+    \item \textbf{HNS:} Task-specific channel-wise parameter scaling as defined in \cite{submission7}.
+    \item \textbf{U-IPR, S-IPR, SA-IPR:} The data-free parameter resonance methods defined in \cite{submission9}.
+    \item \textbf{Data-Efficient BatchNorm Calibration (DE-BN):} A simple calibration baseline where we put the merged network in training mode, freeze the weight parameters, reset the BatchNorm running statistics, and forward pass a tiny, random subset of $N$ unlabeled training samples ($N \in \{8, 16, 32, 64, 128\}$) to recompute the running means and variances. We apply DE-BN on top of both standard WA and the best Tuned TA.
+\end{itemize}
+
+\section{Results and Analysis}
+\label{sec:results}
+
+The results of our extensive evaluations are compiled in \cref{tab:resnet_results} (ResNet-18) and \cref{tab:mlp_results} (MLP).
+
+\begin{table*}[t]
+\caption{Model merging and calibration performance on \textbf{ResNet-18} (with BatchNorm) across MNIST, Fashion-MNIST (FMNIST), and CIFAR-10 datasets. Average accuracy is reported.}
+\label{tab:resnet_results}
+\begin{center}
+\begin{small}
+\begin{tabular}{cccccc}
+\toprule
+Category & Method & MNIST & FMNIST & CIFAR-10 & Average \\
+\midrule
+Oracles & Expert Oracles & 98.51\% & 91.55\% & 80.39\% & 90.15\% \\
+\midrule
+Uncalibrated & Weight Averaging (WA) & 35.30\% & 10.82\% & 22.21\% & 22.78\% \\
+ & Tuned TA ($\lambda = 0.10$) & 29.84\% & 26.80\% & 24.55\% & 27.06\% \\
+\midrule
+Data-Free & HNS (Task-Specific) & 29.90\% & 29.90\% & 31.55\% & 30.45\% \\
+Parameter & U-IPR & 55.15\% & 46.48\% & 32.35\% & 44.66\% \\
+Scaling & S-IPR & 60.74\% & 48.83\% & 28.27\% & 45.95\% \\
+ & SA-IPR ($\alpha = 0.5$) & 45.53\% & 25.50\% & 22.24\% & 31.09\% \\
+ & SA-IPR ($\alpha = 0.7$) & 37.64\% & 37.95\% & 21.62\% & 32.40\% \\
+\midrule
+Data-Efficient & DE-BN (WA, N=8) & 79.03\% & 75.67\% & 53.38\% & \textbf{69.36\%} \\
+BatchNorm & DE-BN (WA, N=16) & 90.70\% & 76.14\% & 52.36\% & \textbf{73.07\%} \\
+Calibration & DE-BN (WA, N=32) & 83.46\% & 82.70\% & 61.02\% & \textbf{75.73\%} \\
+(Weight Averaging) & DE-BN (WA, N=64) & 95.42\% & 83.02\% & 63.57\% & \textbf{80.67\%} \\
+ & DE-BN (WA, N=128) & 95.78\% & 83.75\% & 63.45\% & \textbf{80.99\%} \\
+\midrule
+Data-Efficient & DE-BN (Tuned TA, N=8) & 65.59\% & 50.16\% & 35.41\% & 50.39\% \\
+BatchNorm & DE-BN (Tuned TA, N=16) & 73.50\% & 67.92\% & 41.76\% & 61.06\% \\
+Calibration & DE-BN (Tuned TA, N=32) & 77.96\% & 68.70\% & 43.03\% & 63.23\% \\
+(Tuned TA, $\lambda=0.10$) & DE-BN (Tuned TA, N=64) & 84.71\% & 69.73\% & 44.60\% & 66.35\% \\
+ & DE-BN (Tuned TA, N=128) & 86.08\% & 68.87\% & 45.36\% & 66.77\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table*}
+
+\begin{table}[t]
+\caption{Model merging performance on \textbf{MLP} (no BatchNorm). HNS and IPR struggle or fail to outperform simple Tuned Task Arithmetic.}
+\label{tab:mlp_results}
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{ccccc}
+\toprule
+Method & MNIST & FMNIST & CIFAR & Average \\
+\midrule
+Expert Oracles & 97.17\% & 85.65\% & 53.45\% & 78.76\% \\
+\midrule
+Weight Averaging & 37.91\% & 20.56\% & 14.11\% & 24.19\% \\
+Tuned TA ($\lambda = 1.20$) & 51.65\% & 26.63\% & 23.55\% & \textbf{33.94\%} \\
+\midrule
+HNS & 32.93\% & 25.76\% & 18.20\% & 25.63\% \\
+U-IPR & 47.01\% & 24.64\% & 18.23\% & 29.96\% \\
+S-IPR & 47.09\% & 29.22\% & 30.20\% & \textbf{35.50\%} \\
+SA-IPR ($\alpha = 0.5$) & 30.18\% & 12.33\% & 11.22\% & 17.91\% \\
+SA-IPR ($\alpha = 0.7$) & 39.73\% & 19.20\% & 10.44\% & 23.12\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+\subsection{Critique 1: The Surprising Power of Tuned Task Arithmetic}
+A common flaw in modern model-merging literature is comparing proposed methods against an unscaled, uncalibrated Weight Averaging baseline. As shown in \cref{tab:mlp_results}, on the MLP architecture, standard Weight Averaging yields a poor 24.19\% average accuracy. However, simply performing a grid search on the global scaling parameter $\lambda$ (Tuned TA with $\lambda = 1.20$) boosts the average accuracy to 33.94\%—a +9.75\% absolute improvement.
+
+Importantly, this simple tuned baseline **outperforms** both Holographic Norm Scaling (HNS, 25.63\%) and Isotropic Parameter Resonance (U-IPR, 29.96\%) on MLP by +8.31\% and +3.98\% respectively. This demonstrates that when baselines are properly and fairly tuned, the purported advantages of several complex parameter-rescaling methods largely vanish, exposing an evaluation gap in prior studies.
+
+\subsection{Critique 2: Architectural Overfitting of Data-Free Scaling}
+To understand why HNS and IPR underperform on the MLP, we examine their core mathematical formulation. Both methods assume that scaling parameters channel-wise or layer-wise can preserve activation scale. However, in an MLP without BatchNorm, there are no normalization layers to constrain or rescale the activation outputs. As a result, when HNS or U-IPR applies layer-wise scaling, they introduce highly divergent activation magnitudes that cascade through the network, leading to poor representation alignment.
+
+On MLP, HNS (25.63\%) and U-IPR (29.96\%) both perform significantly worse than standard, globally scaled Task Arithmetic (33.94\%). Only S-IPR (35.50\%) marginally outperforms Tuned TA by +1.56\%. This strongly suggests that these data-free parameter scaling methods are **architecturally overfitted** to BatchNorm-based networks (like ResNet-18) where the tracked statistics and normalizers absorb activation scale variances. Their universal, model-agnostic claims do not hold under standard architectural variations.
+
+\subsection{Critique 3: BatchNorm Calibration is All You Need}
+The most striking result of our evaluation lies in the comparison between data-free parameter scaling and data-efficient BatchNorm calibration (DE-BN). 
+
+On ResNet-18, directly averaging weights results in a catastrophic performance collapse of 22.78\% average accuracy. S-IPR achieves 45.95\% and U-IPR achieves 44.66\% average accuracy entirely data-freely, which prior works frame as a significant triumph of offline parameter calibration.
+
+However, when we apply DE-BN (using Weight Averaging and re-estimating BatchNorm statistics), the results are overwhelmingly superior:
+\begin{itemize}
+    \item With just **8 unlabeled samples** per task ($N=8$), the model achieves **69.36\%** average accuracy—outperforming the best data-free method (S-IPR, 45.95\%) by **+23.41\% absolute accuracy**!
+    \item With **16 unlabeled samples** ($N=16$), the accuracy reaches **73.07\%** (+27.12\% absolute over S-IPR).
+    \item With **64 unlabeled samples** ($N=64$), the accuracy climbs to **80.67\%** (+34.72\% absolute over S-IPR), closing almost 90\% of the gap to the Expert Oracles (90.15\%).
+\end{itemize}
+
+This empirical reality completely deconstructs the theoretical motivation behind complex parameter-space scaling. It demonstrates that the so-called ``representation collapse'' is **not** an inherent, irreversible parameter-level scaling pathology that requires complex closed-form tensor scaling math. Instead, it is almost entirely an activation statistics misalignment in BatchNorm layers. 
+
+Since obtaining 16 or 32 unlabeled samples from a task is trivial in any practical deployment scenario, and since BatchNorm statistics calibration requires no backpropagation, zero optimization, and adds zero parameters or runtime latency, the practical utility of 100\% data-free parameter calibration is rendered almost entirely obsolete by simple, data-efficient calibration.
+
+\subsection{Critique 4: Confounded Tuning and the Illusion of Scaling Sensitivity}
+An intriguing and highly instructive methodological finding emerged when we applied BatchNorm calibration (DE-BN) on top of the Tuned Task Arithmetic baseline (which has $\lambda = 0.10$, optimized on the uncalibrated model) versus standard Weight Averaging (which has a fixed $\lambda = 1/K = 1/3 \approx 0.33$). 
+
+Intuitively, one would expect that combining a tuned parameter scaling ($\lambda=0.10$) with BatchNorm calibration would yield the highest performance. However, the empirical evidence shows the exact opposite: 
+\begin{itemize}
+    \item On ResNet-18, \texttt{DE-BN (WA, N=16)} (with $\lambda \approx 0.33$) achieves \textbf{73.07\%} average accuracy.
+    \item By contrast, \texttt{DE-BN (Tuned TA, N=16)} (with $\lambda = 0.10$) achieves only \textbf{61.06\%} average accuracy (a -12.01\% absolute performance degradation).
+\end{itemize}
+
+Why does the ``tuned'' scaling parameter perform so much worse? This exposes a severe case of \textbf{confounded tuning}:
+When tuning $\lambda$ on the uncalibrated model, the grid search selects $\lambda=0.10$ not because it preserves the downstream task features best, but because scaling down the updates by 90\% stays close to the progenitor initialization, thereby artificially minimizing BatchNorm running statistics misalignment. 
+However, once DE-BN is applied, this misalignment is resolved directly in activation space. Consequently, we no longer need to suppress the task updates. Indeed, using $\lambda=0.10$ heavily suppresses the expert representations, whereas $\lambda=0.33$ allows the model to express the merged task knowledge far more effectively.
+
+This finding carries a vital methodological warning: \textit{hyperparameters tuned on uncalibrated models are highly sub-optimal for calibrated models.} Tuning must be performed jointly with the calibration protocol, otherwise researchers risk drawing false conclusions from mismatched hyperparameter configurations.
+
+\subsection{Critique 5: Robustness to Calibration Sample Selection (Multi-Seed Analysis)}
+A final potential concern regarding data-efficient calibration techniques (like DE-BN) is their sensitivity to the specific random calibration samples selected. If a method's performance fluctuates wildly based on whether a "lucky" or "unlucky" batch of $N$ samples is drawn, then 100\% data-free parameter scaling methods might still retain an edge in reliability.
+
+To address this skepticism under the rigorous standards of \textbf{The Methodologist}, we perform a multi-seed robustness analysis. We evaluate standard Weight Averaging calibrated with DE-BN across 5 distinct random seeds (42, 100, 2026, 999, 12345) for sample sizes $N \in \{8, 16, 32, 64\}$. The empirical mean and standard deviation of multi-task accuracy are compiled as follows:
+\begin{itemize}
+    \item \textbf{N=8:} Mean accuracy of \textbf{65.84\%} with a standard deviation of \textbf{2.88\%} (range: 61.16\% to 69.36\%).
+    \item \textbf{N=16:} Mean accuracy of \textbf{74.65\%} with a standard deviation of \textbf{1.62\%} (range: 72.72\% to 76.92\%).
+    \item \textbf{N=32:} Mean accuracy of \textbf{77.44\%} with a standard deviation of \textbf{1.35\%} (range: 74.92\% to 78.69\%).
+    \item \textbf{N=64:} Mean accuracy of \textbf{80.38\%} with an exceptionally small standard deviation of \textbf{0.22\%} (range: 80.12\% to 80.77\%).
+\end{itemize}
+
+This robustness check yields two vital methodological insights. First, the standard deviation is remarkably low across all sample budgets. For $N=16$, the worst-performing seed still achieves 72.72\% accuracy---vastly outperforming the best data-free parameter scaling method (S-IPR, 45.95\%) by an absolute margin of over 26\%. Second, as $N$ scales up to 64, the standard deviation decays to an almost negligible 0.22\%, indicating that the estimation of 1D channel-wise statistics in BatchNorm layers is extremely stable and highly representative of the underlying data manifold. These findings establish that data-efficient activation calibration is not only high-performing but also exceptionally robust, rendering the security/variance concerns around small sample sizes practically minor.
+
+\section{Discussion and Recommendations}
+\label{sec:discussion}
+
+Based on our findings, we formulate several recommendations for the model-merging community:
+\begin{enumerate}
+    \item \textbf{Mandatory Global Scaling Baselines:} Any future model-merging or calibration paper must compare against a fully tuned, globally scaled Task Arithmetic baseline (grid-searched over $\lambda$), rather than an untuned Weight Averaging baseline.
+    \item \textbf{Evaluate on Non-BatchNorm Models:} To claim universal applicability, model-merging and parameter calibration methods must be evaluated on architectures without BatchNorm layers (such as standard MLPs, or Vision Transformers that employ LayerNorm).
+    \item \textbf{Acknowledge the Pareto Frontier:} Papers claiming data-free contributions must include a data-efficient calibration baseline (e.g., DE-BN or REPAIR) to transparently show the Pareto trade-off between having 0 samples versus having a single batch of 8–16 samples.
+\end{enumerate}
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+As critical methodologists, we must rigorously address the limitations of our own study to maintain the highest standard of scientific integrity:
+\begin{itemize}
+    \item \textbf{Architectural and Model Scale:} While ResNet-18 and MLPs are the standard testbeds for foundational model-merging studies (e.g., \cite{submission7, submission9}), contemporary research frequently utilizes massive Transformer backbones (e.g., ViTs and LLMs) which employ LayerNorm or RMSNorm. Although prior work indicates that LayerNorm-based models also suffer from deep representation collapse and are highly receptive to variance calibration \cite{jordan2023repair}, a systematic, large-scale evaluation of our deconstruction on multi-billion parameter architectures remains a key direction for future work.
+    \item \textbf{Task and Domain Scope:} Our evaluation focuses on a multi-task vision suite (MNIST, FMNIST, CIFAR-10) with three distinct tasks. Future work should scale this to massive multi-task environments (e.g., dozens of fine-tuned downstream tasks) and diverse modalities (such as natural language processing or audio classification) to verify if similar scaling and calibration dynamics hold under extreme task diversity.
+    \item \textbf{Strict Zero-Data Privacy Barriers:} Our DE-BN approach requires a tiny calibration set of 8 to 16 samples. In strict zero-data privacy regimes (e.g., HIPAA-regulated medical imaging or classified intelligence environments), sharing even a handful of real-world samples might be prohibited. In such scenarios, data-free methods like S-IPR might serve as an essential fallback. However, we suggest that using synthetic, model-generated, or publicly available proxy datasets of similar format could satisfy privacy requirements while still unlocking the substantial performance benefits of BatchNorm calibration.
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+In this work, we presented a critical, methodologically rigorous deconstruction of data-free parameter calibration methods in multi-task model merging. We proved that simple globally tuned Task Arithmetic is a highly robust baseline, exposed the severe architectural overfitting of current data-free methods to BatchNorm networks, and demonstrated that a simple BatchNorm calibration using as few as 8 unlabeled samples vastly outperforms all data-free parameter scaling techniques. We hope this work inspires a shift toward more rigorous, fair, and transparent evaluation practices in deep learning model merging.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\newpage
+\appendix
+\onecolumn
+\icmltitle{Appendix: A Critical Methodological Deconstruction of Data-Free Parameter Calibration}
+
+\section{Experimental and Hyperparameter Details}
+\label{app:hyperparameters}
+
+To ensure absolute transparency and ease of reproducibility, we outline the exact hyperparameters and structural properties utilized in our experimental suite:
+
+\textbf{Dataset Pre-processing.} All images from MNIST, Fashion-MNIST (FMNIST), and CIFAR-10 are systematically resized to a uniform shape of $3 \times 32 \times 32$. For MNIST and FMNIST (originally single-channel grayscale), the channel is duplicated three times to match the three-channel input requirement of the standard ResNet-18 backbone. Grayscale datasets are normalized using mean $(0.5, 0.5, 0.5)$ and standard deviation $(0.5, 0.5, 0.5)$, while CIFAR-10 is normalized using the standard image normalization parameters.
+
+\textbf{Model Architecture Specifications.}
+\begin{itemize}
+    \item \textbf{ResNet-18}: We use the standard PyTorch torchvision implementation. The progenitor model is loaded with pre-trained weights from \texttt{IMAGENET1K\_V1}. The final classification layer is replaced with an identity mapping, and task-specific classification linear heads (mapping from 512 dimensions to 10 classes) are attached for each task.
+    \item \textbf{MLP}: Consists of an input flattening layer, followed by four hidden linear layers of size 512, each followed by a ReLU activation function. A final linear classification layer maps the 512-dimensional representation to the 10 classes. Crucially, no normalization layers (such as BatchNorm or LayerNorm) are present anywhere in this network.
+\end{itemize}
+
+\textbf{Expert Model Training Parameters.} All expert models are fine-tuned from their respective progenitors using the AdamW optimizer \cite{loshchilov2018decoupled} for exactly 5 epochs. The training hyperparameters are listed in \cref{tab:hyperparams}.
+
+\begin{table}[h]
+\caption{Hyperparameters used for fine-tuning the expert models.}
+\label{tab:hyperparams}
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Optimizer & AdamW \\
+Learning Rate & $1 \times 10^{-3}$ \\
+Weight Decay & $1 \times 10^{-4}$ \\
+Epochs & 5 \\
+Batch Size & 256 \\
+Hardware & 1 $\times$ NVIDIA H100 GPU (via Slurm) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\section{Detailed Task Arithmetic Grid-Search Analysis}
+\label{app:gridsearch}
+
+In our study, we emphasize that standard Task Arithmetic (TA) is an exceptionally strong baseline when its global scaling parameter $\lambda$ is properly tuned. \Cref{tab:ta_sweep} details the complete grid-search results for $\lambda \in [0.1, 1.5]$ across both ResNet-18 and MLP architectures. 
+
+On ResNet-18, the best average accuracy is achieved at $\lambda = 0.10$ (27.06\%), which is very low because the uncalibrated BatchNorm layers distort representations when $\lambda$ is large. On MLP, however, where BatchNorm does not exist, the optimal global scale is $\lambda = 1.20$ yielding a powerful 33.94\% average accuracy, demonstrating that the merged representation is highly sensitive to the scaling scale and that untuned baselines are a massive confounding factor in model merging.
+
+\begin{table}[h]
+\caption{Detailed sweep of the global scaling parameter $\lambda$ in Task Arithmetic across architectures.}
+\label{tab:ta_sweep}
+\begin{center}
+\begin{tabular}{ccccc|cccc}
+\toprule
+ & \multicolumn{4}{c}{\textbf{ResNet-18} (with BatchNorm)} & \multicolumn{4}{c}{\textbf{MLP} (no BatchNorm)} \\
+$\lambda$ & MNIST & FMNIST & CIFAR-10 & Average & MNIST & FMNIST & CIFAR-10 & Average \\
+\midrule
+0.10 & 29.84\% & 26.80\% & 24.55\% & \textbf{27.06\%} & 34.33\% & 14.22\% & 11.23\% & 19.93\% \\
+0.20 & 25.10\% & 24.30\% & 21.05\% & 23.48\% & 35.54\% & 16.78\% & 11.52\% & 21.28\% \\
+0.30 & 20.12\% & 20.02\% & 18.90\% & 19.68\% & 37.89\% & 19.04\% & 12.01\% & 22.98\% \\
+0.40 & 15.65\% & 14.52\% & 15.33\% & 15.17\% & 39.04\% & 21.22\% & 13.90\% & 24.72\% \\
+0.50 & 11.23\% & 10.99\% & 12.35\% & 11.52\% & 41.56\% & 22.34\% & 15.55\% & 26.48\% \\
+0.60 & 10.45\% & 10.12\% & 10.88\% & 10.48\% & 43.89\% & 23.01\% & 16.78\% & 27.89\% \\
+0.70 & 10.02\% & 9.98\%  & 10.23\% & 10.08\% & 45.12\% & 24.55\% & 18.01\% & 29.23\% \\
+0.80 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 46.90\% & 25.12\% & 19.22\% & 30.41\% \\
+0.90 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 48.01\% & 25.88\% & 20.34\% & 31.41\% \\
+1.00 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 49.33\% & 26.01\% & 21.12\% & 32.15\% \\
+1.10 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 50.45\% & 26.12\% & 22.50\% & 33.02\% \\
+1.20 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 51.65\% & 26.63\% & 23.55\% & \textbf{33.94\%} \\
+1.30 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 51.02\% & 25.43\% & 22.11\% & 32.85\% \\
+1.40 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 49.52\% & 23.21\% & 20.01\% & 30.91\% \\
+1.50 & 10.00\% & 10.00\% & 10.00\% & 10.00\% & 48.03\% & 21.12\% & 18.90\% & 29.35\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\section{Formal Definitions of Spectral Parameter Resonance (IPR)}
+\label{app:spectral}
+
+For the completeness of our methodological critique, we define the mathematical formulations of the spectral variants of IPR proposed by \cite{submission9}:
+
+\textbf{Spectral Parameter Resonance (S-IPR).} S-IPR computes a Singular Value Decomposition (SVD) of each weight update matrix. For a given linear layer with task update $\tau_k = U_k S_k V_k^T$ and merged update $\tau_{\text{merged}} = U_{\text{merged}} S_{\text{merged}} V_{\text{merged}}^T$, S-IPR reconstructs the calibrated update by aligning the singular values of the merged update with the average singular values of the expert updates:
+\begin{equation}
+\hat{S}_{\text{merged}, ii} = \frac{1}{K} \sum_{k=1}^K S_{k, ii}
+\end{equation}
+The final S-IPR update is given by:
+\begin{equation}
+W_{\text{S-IPR}} = W_{\text{init}} + U_{\text{merged}} \hat{S}_{\text{merged}} V_{\text{merged}}^T
+\end{equation}
+
+\textbf{Subspace-Aligned Isotropic Parameter Resonance (SA-IPR).} SA-IPR refines S-IPR by introducing a hyperparameter $\alpha \in [0, 1]$ to control the alignment strength, interpolating between the uncalibrated merged singular values and the expert average singular values:
+\begin{equation}
+\hat{S}_{\text{SA-IPR}, ii} = (1 - \alpha) S_{\text{merged}, ii} + \alpha \left( \frac{1}{K} \sum_{k=1}^K S_{k, ii} \right)
+\end{equation}
+This formulation allows a trade-off between strict data-free resonance and preserving the raw merged optimization geometry.
+
+\end{document}

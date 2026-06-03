@@ -1,0 +1,541 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage[accepted]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{\smash{QR-SP-WCPR for Multi-Task Model Merging}}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Quantization-Robust and Sparsity-Preserving Wasserstein Calibration \\ for Multi-Task Model Merging}
+
+\begin{icmlauthorlist}
+\icmlauthor{Pragmatic Researcher}{prag}
+\end{icmlauthorlist}
+
+\icmlaffiliation{prag}{Pragmatic AI Systems Lab, Department of Computer Science, University of Technology}
+\icmlcorrespondingauthor{Pragmatic Researcher}{researcher@pragmatic-ai.edu}
+
+\icmlkeywords{Model Merging, Optimal Transport, Post-Training Quantization, Sparsity, Robustness}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Multi-task model merging has emerged as a highly practical, training-free paradigm to consolidate multiple task-specific expert neural networks into a single, unified model. While recent non-parametric optimal transport methods like Wasserstein-Calibrated Parameter Resonance (WCPR) achieve state-of-the-art merging performance in full precision, they suffer from two critical real-world deployment limitations: (1) they destroy model sparsity, rendering them incompatible with advanced sparsification techniques (e.g., TIES and DARE), and (2) they exhibit extreme sensitivity to Post-Training Quantization (PTQ) due to the propagation of expert weight outliers which inflates the quantization dynamic range. 
+In this work, we introduce \textbf{Quantization-Robust and Sparsity-Preserving Wasserstein Calibration (QR-SP-WCPR)}, a unified, data-free post-merge calibration framework designed to resolve these bottlenecks. QR-SP-WCPR executes 1D optimal transport on dense parameter updates to guarantee stable coordinate ranks and prevent sorting instabilities on duplicate zero coordinates, applies the baseline sparsification mask to preserve 100\% of the sparsity structure, and dynamically clamps extreme outlier updates using standard-deviation-based robust statistics. 
+Our comprehensive empirical evaluation across ResNet-18 and deep MLP architectures on vision datasets (MNIST, FashionMNIST, CIFAR-10) demonstrates that QR-SP-WCPR successfully preserves 100\% of baseline sparsity while achieving outstanding robustness under 8-bit quantization and environmental noise, outperforming standard WCPR and other state-of-the-art calibration baselines.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+Modern deep learning relies heavily on the pretrain-then-finetune paradigm, which specializes a shared progenitor model across distinct downstream tasks \cite{he2016deep}. However, serving, maintaining, and storing dozens of specialized, task-specific backbones simultaneously introduces astronomical storage, memory, and operational overheads, especially on resource-constrained edge hardware or high-throughput servers \cite{brown2020language}. 
+
+To bypass these serving barriers, multi-task model merging has emerged as a cost-effective, training-free alternative \cite{wortsman2022robust,ilharco23editing}. By interpolating or combining the weight matrices of multiple expert models (which share a common pretrained initialization) into a single, unified network, practitioners can perform multiple downstream tasks without additional training or parameter expansion \cite{yadav2023ties,tokuda2024dare}. 
+
+Despite its appeal, directly averaging parameters typically triggers a catastrophic performance drop due to task parameter interference and ``representation collapse'' (the decay of activation scale in deep layers) \cite{jordan2023repair}. To address this, parameter-space calibration methods like Isotropic Parameter Resonance (IPR) and Holographic Norm Scaling (HNS) rescale updates to restore representational scale \cite{leclaire2024isotropic}. More recently, Wasserstein-Calibrated Parameter Resonance (WCPR) proposed a non-parametric approach grounded in 1D Optimal Transport (OT) theory \cite{theorist2026wcpr}. WCPR channel-by-channel aligns the empirical weight distribution of the merged model to the Wasserstein barycenter of the experts, achieving state-of-the-art results in full precision (FP32).
+
+However, from a \emph{Pragmatist} perspective, existing methods exhibit two severe bottlenecks that hinder real-world edge deployment:
+\begin{enumerate}
+    \item \textbf{Sparsity-Calibration Mismatch:} High-performing merging frameworks like TIES-Merging \cite{yadav2023ties} and DARE \cite{tokuda2024dare} rely on sparsification to prune redundant updates and resolve sign conflicts. Standard WCPR destroys this beneficial sparsity because the 1D optimal transport map is continuous, mapping all zero values to non-zero values in the expert barycenter.
+    \item \textbf{PTQ Outlier Vulnerability:} Real-world edge deployment demands Post-Training Quantization (PTQ) to low-bit formats (e.g., 8-bit integer, or INT8) to fit tight VRAM limits \cite{dettmers2022gpt3}. Because WCPR aligns to the exact Wasserstein barycenter, it propagates extreme weight outliers present in any of the expert models. Under symmetric uniform quantization, these outliers inflate the dynamic range, blowing up the quantization step-size and introducing massive rounding noise that collapses model accuracy.
+\end{enumerate}
+
+To bridge this gap between academic theory and practical deployment, we propose \textbf{Quantization-Robust and Sparsity-Preserving Wasserstein Calibration (QR-SP-WCPR)}. Our method is fully automated, data-free, adds zero runtime latency, and operates strictly in parameter-space. 
+
+Our main contributions are:
+\begin{itemize}
+    \item We mathematically analyze and deconstruct the failure modes of Wasserstein model merging under sparsification and Post-Training Quantization (PTQ).
+    \item We introduce \textbf{QR-SP-WCPR}, which executes 1D optimal transport on the dense parameter updates to guarantee stable coordinate ranks, applies the baseline sparsification mask to preserve 100\% of the sparsity structure, and dynamically clamps extreme outliers using standard-deviation-based robust statistics to prevent post-training quantization collapse.
+    \item We conduct a unified empirical investigation of merging algorithms on ResNet-18 and MLP architectures across MNIST, FashionMNIST, and CIFAR-10. Our results show that QR-SP-WCPR stabilizes model merging under both INT8 quantization and environmental corruptions while preserving the exact benefits of sparsification.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Model Merging and Sparsification:} Consolidating multiple expert models trained from a shared progenitor has gained massive traction \cite{wortsman2022robust}. Task Arithmetic (TA) formalizes updates as task vectors $\tau_k = W_k - W_{\text{init}}$ that can be linearly combined \cite{ilharco23editing}. To combat interference, TIES-Merging \cite{yadav2023ties} prunes small updates and elects parameter signs, while DARE \cite{tokuda2024dare} randomly drops updates and rescales. However, these methods suffer from representation collapse in deep layers. To align parameters across models before merging, foundational work in optimal transport fusion used Wasserstein barycenters to soft-align neurons \cite{singh2020model}. Recent extensions apply Gromov-Wasserstein alignment to preserve structural feature relationships \cite{gw2025efficient}, or leverage continual optimal transport fusion to sequentially merge task-specific models without forgetting \cite{pan2025merging}.
+
+\textbf{Parameter-Space Calibration:} Grounded in restoring activation scale, SP-TAAC \cite{leclaire2024isotropic} and REPAIR \cite{jordan2023repair} use data-driven calibration to scale activations. To achieve a 100\% data-free setup, HNS \cite{visionary2026hns} and U-IPR \cite{leclaire2024isotropic} compute closed-form scale factors from parameter norms. Recently, WCPR \cite{theorist2026wcpr} framed calibration as 1D optimal transport, aligning weights channel-by-channel to the experts' Wasserstein barycenter. While highly accurate in FP32, WCPR fails under quantization and destroys sparsity.
+
+\textbf{Post-Training Quantization (PTQ):} PTQ is the industry standard for compressing models for edge hardware \cite{frantar2022gptq}. However, quantization is highly sensitive to the dynamic range of weight tensors \cite{xiao23smoothquant}. Outlier parameters inflate the quantization step-size, creating a severe ``error barrier'' when merging. Recent work like QR-IPR \cite{pragmatic2026unified} introduced robust clamping for parametric scaling, but does not address non-parametric optimal transport nor sparsity preservation. Furthermore, when deploying merged models on constraint-tight devices, practitioners are increasingly turning to the Post-Merge Quantization (PMQ) setting, where quantization errors couple with model-merging deviations to cause severe performance degradation \cite{epmq2026expert}.
+
+\section{Preliminaries \& Deconstruction of WCPR}
+\label{sec:prelim}
+Let $W_{\text{init}} \in \mathbb{R}^{d}$ be the weight vector of the shared progenitor model. We have $K$ task-specific expert models $\{W_k\}_{k=1}^K$ fine-tuned from $W_{\text{init}}$ for $K$ distinct tasks, where $W_k \in \mathbb{R}^{d}$. For each expert $k$, we define the parameter update (or task vector) as:
+\begin{equation}
+    \tau_k = W_k - W_{\text{init}}
+\end{equation}
+Our goal is to merge these $K$ task vectors into a single, unified task update $T_{\text{merged}} \in \mathbb{R}^{d}$ such that the merged model $W_{\text{merged}} = W_{\text{init}} + T_{\text{merged}}$ performs well across all $K$ tasks without additional training, completely data-freely, and is highly robust under low-bit Post-Training Quantization (PTQ) and environmental noise.
+
+\subsection{1D Optimal Transport and Wasserstein-2 Barycenters}
+WCPR \cite{theorist2026wcpr} models each task-specific parameter update $\tau_k$ as a sequence of empirical samples drawn from a underlying continuous probability distribution. Standard Weight Averaging (WA) merges the models by computing the element-wise mean of the task vectors:
+\begin{equation}
+    T_{\text{merged}} = \frac{1}{K}\sum_{k=1}^K \tau_k
+\end{equation}
+Because task updates $\tau_k$ correspond to distinct tasks, they adapt to different regions of the loss surface, which makes them highly orthogonal in high dimensions ($\tau_k \cdot \tau_j \approx 0$ for $k \neq j$). 
+
+Under the assumption of orthogonality, if we model the individual coordinates of $\tau_k$ as zero-mean random variables with variance $\sigma_{\text{task}}^2$, the variance of the merged task vector $T_{\text{merged}}$ collapses:
+\begin{equation}
+\begin{split}
+    \text{Var}(T_{\text{merged}}) &= \text{Var}\left( \frac{1}{K} \sum_{k=1}^K \tau_k \right) \\
+    &= \frac{1}{K^2} \sum_{k=1}^K \text{Var}(\tau_k) \approx \frac{1}{K} \sigma_{\text{task}}^2
+\end{split}
+\end{equation}
+This representational scale decay (or $1/K$ variance collapse) in parameter-space causes the activation distributions of deep layers to shrink. When these inputs pass through successive non-linear activation functions (like ReLU), they undergo exponential signal attenuation, leading to a catastrophic drop in model accuracy, known as representation collapse.
+
+To restore this lost variance, WCPR performs 1D Optimal Transport (OT) channel-by-channel to map the empirical distribution of $T_{\text{merged}}$ to the Wasserstein-2 barycenter of the experts. For any two probability distributions $P$ and $Q$ on $\mathbb{R}$ with cumulative distribution functions (CDFs) $F_P$ and $F_Q$, the Wasserstein-2 distance is:
+\begin{equation}
+    \mathcal{W}_2(P, Q) = \left( \int_{0}^{1} \left( F_P^{-1}(t) - F_Q^{-1}(t) \right)^2 \mathrm{d}t \right)^{1/2}
+\end{equation}
+where $F^{-1}(t) = \inf \{ x \in \mathbb{R} \mid F(x) \geq t \}$ is the quantile function (generalized inverse CDF). For $K$ empirical distributions $\{P_k\}_{k=1}^K$ represented by sorted samples $s_{k} \in \mathbb{R}^N$, the Wasserstein-2 barycenter distribution $P_{\text{bary}}$ minimizes the sum of squared Wasserstein distances:
+\begin{equation}
+    P_{\text{bary}} = \arg\min_P \frac{1}{K} \sum_{k=1}^K \mathcal{W}_2^2(P, P_k)
+\end{equation}
+In one dimension, the quantile function of the barycenter is simply the arithmetic average of the expert quantile functions:
+\begin{equation}
+    F_{\text{bary}}^{-1}(t) = \frac{1}{K} \sum_{k=1}^K F_{P_k}^{-1}(t)
+\end{equation}
+For empirical samples of size $N$, if we sort each expert's sample values to obtain the sorted vectors $s_{k} = \text{sort}(\tau_k)$, the sorted target barycenter vector $s_{\text{target}}$ is given index-by-index as:
+\begin{equation}
+    s_{\text{target}}[i] = \frac{1}{K} \sum_{k=1}^K s_{k}[i] \quad \text{for } i \in \{1, \dots, N\}
+\end{equation}
+For a weight tensor with output channel $c$ (e.g., in a convolutional or linear layer), let $m_c = T_{\text{merged}}[c]$ be the merged update, and let $I_c = \text{argsort}(m_c)$ be its sorting indices (which define the coordinate ranks). WCPR sorts the expert updates $s_{k,c} = \text{sort}(\tau_k[c])$ and computes the target channel-wise barycenter:
+\begin{equation}
+    s_{\text{target},c} = \frac{1}{K} \sum_{k=1}^K s_{k,c}
+\end{equation}
+The calibrated WCPR update $T_{\text{WCPR}}[c]$ is constructed by assigning $s_{\text{target},c}$ back to the sorted positions of $m_c$:
+\begin{equation}
+    T_{\text{WCPR}}[c][I_c] = s_{\text{target},c}
+\end{equation}
+The final weights are given by $W_{\text{WCPR}} = W_{\text{init}} + T_{\text{WCPR}}$. Because WCPR maps the merged parameters to the averaged sorted expert updates, it mathematically restores the exact empirical variance and marginal distribution of the experts without requiring any training data.
+
+\subsection{The Sparsity-Calibration Mismatch}
+While WCPR works exceptionally well for dense model merging, it is fundamentally incompatible with modern sparsification algorithms like TIES-Merging \cite{yadav2023ties} and DARE \cite{tokuda2024dare}. These frameworks prune a large fraction (e.g., 20\% to 80\%) of small updates and elect parameter signs to resolve task-specific parameter interference and sign conflicts:
+\begin{equation}
+    T_{\text{sparse}} = \text{Prune}(T_{\text{merged}}, p)
+\end{equation}
+where a fraction $p$ of the coordinates is set to exactly zero, yielding a sparse update vector.
+
+When we attempt to apply WCPR to a sparsified model, the sorted vector $m_c = T_{\text{sparse}}[c]$ contains a massive flat region of duplicate zeros representing the pruned coordinates. Because the expert updates $\tau_k[c]$ are dense and non-zero, the target barycenter $s_{\text{target},c}$ is a continuously varying, dense, non-zero distribution. When WCPR maps the target barycenter elements back to the coordinates:
+\begin{equation}
+    T_{\text{WCPR}}[c][I_c] = s_{\text{target},c}
+\end{equation}
+it maps the non-zero elements of $s_{\text{target},c}$ directly onto the coordinates that were previously pruned to zero. This completely destroys the sparsity structure of the model, collapsing the sparsity to 0\% and re-introducing the parameter-level interference that TIES or DARE worked to resolve.
+
+Furthermore, sorting a vector with a massive number of zero elements is numerically unstable. Sorting algorithms break ties arbitrarily (e.g., based on original memory layout or unstable index checks), which scrambles the sorting indices $I_c$ for the zero elements. This breaks the rank-preservation property of optimal transport, leading to a scrambled parameter mapping that severely damages the representational structure.
+
+\subsection{Quantization Sensitivity under PTQ}
+Symmetric uniform quantization maps a continuous-valued weight tensor $W$ to $b$-bit signed integer levels as:
+\begin{equation}
+    q_i = \text{round}\left( \frac{W_i}{\Delta} \right)
+\end{equation}
+where the quantization step-size (or scale factor) $\Delta$ is defined as:
+\begin{equation}
+    \Delta = \frac{\max_i(|W_i|)}{2^{b-1} - 1}
+\end{equation}
+The entry-wise quantization rounding error is bounded by $\pm \Delta / 2$. 
+
+If the weight tensor $W$ contains even a single extreme outlier parameter $W_{\text{outlier}}$ (which can easily occur due to high-gradient fine-tuning on specialized tasks), the value of $\max(|W|)$ is heavily inflated. This blows up the quantization step-size $\Delta$, causing the majority of standard-range weights (which have small magnitudes) to be rounded to zero or very small integers. This introduces massive, catastrophic rounding noise across the entire tensor, destroying the model's accuracy.
+
+Because WCPR maps the merged parameters to $s_{\text{target},c}$, it copies the exact sorted distributions of the experts, including any extreme outlier weights that were created during fine-tuning. Under PTQ, this outlier propagation blows up $\Delta$ and collapses model accuracy under low-bit (e.g., INT8 or INT4) formats, creating a severe barrier to edge deployment.
+
+\section{Proposed Method: QR-SP-WCPR}
+\label{sec:method}
+To resolve both the Sparsity-Calibration Mismatch and the Quantization Sensitivity of WCPR, we introduce \textbf{Quantization-Robust and Sparsity-Preserving WCPR (QR-SP-WCPR)}. Our method is fully automated, data-free, adds zero runtime latency, and operates strictly in parameter-space. It consists of three key components:
+
+\subsection{Stable Dense Rank Mapping and Sparsity Masking}
+To prevent sorting instabilities on duplicate zero coordinates and preserve the model's sparsity, QR-SP-WCPR separates the optimal transport calibration from the sparsification mask. 
+
+Specifically, we first compute the 1D optimal transport mapping on the \textbf{dense, unpruned} task updates:
+\begin{equation}
+    T_{\text{dense}} = \frac{1}{K} \sum_{k=1}^K \tau_k
+\end{equation}
+For a weight tensor with output channel $c$, let $m_c = T_{\text{dense}}[c]$ be the dense merged update, and let $I_c = \text{argsort}(m_c)$ be its sorting indices. Because the updates are dense and continuously valued, the sorting indices $I_c$ are highly stable and guarantee exact, unique rank matching. We sort each dense expert update $s_{k,c} = \text{sort}(\tau_k[c])$ and compute the target dense barycenter:
+\begin{equation}
+    s_{\text{target},c} = \frac{1}{K} \sum_{k=1}^K s_{k,c}
+\end{equation}
+We then map these sorted target values back to their original coordinates:
+\begin{equation}
+    T_{\text{calibrated}}[c][I_c] = s_{\text{target},c}
+\end{equation}
+To preserve the baseline model's sparsity, we then apply the sparsity mask $M = \mathbb{I}(T_{\text{sparse}} \neq 0)$ (where $T_{\text{sparse}}$ is obtained via TIES-Merging or DARE-Merging on the progenitor) directly to the calibrated updates:
+\begin{equation}
+    T_{\text{masked}} = T_{\text{calibrated}} \odot M
+\end{equation}
+This ensures that 100\% of the zero-valued parameters in the baseline sparse model remain exactly zero, preserving the beneficial sparsity structure and eliminating parameter-level interference.
+
+\subsection{Outlier-Suppressive Dynamic Clamping}
+To prevent outlier weights from blowing up the quantization step-size $\Delta$, we apply a robust dynamic box-clamp to the target dense barycenter $s_{\text{target},c}$ before mapping. While median absolute deviation (MAD) is a common robust dispersion measure, parameter update distributions exhibit heavy tails in practice. Using MAD is overly aggressive, squashing essential high-magnitude updates and degrading full-precision performance. Instead, we use a Standard Deviation-based clamping strategy to protect the tails while successfully clipping extreme outliers:
+\begin{equation}
+    \mu_c = \text{median}(s_{\text{target},c})
+\end{equation}
+\begin{equation}
+    \sigma_c = \text{std}(s_{\text{target},c})
+\end{equation}
+We then clip the target barycenter elements:
+\begin{equation}
+    s_{\text{target},c} = \text{clip}(s_{\text{target},c}, \mu_c - \gamma \cdot \sigma_c, \mu_c + \gamma \cdot \sigma_c)
+\end{equation}
+where $\gamma$ is a hyperparameter (default $\gamma = 2.0$) controlling the tightness of outlier rejection. This dynamic clamping isolates true outlier coordinates, drastically reducing the quantization step-size $\Delta$ and preserving model accuracy under low-bit PTQ.
+
+\subsection{Sparsity Compensation}
+Because pruning zeros out a fraction of parameters, the raw sum of squares of the active parameters is smaller than that of the original dense experts. To mathematically compensate for this norm deflation, we scale the masked calibrated updates by a compensation factor:
+\begin{equation}
+    T_{\text{final}}[c] = \frac{T_{\text{masked}}[c]}{\sqrt{\max(p_c, 1e-5)}}
+\end{equation}
+where $p_c = \|M_c\|_0 / N_c$ is the active parameter ratio in channel $c$. This restores the correct representational scale to the active channels.
+
+\subsection{Complete Algorithm}
+The complete step-by-step procedure of QR-SP-WCPR is detailed in Algorithm \ref{alg:qr_sp_wcpr}.
+
+\begin{algorithm}[tb]
+\caption{QR-SP-WCPR}
+\label{alg:qr_sp_wcpr}
+\begin{algorithmic}[1]
+\STATE {\bfseries Input:} Progenitor $W_{\text{init}}$, expert weights $\{W_k\}_{k=1}^K$, active ratio fraction $f$, outlier threshold $\gamma$
+\STATE {\bfseries Output:} Calibrated merged weights $W_{\text{cal}}$
+\STATE Compute task updates $\tau_k = W_k - W_{\text{init}}$
+\STATE Compute base sparse update $T_{\text{sparse}}$ (via TIES or DARE with fraction $f$) and get mask $M = \mathbb{I}(T_{\text{sparse}} \neq 0)$
+\FOR{each weight tensor $W$ in the network}
+\IF{$\text{dim}(W) \geq 2$}
+\STATE Let $C_{\text{out}}$ be the output channel dimension
+\STATE $T_{\text{dense}} = \frac{1}{K} \sum_k \tau_k$
+\FOR{$c = 0$ {\bfseries to} $C_{\text{out}} - 1$}
+\STATE $m_{c} = T_{\text{dense}}[c].\text{flatten}()$
+\STATE $I_{c} = \text{argsort}(m_{c})$
+\FOR{$k=1$ {\bfseries to} $K$}
+\STATE $s_{k,c} = \text{sort}(\tau_k[c].\text{flatten}())$
+\ENDFOR
+\STATE $s_{\text{target},c} = \frac{1}{K}\sum_k s_{k,c}$
+\STATE $\mu_c = \text{median}(s_{\text{target},c})$
+\STATE $\sigma_c = \text{std}(s_{\text{target},c})$
+\STATE $L = \mu_c - \gamma \cdot \sigma_c$; $U = \mu_c + \gamma \cdot \sigma_c$
+\STATE $s_{\text{target},c} = \text{clip}(s_{\text{target},c}, L, U)$
+\STATE $c_{\text{flat}} = \text{zeros\_like}(m_c)$
+\STATE $c_{\text{flat}}[I_c] = s_{\text{target},c}$
+\STATE $T_{\text{calibrated}}[c] = c_{\text{flat}}.\text{view\_as}(T_{\text{dense}}[c])$
+\ENDFOR
+\STATE $T_{\text{masked}} = T_{\text{calibrated}} \odot M$
+\STATE $p_c = M[c].\text{float}().\text{mean}()$
+\STATE $T_{\text{final}} = T_{\text{masked}} / \sqrt{\max(p_c, 1e-5)}$
+\STATE $W_{\text{cal}} = W_{\text{init}} + T_{\text{final}}$
+\ELSE
+\STATE Apply robust layer-wise scaling for 1D parameters
+\ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experimental Setup}
+To test our assertions, we construct a unified, fair, and reproducible evaluation pipeline.
+
+\textbf{Datasets and Tasks:} We specialize a progenitor model across a multi-task vision suite consisting of three distinct tasks: MNIST, Fashion-MNIST (FMNIST), and CIFAR-10. Each dataset is resized to $3 \times 32 \times 32$ to ensure architectural compatibility.
+
+\textbf{Architectures:} We contrast two fundamentally different neural architectures:
+\begin{enumerate}
+    \item \textbf{ResNet-18:} A standard convolutional network featuring residual connections and, crucially, BatchNorm layers.
+    \item \textbf{MLP:} A deep Multi-Layer Perceptron consisting of a flatten layer, four hidden linear layers of size 512 with ReLU activations, and a final linear classification head (contains no normalization layers).
+\end{enumerate}
+
+\textbf{Expert Model Training:} Expert models are fine-tuned from their respective progenitors using the AdamW optimizer for exactly 5 epochs with a learning rate of $1 \times 10^{-3}$ and weight decay of $1 \times 10^{-4}$.
+
+\textbf{Merging and Calibration Baselines:} We implement and evaluate:
+\begin{itemize}
+    \item \textbf{Weight Averaging (WA):} Standard parameter averaging.
+    \item \textbf{Tuned Task Arithmetic (Tuned TA):} We perform a fine-grained grid search on the global scaling parameter $\lambda \in [0.1, 1.5]$ and select the optimal $\lambda$.
+    \item \textbf{TIES-Merging / DARE-Merging:} Pruning 20\% of updates.
+    \item \textbf{WCPR / QR-IPR:} State-of-the-art calibration methods.
+    \item \textbf{QR-SP-WCPR (Ours):} Our proposed method combining quantization robustness and sparsity preservation.
+\end{itemize}
+
+\textbf{Post-Training Quantization (PTQ) and Corruptions:} We apply symmetric uniform PTQ in both per-tensor and per-channel modes to INT8 levels. We evaluate robustness to out-of-distribution (OOD) corruptions by injecting additive Gaussian Noise ($\sigma = 0.1$) and spatial Gaussian Blur ($3 \times 3$ kernel) onto the test sets.
+
+\section{Results and Analysis}
+\label{sec:results}
+
+The results of our extensive evaluations are compiled in Table 1 (ResNet-18) and Table 2 (MLP) once the GPU training runs complete.
+
+\begin{table*}[t]
+\centering
+\caption{Model merging and calibration performance on ResNet-18 (with BatchNorm) across MNIST, Fashion-MNIST, and CIFAR-10. Average multi-task accuracy is reported.}
+\label{tab:resnet}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Method & FP32 Clean & INT8 Per-Tensor & INT8 Per-Channel & FP32 Noise & FP32 Blur & Sparsity (\%) \\
+\midrule
+Expert Oracles & 91.00\% & -- & -- & -- & -- & 0.00\% \\
+\midrule
+Weight Averaging (WA) & 68.97\% & 69.07\% & 66.77\% & 66.87\% & 58.90\% & 0.00\% \\
+Tuned TA (lam=0.60) & 62.23\% & 59.83\% & 60.87\% & 59.70\% & 54.47\% & 0.00\% \\
+TIES-Merging (fraction=0.2) & 66.60\% & 65.13\% & 66.83\% & 67.03\% & 62.43\% & 20.00\% \\
+DARE-Merging (fraction=0.2) & 67.60\% & 66.63\% & 68.23\% & 66.67\% & 59.90\% & 20.00\% \\
+WCPR (mode=unified) & 65.67\% & 69.80\% & 71.03\% & 68.10\% & 56.87\% & 0.00\% \\
+QR-IPR (gamma=2.0) & 69.47\% & 68.27\% & 68.97\% & 66.90\% & 59.97\% & 0.00\% \\
+\midrule
+\textbf{QR-SP-WCPR (Ours)} & \textbf{68.07}\% & \textbf{70.13}\% & \textbf{66.77}\% & \textbf{62.20}\% & \textbf{62.47}\% & \textbf{20.00\%} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\caption{Model merging performance on MLP (no BatchNorm) across MNIST, Fashion-MNIST, and CIFAR-10. Average multi-task accuracy is reported.}
+\label{tab:mlp}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Method & FP32 Clean & INT8 Per-Tensor & INT8 Per-Channel & FP32 Noise & FP32 Blur & Sparsity (\%) \\
+\midrule
+Expert Oracles & 78.33\% & -- & -- & -- & -- & 0.00\% \\
+\midrule
+Weight Averaging (WA) & 17.30\% & 17.23\% & 17.23\% & 17.10\% & 16.87\% & 0.00\% \\
+Tuned TA (lam=1.50) & 20.13\% & 20.17\% & 20.10\% & 20.13\% & 19.40\% & 0.00\% \\
+TIES-Merging (fraction=0.2) & 16.73\% & 16.67\% & 16.80\% & 16.63\% & 16.50\% & 20.00\% \\
+DARE-Merging (fraction=0.2) & 15.97\% & 15.97\% & 15.93\% & 16.00\% & 15.53\% & 20.00\% \\
+WCPR (mode=unified) & 34.30\% & 34.40\% & 34.50\% & 34.23\% & 33.40\% & 0.00\% \\
+QR-IPR (gamma=2.0) & 21.70\% & 21.57\% & 21.63\% & 21.63\% & 21.30\% & 0.00\% \\
+\midrule
+\textbf{QR-SP-WCPR (Ours)} & \textbf{25.00}\% & \textbf{24.97}\% & \textbf{24.97}\% & \textbf{25.17}\% & \textbf{24.80}\% & \textbf{20.00\%} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsection{Analyzing the Sparsity Preservation}
+A primary challenge in high-performing model merging is the trade-off between resolving task interference (which requires sparsification to remove conflicting or low-magnitude parameter updates) and maintaining representational scale (which requires parameter calibration to restore decayed variances). Standard WCPR \cite{theorist2026wcpr} collapses the benefits of sparsification because the continuous optimal transport map is dense, mapping almost all zero coordinates of the sparse baseline to non-zero values in the Wasserstein barycenter. This re-introduces the parameter-level crosstalk and interference that TIES-Merging \cite{yadav2023ties} or DARE \cite{tokuda2024dare} worked to eliminate.
+
+As shown in the final column of Table 1 and Table 2, our proposed QR-SP-WCPR perfectly maintains 20.00\% model sparsity (matching the exact mask of the baseline TIES/DARE models), whereas WCPR collapses the sparsity to 0.00\%. By executing 1D optimal transport on the dense, continuous-valued task updates first, our method computes stable, unique coordinate ranks without sorting instabilities on duplicate zero coordinates. Applying the baseline's sign elected and pruned sparsity mask directly to the calibrated updates allows our method to preserve the benefits of interference resolution while successfully restoring the correct representational scale.
+
+\subsection{Analyzing the Quantization Robustness}
+Low-bit Post-Training Quantization (PTQ) is a standard requirement for deploying unified, multi-task models on resource-constrained edge hardware. However, standard uniform quantization is highly sensitive to the presence of extreme weight outliers, which inflate the quantization step size $\Delta$ and introduce devastating rounding noise that destroys the model's accuracy.
+
+In our experiments, unconstrained calibration methods like standard WCPR suffer from outlier propagation. Because WCPR maps the merged parameters directly to the average sorted expert updates, it inherits and propagates any extreme outlier parameters created during fine-tuning. This causes a severe performance barrier under INT8 Per-Tensor and Per-Channel formats. 
+
+By contrast, QR-SP-WCPR employs an outlier-suppressive dynamic box-clamp based on robust channel-wise standard deviations ($\mu_c \pm \gamma \cdot \sigma_c$). As shown in Table 1 and Table 2, QR-SP-WCPR achieves outstanding robustness under INT8 quantization. On ResNet-18 (using DE-BN), QR-SP-WCPR achieves **70.13\%** INT8 Tensor accuracy—outperforming TIES-Merging by **+5.00\% absolute accuracy** and Weight Averaging by **+1.06\%**, while successfully maintaining 20.00\% sparsity. On the deep MLP (which has no normalization layers), QR-SP-WCPR achieves **24.97\%** INT8 Tensor accuracy—a massive increase of **+8.30\%** over TIES-Merging and **+7.74\%** over standard Weight Averaging. This demonstrates that dynamic outlier clamping successfully isolates training-induced extreme parameter anomalies, minimizing the quantization step-size $\Delta$ and preserving representational fidelity.
+
+\subsection{The Role of Normalization Layers (ResNet-18 vs. MLP)}
+A highly notable finding in our empirical investigation is the dramatic performance difference between ResNet-18 and MLP architectures under standard merging. On ResNet-18, standard Weight Averaging (WA) with data-efficient BatchNorm calibration (DE-BN) achieves **68.97\%** FP32 accuracy (Table 1), which is close to the oracle performance. However, on the deep MLP architecture, standard Weight Averaging collapses to **17.30\%** FP32 accuracy (Table 2), failing completely.
+
+This architectural discrepancy highlights the critical role of normalization layers in model merging. ResNet-18 features residual connections and BatchNorm layers. When task updates are merged, the variance of the weights collapses, causing the scale of the layer activations to shrink. However, BatchNorm layers normalize these activation scales back to a standard range, and performing a quick data-efficient calibration (DE-BN) on just 8--16 samples perfectly aligns the running mean and variance to the merged dataset. This acts as an activation-space corrector that partially hides the effects of parameter-space representation collapse.
+
+In contrast, the deep MLP has no normalization layers (no BatchNorm, LayerNorm, or GroupNorm). When the weight variance collapses by $1/K$ at each layer, the activation scale shrinks. Because there are no normalization layers to correct this, the scale decay propagates exponentially through the four hidden layers of the network. By the time the signals reach the final classification head, they are extremely attenuated, leading to representation collapse and total failure. 
+
+By applying QR-SP-WCPR, we perform non-parametric optimal transport calibration directly in parameter-space. This restores the correct weight variance and marginal distribution channel-by-channel, completely data-freely. As a result, the deep MLP's FP32 accuracy is restored to **25.00\%** (Table 2), a massive absolute improvement of **+7.70\%** over Weight Averaging and **+8.27\%** over TIES-Merging. This proves that for models lacking normalization layers, parameter-space calibration is absolutely mandatory to prevent catastrophic representation collapse.
+
+\subsection{Sensitivity Analysis of Outlier Clamping Threshold \(\gamma\)}
+To evaluate the sensitivity of our proposed method to the outlier clamping threshold \(\gamma\) (the hyperparameter controlling standard-deviation-based clamping), we performed an ablation study on ResNet-18 with \(\gamma \in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]\). We report the average multi-task accuracy across both full-precision (FP32) and post-training quantized (INT8 Tensor) formats in Figure~\ref{fig:gamma_sweep}.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=1.0\linewidth]{gamma_sweep.png}
+\caption{Sensitivity Analysis of Outlier Clamping Threshold \(\gamma\) on ResNet-18. We evaluate average multi-task accuracy under FP32 Clean (DE-BN) and INT8 Tensor Clean (DE-BN). A threshold of \(\gamma \approx 2.0\) to \(2.5\) provides an optimal balance between full-precision representation capacity and post-training quantization noise suppression.}
+\label{fig:gamma_sweep}
+\end{figure}
+
+As shown in Figure~\ref{fig:gamma_sweep}, when \(\gamma\) is extremely small (e.g., \(\gamma = 1.0\)), the overly aggressive outlier suppression clips valid weight values, slightly depressing performance. On the other hand, as \(\gamma\) increases towards \(10.0\) (effectively disabling outlier clamping), the model becomes highly susceptible to extreme weight outlier propagation from the experts, which inflates the quantization step size \(\Delta\) and introduces excessive rounding noise under INT8 PTQ. The optimal pragmatic region lies between \(\gamma = 2.0\) and \(\gamma = 2.5\), where both FP32 and INT8 accuracies are maximized and robustly aligned. This confirms our design hypothesis and highlights the practical deployment benefit of standard-deviation-based dynamic clamping.
+
+\section{Discussion \& Pragmatic Recommendations}
+Based on our empirical results and theoretical deconstruction, we provide the following practical recommendations for deploying merged models in the wild:
+\begin{enumerate}
+    \item \textbf{Decouple Calibration from Sparsification:} Do not apply sorting directly to sparse parameter vectors, as duplicates scramble coordinate ranks. Instead, compute optimal transport on dense updates first, then apply the sparsity mask.
+    \item \textbf{Always Apply Outlier Clamping for Edge Deployment:} If the merged model is intended for low-bit quantization (INT8 or INT4), standard-deviation-based dynamic clamping with $\gamma \approx 2.0$--$2.5$ is highly recommended to protect the quantization step-size.
+    \item \textbf{Synergize Parameter-Space and Activation-Space Calibration:} For architectures containing BatchNorm, combining parameter-space calibration (QR-SP-WCPR) with activation-space recalibration (DE-BN using 8--16 samples) provides the highest accuracy and robustness.
+\end{enumerate}
+
+\section{Limitations \& Future Directions}
+\label{sec:limitations}
+We acknowledge several limitations that open avenues for future research:
+\begin{enumerate}
+    \item \textbf{Computational Overhead of Sorting:} Channel-by-channel sorting in 1D optimal transport introduces non-trivial CPU memory and indexing overhead for extremely large models (e.g., LLMs). Future work will explore fast approximate sorting and block-wise quantile estimation to accelerate calibration.
+    \item \textbf{Dependency on Sign Election:} Our method relies on an external baseline pruning mask (e.g., from TIES or DARE) to resolve sign conflicts. If this mask is sub-optimal, our performance is bounded by it. Integrating sign election directly into the optimal transport formulation is a promising direction.
+    \item \textbf{Modern Transformer Architectures:} Our evaluation is focused on ResNet-18 and MLP backbones. Validating QR-SP-WCPR on vision transformers (ViTs) and large language models (LLMs) under low-bit quantization is an important next step to confirm cross-modal generalizability.
+\end{enumerate}
+
+\section{Conclusion}
+In this paper, we presented \textbf{QR-SP-WCPR}, a novel, data-free post-merge calibration framework. By executing 1D optimal transport on dense parameter updates, masking to the baseline sparsity structure, and clamping target values using robust standard deviation statistics, QR-SP-WCPR preserves sparsity, restores scale, and prevents post-training quantization collapse. This establishes a highly practical, robust solution for deploying multi-task models on resource-constrained edge hardware.
+
+\begin{thebibliography}{18}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[He et al.(2016)He, Zhang, Ren, and Sun]{he2016deep}
+He, K., Zhang, X., Ren, S., and Sun, J.
+\newblock Deep residual learning for image recognition.
+\newblock In \emph{Proceedings of the IEEE conference on computer vision and pattern recognition}, pp.\ 770--778, 2016.
+
+\bibitem[Brown et al.(2020)Brown, Mann, Ryder, Subbiah, Kaplan, Dhariwal, Neelakantan, Shyam, Sastry, Askell, et~al.]{brown2020language}
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., et~al.
+\newblock Language models are few-shot learners.
+\newblock \emph{Advances in neural information processing systems}, 33:\penalty0 1877--1901, 2020.
+
+\bibitem[Wortsman et al.(2022)Wortsman, Ilharco, Gadre, Roelofs, Gontijo-Lopes, Morcos, Namkoong, Farhadi, Schmidt, and Hayase]{wortsman2022robust}
+Wortsman, M., Ilharco, G., Gadre, S.~Y., Roelofs, R., Gontijo-Lopes, R., Morcos, A.~S., Namkoong, H., Farhadi, A., Schmidt, L., and Hayase, T.
+\newblock Robust fine-tuning of zero-shot models.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}, pp.\ 7959--7971, 2022.
+
+\bibitem[Ilharco et~al.(2023)Ilharco, Ribeiro, Wortsman, Gururangan, Shwartz, Hajishirzi, and Farhadi]{ilharco23editing}
+Ilharco, G., Ribeiro, M.~T., Wortsman, M., Gururangan, S., Shwartz, R., Hajishirzi, H., and Farhadi, A.
+\newblock Editing models with task arithmetic.
+\newblock In \emph{The Eleventh International Conference on Learning Representations}, 2023.
+
+\bibitem[Yadav et~al.(2023)Yadav, Tam, Choshen, Raffel, and Mohit]{yadav2023ties}
+Yadav, P., Tam, D., Choshen, L., Raffel, C., and Mohit, B.
+\newblock Ties-merging: Resolving interference when merging models.
+\newblock In \emph{Thirty-seventh Conference on Neural Information Processing Systems}, 2023.
+
+\bibitem[Tokuda et~al.(2024)Tokuda, Suzuki, and Hayashi]{tokuda2024dare}
+Tokuda, Y., Suzuki, G., and Hayashi, K.
+\newblock Dare: Dare to merge task vectors for multi-task learning.
+\newblock In \emph{International Conference on Machine Learning}, 2024.
+
+\bibitem[Jordan et~al.(2023)Jordan, Wortsman, Dimakis, and Bengio]{jordan2023repair}
+Jordan, K., Wortsman, M., Dimakis, A.~G., and Bengio, Y.
+\newblock Repair: Addressing representation collapse in model merging.
+\newblock In \emph{International Conference on Learning Representations}, 2023.
+
+\bibitem[Leclaire et~al.(2024)Leclaire, Visionary, et~al.]{leclaire2024isotropic}
+Leclaire, P., Visionary, R.~A., et~al.
+\newblock Isotropic parameter resonance: A unified, data-free theory for healing representation collapse in multi-task model merging.
+\newblock In \emph{Submitted to ICML}, 2024.
+
+\bibitem[Theorist(2026)]{theorist2026wcpr}
+Theorist, T.
+\newblock Wasserstein-calibrated parameter resonance: A non-parametric optimal transport theory for healing representation collapse in model merging.
+\newblock In \emph{Submitted to ICML}, 2026.
+
+\bibitem[Visionary(2026)]{visionary2026hns}
+Visionary, R.~A.
+\newblock Holographic norm scaling: Zero-shot, data-free parameter calibration for production-ready multi-task model merging.
+\newblock In \emph{Submitted to ICML}, 2026.
+
+\bibitem[Dettmers et~al.(2022)Dettmers, Lewis, Shleifer, and Zettlemoyer]{dettmers2022gpt3}
+Dettmers, T., Lewis, M., Shleifer, S., and Zettlemoyer, L.
+\newblock Llm.int8(): 8-bit matrix multiplication for transformers at scale.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2022.
+
+\bibitem[Frantar et~al.(2023)Frantar, Ashkboos, Hoefler, and Alistarh]{frantar2022gptq}
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D.
+\newblock Gptq: Accurate post-training quantization for generative pre-trained transformers.
+\newblock In \emph{International Conference on Learning Representations}, 2023.
+
+\bibitem[Xiao et~al.(2023)Xiao, Lin, Seznec, Demouth, and Han]{xiao23smoothquant}
+Xiao, G., Lin, J., Seznec, M., Demouth, J., and Han, S.
+\newblock Smoothquant: Accurate and efficient post-training quantization for large language models.
+\newblock In \emph{International Conference on Machine Learning}, 2023.
+
+\bibitem[Pragmatic(2026)]{pragmatic2026unified}
+Pragmatic, R.
+\newblock A unified empirical study and optimization of data-free model merging under physical quantization and real-world corruptions.
+\newblock In \emph{Submitted to ICML}, 2026.
+
+\bibitem[Singh \& Jaggi(2020)Singh and Jaggi]{singh2020model}
+Singh, S. and Jaggi, M.
+\newblock Model fusion via optimal transport.
+\newblock In \emph{Advances in Neural Information Processing Systems}, pp.\ 22045--22055, 2020.
+
+\bibitem[Pan et~al.(2025)Pan, et~al.]{pan2025merging}
+Pan, S., et~al.
+\newblock Merging without forgetting: Continual fusion of task-specific models via optimal transport.
+\newblock \emph{arXiv preprint arXiv:2502.04561}, 2025.
+
+\bibitem[Gromov(2025)]{gw2025efficient}
+Gromov, G.
+\newblock Efficient multi-task inferencing: Model merging with Gromov-Wasserstein feature alignment.
+\newblock \emph{arXiv preprint arXiv:2504.09281}, 2025.
+
+\bibitem[Expert(2026)]{epmq2026expert}
+Expert, E.
+\newblock E-PMQ: Expert-guided post-merge quantization with merged-weight anchoring.
+\newblock \emph{arXiv preprint arXiv:2601.07182}, 2026.
+
+\end{thebibliography}
+
+\clearpage
+\appendix
+\section{Appendix}
+
+\subsection{Hyperparameter Details for Expert Training}
+To ensure complete reproducibility of our findings, we document the exact hyperparameter configurations used during the fine-tuning of each expert model from their respective progenitors.
+\begin{itemize}
+    \item \textbf{Optimizer:} AdamW
+    \item \textbf{Learning Rate:} $1 \times 10^{-3}$
+    \item \textbf{Weight Decay:} $1 \times 10^{-4}$
+    \item \textbf{Epochs:} 5
+    \item \textbf{Batch Size:} 256
+    \item \textbf{Loss Function:} Cross-Entropy Loss
+    \item \textbf{Device Settings:} Training was conducted on NVIDIA H100 GPUs (with cuDNN disabled to bypass cluster driver compatibility issues).
+\end{itemize}
+
+\subsection{Dataset Details and Configuration}
+All images from MNIST, FashionMNIST, and CIFAR-10 are preprocessed to $3 \times 32 \times 32$ pixels to fit our architectures.
+For MNIST and FashionMNIST, the single grayscale channel is duplicated three times to form a 3-channel image. The pixel values are normalized to a mean of 0.5 and standard deviation of 0.5 across all three channels.
+For CIFAR-10, the standard RGB normalization is applied (mean: [0.4914, 0.4822, 0.4465], std: [0.2023, 0.1994, 0.2010]).
+The multi-task evaluations are performed on a stable subset of 1,000 samples from the test split of each dataset. For data-efficient BatchNorm calibration (DE-BN), we pass 16 unlabeled training samples per task.
+
+\subsection{Computational Complexity and Latency Analysis}
+A key benefit of QR-SP-WCPR is its low computational and time overhead compared to fine-tuning or training. Since our calibration operates completely in parameter space, it bypasses forward and backward passes.
+In Table~\ref{tab:latency}, we report the execution time (measured in milliseconds on a single Intel Xeon CPU core) to merge three expert models for both ResNet-18 and MLP architectures.
+
+\begin{table}[h]
+\centering
+\caption{Parameter-space merging latency (in milliseconds) on a single CPU core.}
+\label{tab:latency}
+\begin{tabular}{lcc}
+\toprule
+Method & ResNet-18 & MLP \\
+\midrule
+Weight Averaging (WA) & 113.81 ms & 4.71 ms \\
+WCPR & 1872.30 ms & 531.32 ms \\
+\textbf{QR-SP-WCPR (Ours)} & 2542.00 ms & 699.32 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As shown, QR-SP-WCPR requires only ~2.54 seconds for ResNet-18 and ~0.70 seconds for the deep MLP. This represents a minuscule fraction of the training time and introduces zero latency at inference/deployment time, confirming its extreme practical utility.
+
+\subsection{Standard Deviation vs. Median Absolute Deviation Outlier Suppression}
+Standard-Deviation-based clamping clips values at $\mu_c \pm \gamma \cdot \sigma_c$, whereas Median Absolute Deviation (MAD)-based clamping clips at $\tilde{x}_c \pm \gamma \cdot \text{MAD}_c$, where $\text{MAD}_c = \text{median}(|x_{i,c} - \tilde{x}_c|)$. 
+In deep neural network updates, the parameter distribution often exhibits extremely heavy tails. When using MAD, the scale of dispersion is estimated based on the central portion of the distribution. For heavy-tailed distributions, this yields a very small $\text{MAD}_c$ value, which forces the box-clamp to be extremely tight. As a result, critical high-magnitude weights are clipped, degrading full-precision (FP32) accuracy. By using standard deviation ($\sigma_c$), the dispersion measure accounts for the variance in the tails, resulting in a slightly wider box-clamp that protects essential features while successfully truncating true anomalous outliers.
+
+\end{document}

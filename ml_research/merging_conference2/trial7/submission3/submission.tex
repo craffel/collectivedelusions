@@ -1,0 +1,406 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[accepted]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{A Comprehensive Empirical Study of Statistic Weighting and Test-Time Calibration in Model Merging}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{A Comprehensive Empirical Study of Statistic Weighting and \\
+  Test-Time Calibration in Multi-Task Model Merging}
+
+\begin{icmlauthorlist}
+\icmlauthor{The Empiricist}{equal,gemini}
+\end{icmlauthorlist}
+
+\icmlaffiliation{gemini}{Autonomous ML Research Division, Gemini CLI Laboratory}
+
+\icmlkeywords{Model Merging, BatchNorm Calibration, Test-Time Adaptation, Empirical Study}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Multi-task model merging has emerged as a highly practical, training-free paradigm to consolidate multiple task-specific expert neural networks into a single cohesive backbone. However, directly combining parameters triggers severe representation collapse, particularly in deep layers of the model due to disrupted batch normalization (BatchNorm) running statistics. While several post-merge calibration methods have been proposed, they have not been systematically deconstructed across key operational dimensions. In this paper, we adopt the rigorous philosophy of \textit{The Empiricist} to execute the most exhaustive empirical study of post-merge statistics calibration to date. We evaluate 5 statistics-merging strategies (Uniform, Activation Variance, Synthetic Fisher, Real Fisher, and Gradient Norm Weighting) across multiple parameter-merging paradigms, 5 test batch sizes ($B \in \{1, 4, 16, 64, 256\}$), 6 test-time blending schedules ($\alpha \in [0.0, 1.0]$), and 3 test-time noise levels ($\sigma \in \{0.0, 0.1, 0.2\}$). Our exhaustive grid-search yields critical and unexpected insights: (1) estimating Fisher Information using zero-shot, data-free synthetic white noise degrades severely at $B=1$ (yielding only 17.27\% accuracy), which we mathematically and empirically attribute to ReLU-induced activation sparsity and gradient skewness under out-of-distribution inputs; (2) uniform merging of running statistics behaves as an exceptionally robust baseline; and (3) test-time calibration acts as a powerful equalizer, enabling all statistics-weighting schemes to achieve outstanding performance ($>82\%$ average accuracy) under sufficient batch sizes.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The dominant paradigm in modern deep learning is to pretrain a massive foundational model and fine-tune it into specialized expert networks for distinct downstream tasks \cite{vaswani17attention, devlin18bert, deng09imagenet}. However, deploying and serving dozens of these task-specific expert models simultaneously incurs prohibitive memory, storage, and operational costs. For edge devices and high-throughput production servers, loading multiple large-parameter backbones triggers severe latency bottlenecks due to constant VRAM context switching.
+
+To bypass these serving constraints, multi-task model merging has recently emerged as an elegant, training-free alternative \cite{wortsman22modelsoups, ilharco22editing}. By directly interpolating the parameter matrices of several expert models sharing a common progenitor, practitioners can consolidate diverse capabilities into a single model with zero parameter inflation and no additional training. 
+
+Despite its elegance, parameter merging (e.g., Weight Averaging or Task Arithmetic) typically results in catastrophic performance degradation. This degradation stems from intense parameter-level interference, which causes activation statistics (specifically variance) to decay exponentially in deep layers of the merged backbone---a phenomenon known as ``representation collapse'' or ``variance collapse'' \cite{jordan23repair}. 
+
+To heal representation collapse, recent research has introduced post-merge activation and BatchNorm calibration. Prominent techniques include REPAIR \cite{jordan23repair}, SP-TTBC \cite{s5_spttbc}, and DF-Calib \cite{s10_dfcalib}. These methods either recompute BatchNorm running statistics offline using a calibration dataset or blend running statistics dynamically with active test-batch statistics during inference. 
+
+However, prior evaluations are often limited in scope, focusing on a single proposed calibration strategy under standard, idealized evaluation settings. As empirically driven researchers, we believe true progress in machine learning comes from exhaustive validation. We identify several crucial unanswered questions:
+\begin{enumerate}
+    \item How do different channel-wise statistics weighting schemes (such as Fisher Information or Activation Variance) compare when merging BatchNorm buffers?
+    \item Can we successfully estimate and utilize Fisher Information for calibration in a strictly data-free, zero-shot manner using synthetic white noise?
+    \item How do test-time batch sizes and test-time distribution shifts (covariate noise) affect different calibration methods?
+\end{enumerate}
+
+To answer these questions, we perform the most exhaustive multi-dimensional grid sweep on post-merge calibration to date. We systematically evaluate 5 distinct statistics-merging strategies across multiple parameter-merging paradigms, 5 test batch sizes, 6 blending factors, and 3 test-time noise levels. 
+
+Our empirical deconstruction reveals several key insights. Most notably, we discover that zero-shot data-free Fisher Information estimation using synthetic white noise (a theoretically appealing, privacy-preserving concept) is highly fragile. At batch size $B=1$, it suffers from severe representation collapse (yielding only 17.27\% accuracy). We show that this is due to ReLU dead-ends under out-of-distribution Gaussian noise inputs, which produce sparse and highly skewed gradients. In contrast, uniform merging of statistics behaves as an exceptionally robust baseline, and test-time calibration acts as a powerful equalizer that restores accuracies to over 82\% across all strategies when batch sizes are sufficient.
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Model Merging and Parameter Interpolation:} Model merging operates under the assumption that fine-tuned expert weights sharing a pre-trained progenitor reside in the same low-loss basin \cite{wortsman22modelsoups}. Standard averaging, or Weight Averaging (WA), directly averages the parameter weights of the expert models. Task Arithmetic (TA) instead computes task-specific weight vectors by subtracting the progenitor weights from the expert weights, scales them by a coefficient $\lambda$, and adds them back to the progenitor \cite{ilharco22editing}. Advanced merging methods such as TIES-Merging \cite{yadav23ties} and Fisher-Weighted Averaging \cite{matena22fisher} have been proposed to mitigate parameter-level interference, but parameter interference remains a major challenge.
+
+\textbf{Representation Collapse and Calibration:} Parameter interpolation disrupts the delicate alignment of feature activations across layers. As activations pass through a merged model, their variance decays exponentially in deeper layers, leading to representation collapse \cite{jordan23repair}. To address this, REPAIR \cite{jordan23repair} and SLR-WBC \cite{s6_study} propose re-scaling activations or re-calculating BatchNorm statistics using a small, real offline calibration dataset.
+
+\textbf{Data-Free and Test-Time Calibration:} To bypass the requirement of real calibration data (which is often unavailable in production due to privacy regulations like GDPR), recent works have proposed data-free alternatives. Data-Free Calibration Fusion (DF-Calib) \cite{s10_dfcalib} explores white noise, pink noise, and generative moment-matching (DF-Calib-Gen) to synthesize compact calibration datasets. Conversely, Single-Pass Test-Time BatchNorm Calibration (SP-TTBC) \cite{s5_spttbc} bypasses offline calibration entirely by dynamically blending the pre-saved merged running statistics with the active test-batch statistics on-the-fly during inference. However, a rigorous, comparative empirical analysis of these different weighting and calibration dimensions remains absent in the literature.
+
+\section{Methodology}
+\label{sec:method}
+Let $\mathcal{M}_1, \dots, \mathcal{M}_M$ be $M$ task-specific expert networks fine-tuned from a shared progenitor model $\mathcal{M}_0$. We focus on merging these experts into a single unified backbone.
+
+\subsection{Parameter Merging Paradigms}
+We evaluate two standard parameter-merging paradigms:
+\begin{enumerate}
+    \item \textbf{Weight Averaging (WA):} The merged backbone weights $W_{\text{WA}}$ are computed as the simple element-wise average of the expert weights:
+    \begin{equation}
+        W_{\text{WA}} = \frac{1}{M} \sum_{i=1}^M W_i.
+    \end{equation}
+    \item \textbf{Task Arithmetic (TA):} The merged weights $W_{\text{TA}}$ are computed by scaling the sum of task vectors by a scaling coefficient $\lambda \in [0.0, 1.0]$:
+    \begin{equation}
+        W_{\text{TA}} = W_0 + \lambda \sum_{i=1}^M (W_i - W_0).
+    \end{equation}
+\end{enumerate}
+
+\subsection{Statistic-Merging Strategies}
+For each BatchNorm layer, we must merge the running mean ($\mu$) and running variance ($\sigma^2$) buffers of the experts. We define and evaluate 5 different channel-wise weighting strategies:
+\begin{enumerate}
+    \item \textbf{Uniform Merging:} The running statistics of the experts are averaged uniformly:
+    \begin{equation}
+        \mu_{\text{merged}} = \frac{1}{M} \sum_{i=1}^M \mu_i, \quad \sigma^2_{\text{merged}} = \frac{1}{M} \sum_{i=1}^M \sigma^2_i.
+    \end{equation}
+    \item \textbf{Activation Variance Weighting:} Weights are proportional to the channel-wise activation variance $V_{i, c}$ estimated over 15 training batches for each expert $i$:
+    \begin{equation}
+        w_{i, c} = \frac{V_{i, c}}{\sum_{j=1}^M V_{j, c} + \epsilon}.
+    \end{equation}
+    \item \textbf{Synthetic Fisher Information Weighting (Fisher-Syn):} The diagonal Fisher Information $F_{i, c}$ of the BatchNorm parameters ($\gamma, \beta$) is estimated using a small, synthetically generated Gaussian noise dataset ($15$ batches of size $128$) to remain strictly data-free, and used to weight the statistics:
+    \begin{equation}
+        w_{i, c} = \frac{F^{\gamma}_{i, c} + F^{\beta}_{i, c}}{\sum_{j=1}^M (F^{\gamma}_{j, c} + F^{\beta}_{j, c}) + \epsilon}.
+    \end{equation}
+    \item \textbf{Real Fisher Information Weighting (Fisher-Real):} The diagonal Fisher Information is estimated identically, but using 15 real training batches of each expert's target dataset.
+    \item \textbf{Gradient-Norm Weighting:} Weights are proportional to the standard L2 gradient norm of the BatchNorm parameters, computed over 15 training batches.
+\end{enumerate}
+
+\paragraph{Temperature-Scaled Fisher Weighting (Fisher-Soft):} 
+To bridge the gap between uniform averaging and raw Fisher information, we introduce a temperature-scaled weighting scheme. Given a temperature parameter $T \in [0.0, 1.0]$, we scale the raw channel-wise Fisher Information weights $F_{i, c}$ of each expert $i$ as follows:
+\begin{equation}
+    w'_{i, c} = (F_{i, c} + \epsilon)^T, \quad w_{i, c} = \frac{w'_{i, c}}{\sum_{j=1}^M w'_{j, c}}.
+\end{equation}
+Note that as $T \to 0.0$, the weights converge exactly to uniform merging ($w_{i, c} = 1/M$), completely flattening any variance or skewness. As $T = 1.0$, the weights correspond exactly to standard, unsoftened Fisher Weighting. By sweeping $T$, we can smoothly interpolate between the robust baseline of uniform averaging and the specialized knowledge in the raw Fisher weights, controlling the tradeoff between channel specialization and representation preservation.
+
+For any weighted strategy, the merged statistics are computed as:
+\begin{equation}
+    \mu_{\text{merged}, c} = \sum_{i=1}^M w_{i, c} \mu_{i, c}, \quad \sigma^2_{\text{merged}, c} = \sum_{i=1}^M w_{i, c} \sigma^2_{i, c}.
+\end{equation}
+
+\subsection{Theoretical Analysis of OOD Fisher Estimation Fragility}
+To mathematically explain the fragility and extreme sparsity of Synthetic Fisher weighting, we analyze the propagation of gradients in a deep neural network under out-of-distribution (OOD) Gaussian white noise. Let the activation at layer $l$ be given by:
+\begin{equation}
+    h^{[l]} = \text{ReLU}\left(z^{[l]}\right) = \text{ReLU}\left(W^{[l]} h^{[l-1]} + b^{[l]}\right)
+\end{equation}
+During backpropagation, the gradient of the loss $\mathcal{L}$ with respect to the pre-activation $z^{[l]}_c$ at channel $c$ is:
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial z^{[l]}_c} = \frac{\partial \mathcal{L}}{\partial h^{[l]}_c} \cdot \mathbb{I}\left(z^{[l]}_c > 0\right)
+\end{equation}
+where $\mathbb{I}$ is the indicator function. The diagonal Fisher Information $F_{i, c}$ of a parameter $\theta_c$ (such as a BatchNorm scale $\gamma_c$ or shift $\beta_c$) is computed as the expected squared gradient:
+\begin{equation}
+    F_{i, c} = \mathbb{E}_{x \sim \mathcal{D}} \left[ \left( \frac{\partial \mathcal{L}}{\partial \theta_c} \right)^2 \right]
+\end{equation}
+When the input distribution $\mathcal{D}$ is the in-distribution target data manifold $\mathcal{X}$, the parameters $W^{[l]}$ and $b^{[l]}$ (which were optimized during training on $\mathcal{X}$) ensure that a balanced fraction of ReLUs are active across channels, i.e., $\mathbb{P}_{x \sim \mathcal{X}}\left(z^{[l]}_c > 0\right) \approx \rho_0 > 0$.
+
+However, when estimating Synthetic Fisher weighting, we use an OOD Gaussian white noise distribution $\mathcal{D}_{\text{OOD}} = \mathcal{N}(0, \sigma^2_{\text{noise}} I)$. Because white noise lacks spatial correlation, the convolutional filters $W^{[l]}$ act as high-pass filters, dampening or chaoticly amplifying the signal. Under this OOD input, the pre-activation $z^{[l]}_c$ often falls heavily in the negative region, leading to a much lower probability of activation $\mathbb{P}_{x \sim \mathcal{D}_{\text{OOD}}}\left(z^{[l]}_c > 0\right) = \rho_{\text{OOD}} \ll \rho_0$.
+
+In a deep architecture of depth $K$, the gradient must flow backwards through a cascade of ReLU activations. The probability of a pathway remaining active from the output back to layer $l$ decays exponentially as $(\rho_{\text{OOD}})^{K-l}$. When $\rho_{\text{OOD}}$ is very small, we obtain:
+\begin{equation}
+    \mathbb{P}_{x \sim \mathcal{D}_{\text{OOD}}}\left(\frac{\partial \mathcal{L}}{\partial z^{[l]}_c} \neq 0\right) \approx 0
+\end{equation}
+for the vast majority of channels $c$. This triggers severe gradient sparsity, where the gradient is exactly zero for almost all channels. Only a small, random subset of pathways remain active under the high-variance OOD input, resulting in extremely large (spiked) gradients for a tiny fraction of channels. This mathematically explains the extreme coefficient of variation ($2.40$ for Synthetic Fisher vs. $1.08$ for Real Fisher) and justifies our proposed temperature softening parameter $T$ to smooth this skewed weight distribution.
+
+\subsection{Test-Time BatchNorm Calibration}
+To adapt the merged model's statistics to the active test stream, we implement Single-Pass Test-Time BatchNorm Calibration (SP-TTBC) \cite{s5_spttbc}. During the forward pass, for each active test batch of size $B$, we compute its active mean $\mu_{\text{batch}}$ and variance $\sigma^2_{\text{batch}}$ over the spatial and batch dimensions. These active statistics are blended with the pre-saved merged running statistics using a blending factor $\alpha \in [0.0, 1.0]$:
+\begin{equation}
+    \mu_{\text{active}} = (1 - \alpha) \mu_{\text{merged}} + \alpha \mu_{\text{batch}}
+\end{equation}
+\begin{equation}
+    \sigma^2_{\text{active}} = (1 - \alpha) \sigma^2_{\text{merged}} + \alpha \sigma^2_{\text{batch}}
+\end{equation}
+where $\alpha=0.0$ corresponds to static uncalibrated evaluation, and $\alpha=1.0$ corresponds to full test-time active normalization.
+
+\section{Experimental Setup}
+\label{sec:setup}
+To execute our exhaustive empirical study, we fine-tune expert models on three distinct tasks: MNIST \cite{lecun98mnist}, Fashion-MNIST \cite{fashionmnist}, and CIFAR-10 \cite{cifar10}.
+
+\textbf{Architecture and Progenitor:} We use a ResNet-18 model \cite{he16resnet} pre-trained on ImageNet \cite{deng09imagenet} as our progenitor. The final classification head is modified to output 10 classes.
+
+\textbf{Expert Training:}
+We train three independent expert models starting from the progenitor:
+\begin{itemize}
+    \item \textbf{MNIST Expert:} Fine-tuned for 5 epochs, achieving 99.28\% test accuracy.
+    \item \textbf{Fashion-MNIST Expert:} Fine-tuned for 5 epochs, achieving 91.83\% test accuracy.
+    \item \textbf{CIFAR-10 Expert:} Fine-tuned for 10 epochs, achieving 80.09\% test accuracy.
+\end{itemize}
+All datasets are resized to 32x32 and normalized. Grayscale datasets (MNIST, Fashion) are replicated across 3 channels to maintain structural compatibility with the color-image backbone.
+
+\textbf{Exhaustive Grid Sweep:}
+We execute our sweeps across the following dimensions:
+\begin{itemize}
+    \item \textbf{Merging Strategies:} Uniform, Activation Variance, Synthetic Fisher, Real Fisher, Gradient Norm.
+    \item \textbf{Parameter Paradigms:} WA, TA with task vector scaling coefficients $\lambda \in \{0.3, 0.5, 0.7, 0.9\}$.
+    \item \textbf{Test Batch Sizes:} $B \in \{1, 4, 16, 64, 256\}$.
+    \item \textbf{Blending Factors:} $\alpha \in \{0.0, 0.2, 0.4, 0.6, 0.8, 1.0\}$.
+    \item \textbf{Test-time Noise Std:} $\sigma \in \{0.0, 0.1, 0.2\}$ (additive Gaussian noise applied at test-time to measure covariate shift robustness).
+\end{itemize}
+This results in evaluating a massive total of 2,250 unique configurations. To guarantee a high level of rigor, we limit the maximum evaluation size to 2,000 samples per task, yielding stable accuracy estimates while enabling the entire sweep to execute efficiently.
+
+\section{Empirical Results \& Analysis}
+\label{sec:results}
+
+\subsection{Overall Performance \& Parameter-Merging Paradigms}
+First, we analyze the overall best configuration achieved by each strategy (restricted to clean test-time settings, i.e., no noise). As shown in Table \ref{tab:best_configs}, \textbf{Task Arithmetic (TA) with $\lambda = 0.70$} is the absolute dominant parameter-merging paradigm. Across all five statistics-merging strategies, TA with $\lambda=0.70$ consistently outperforms Weight Averaging, achieving a high average accuracy of over 82.4\% when paired with an optimal test batch size ($B=256$) and sufficient test-time calibration ($\alpha \in \{0.8, 1.0\}$).
+
+\begin{table*}[t]
+\caption{Overall best configurations achieved by each statistics-merging strategy (no test-time noise).}
+\label{tab:best_configs}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+Strategy & Avg Accuracy & Paradigm & Batch Size ($B$) & Blending Factor ($\alpha$) & MNIST & Fashion & CIFAR-10 \\
+\midrule
+\textbf{Uniform} & \textbf{82.65\%} & TA ($\lambda=0.70$) & 256 & 0.8 & 95.51\% & 83.11\% & 69.34\% \\
+\textbf{Variance} & 82.49\% & TA ($\lambda=0.70$) & 256 & 1.0 & 95.26\% & 83.35\% & 68.85\% \\
+\textbf{Fisher-Real} & 82.49\% & TA ($\lambda=0.70$) & 256 & 1.0 & 95.26\% & 83.35\% & 68.85\% \\
+\textbf{Fisher-Syn} & 82.49\% & TA ($\lambda=0.70$) & 256 & 1.0 & 95.26\% & 83.35\% & 68.85\% \\
+\textbf{Grad-Norm} & 82.50\% & TA ($\lambda=0.70$) & 256 & 0.8 & 95.75\% & 83.11\% & 68.65\% \\
+\bottomrule
+\end{tabular}
+}
+\end{small}
+\end{center}
+\end{table*}
+
+\subsection{Deconstructing the Synthetic Fisher Fragility at $B=1$}
+The core discovery of our study is the performance profile under small test-time batch sizes. In many production settings (e.g., edge devices or real-time streaming), test samples arrive individually ($B=1$) or in very small groups.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_batch_size.pdf}
+\caption{Average accuracy of merged models across different statistics-merging strategies as a function of test batch size ($B$). Standard Uniform merging remains an exceptionally robust baseline at small batch sizes, whereas Synthetic Fisher experiences catastrophic collapse.}
+\label{fig:batch_size_sweep}
+\end{figure}
+
+As shown in Table \ref{tab:accuracy_by_bs}, we observe that when batch size decreases, the performance of all calibration strategies degrades. However, \textbf{Synthetic Fisher weighting (Fisher-Syn)} experiences a catastrophic failure at $B=1$, collapsing to only \textbf{17.27\%} average accuracy. Even at $B=4$, it achieves only 64.00\% accuracy, lagging behind the Uniform baseline by over 7.6\%.
+
+\begin{table}[h]
+\caption{Accuracy by test batch size under the best overall configuration schedule (no noise).}
+\label{tab:accuracy_by_bs}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+Strategy & $B=1$ & $B=4$ & $B=16$ & $B=64$ & $B=256$ \\
+\midrule
+\textbf{Uniform} & \textbf{65.10\%} & \textbf{71.68\%} & \textbf{78.65\%} & 81.85\% & \textbf{82.65\%} \\
+\textbf{Variance} & 59.55\% & 68.57\% & 78.20\% & 81.61\% & 82.49\% \\
+\textbf{Fisher-Real} & 59.90\% & 68.82\% & 77.57\% & \textbf{81.90\%} & 82.49\% \\
+\textbf{Grad-Norm} & 60.25\% & 69.48\% & 77.88\% & 81.88\% & 82.50\% \\
+\textbf{Fisher-Syn} & \textbf{17.27\%} & 64.00\% & 77.07\% & 81.45\% & 82.49\% \\
+\bottomrule
+\end{tabular}
+}
+\end{small}
+\end{center}
+\end{table}
+
+To understand this collapse, we analyze the distribution of the estimated weights. Since Fisher-Syn uses standard random Gaussian white noise as a zero-shot input, it is highly out-of-distribution for our trained experts.
+Consequently, we observe extreme sparsity in parameter gradients during backpropagation:
+\begin{itemize}
+    \item \textbf{Synthetic Fisher Weighting:} Mean estimated Fisher value of \textbf{0.052} with a standard deviation of \textbf{0.125}. The coefficient of variation is \textbf{2.40}, indicating that the estimated channel-wise weights are extremely sparse and highly skewed, with many channels receiving exactly 0.0 weight.
+    \item \textbf{Real Fisher Weighting:} Mean estimated Fisher value of \textbf{0.00040} with a standard deviation of \textbf{0.00043}. The coefficient of variation is \textbf{1.08}, indicating a much smoother, balanced, and stable distribution of channel-wise weights.
+\end{itemize}
+
+When the estimated weights are highly sparse and skewed (as in Fisher-Syn), certain channels focus entirely on one expert, completely ignoring others. This triggers severe representation and variance collapse in deeper layers, rendering the static running statistics useless ($\alpha=0.0$ yields only 12.02\% accuracy, as shown in Table \ref{tab:ablation_alpha}). 
+
+Furthermore, at $B=1$, the active batch variance is always exactly zero:
+\begin{equation}
+    \sigma^2_{\text{batch}, c} = 0.0, \quad \forall c.
+\end{equation}
+As a result, test-time calibration at $B=1$ cannot compute valid active variance statistics and is forced to scale activations by $\sqrt{\epsilon}$, scaling them up by $\approx 300\times$ and corrupting the feature representation. Thus, even with $\alpha=1.0$, the accuracy remains at random guessing ($\approx 10\%$).
+
+\subsection{Softened Fisher Weighting as a Robust Bridge}
+To address the extreme skewness and sparsity of zero-shot Synthetic Fisher weighting that triggers representation collapse under small test batch sizes, we evaluate our proposed \textit{Fisher-Soft} weighting scheme. By introducing the temperature parameter $T \in [0.0, 1.0]$, we can smoothly scale the channel weightings from uniform averaging ($T=0.0$) to standard raw Fisher weighting ($T=1.0$). We execute a focused sweep over temperatures $T \in \{0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.80, 1.00\}$ under the Task Arithmetic ($\lambda=0.70$) paradigm.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_temperature.pdf}
+\caption{The effect of Fisher-Soft temperature scaling ($T$) on the average accuracy of merged models evaluated statically ($\alpha=0.0$) at batch size $B=1$. Non-monotonic peaks at $T \approx 0.10$--$0.20$ demonstrate that softening flattens extreme ReLU-induced sparsity while preserving relative channel importances.}
+\label{fig:temperature_sweep}
+\end{figure}
+
+As presented in Table \ref{tab:temperature_sweep}, temperature scaling yields a highly successful, non-monotonic performance curve under static uncalibrated evaluation ($\alpha=0.0$). For Synthetic Fisher (\textit{Fisher-Syn-Soft}), lowering the temperature from $T=1.0$ (which suffers from severe collapse at $38.23\%$ average accuracy) to $T=0.20$ completely resolves the collapse, achieving a peak performance of \textbf{67.00\%} average accuracy at $B=1$. This is a substantial improvement of \textbf{+28.77\%} over standard Synthetic Fisher, and importantly, it outperforms the strong Uniform baseline ($65.10\%$) by \textbf{+1.90\%}. Similarly, for Real Fisher (\textit{Fisher-Real-Soft}), an optimal temperature of $T=0.10$ peaks at \textbf{65.62\%} accuracy, resolving its standard $T=1.0$ degradation ($61.38\%$) and outperforming the Uniform baseline by \textbf{+0.52\%}.
+
+This non-monotonic peak demonstrates that a moderate temperature (e.g., $T \in [0.10, 0.20]$) acts as a powerful regularizer: it smooths out the extreme, ReLU-induced weight sparsity and gradient skewness under out-of-distribution inputs, preventing channel-level dead-ends while retaining the relative channel-importance structures discovered by backpropagation. For larger batch sizes (e.g., $B=256$) under blended test-time calibration ($\alpha=0.8$), all temperatures achieve outstanding, near-expert performance ($\approx 82.5\%$), indicating that temperature softening maintains high compatibility with test-time statistic adaptation.
+
+\begin{table}[h]
+\caption{Average accuracy under static evaluation ($\alpha=0.0$) and blended evaluation ($\alpha=0.8$) across different temperatures $T$ under Task Arithmetic ($\lambda=0.70$).}
+\label{tab:temperature_sweep}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{\textbf{Fisher-Syn-Soft}} & \multicolumn{2}{c}{\textbf{Fisher-Real-Soft}} \\
+\cmidrule(r){2-3} \cmidrule(l){4-5}
+Temp ($T$) & $\alpha=0.0, B=1$ & $\alpha=0.8, B=256$ & $\alpha=0.0, B=1$ & $\alpha=0.8, B=256$ \\
+\midrule
+0.00 (Unif) & 65.10\% & \textbf{82.65\%} & 65.10\% & 82.65\% \\
+0.05 & 66.22\% & 82.54\% & 65.30\% & 82.60\% \\
+0.10 & 66.52\% & 82.32\% & \textbf{65.62\%} & \textbf{82.65\%} \\
+0.20 & \textbf{67.00\%} & 82.34\% & 65.50\% & 82.63\% \\
+0.30 & 65.30\% & 82.39\% & 64.72\% & 82.67\% \\
+0.50 & 54.85\% & 82.45\% & 63.75\% & 82.63\% \\
+0.80 & 42.53\% & 82.57\% & 62.32\% & 82.67\% \\
+1.00 (Raw) & 38.23\% & 82.42\% & 61.38\% & 82.57\% \\
+\bottomrule
+\end{tabular}
+}
+\end{small}
+\end{center}
+\end{table}
+
+\subsection{Test-Time Calibration as an Equalizer}
+Our study reveals that \textbf{test-time calibration (SP-TTBC)} behaves as a powerful equalizer. When $B \ge 16$, the choice of statistic-merging strategy becomes practically irrelevant: all five strategies achieve within 1.5\% of each other. At $B=256$, they all converge to $\approx 82.5\%$ average accuracy. 
+
+To illustrate this, we provide an ablation of the blending factor $\alpha$ for the Weight Averaging (WA) paradigm at $B=1$ in Table \ref{tab:ablation_alpha}. Under static uncalibrated evaluation ($\alpha=0.0$), the Uniform, Real Fisher, and Gradient Norm methods are highly robust, whereas Variance and Synthetic Fisher suffer severe collapse. As $\alpha$ increases to 0.2, some methods improve, but further increases to $\alpha \ge 0.4$ cause catastrophic failure across all methods due to the zero-variance bottleneck at $B=1$.
+
+\begin{table}[h]
+\caption{Ablation of blending factor $\alpha$ under the Weight Averaging paradigm at test batch size $B=1$.}
+\label{tab:ablation_alpha}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+Strategy & $\alpha=0.0$ & $\alpha=0.2$ & $\alpha=0.4$ & $\alpha=0.6$ & $\alpha=0.8$ & $\alpha=1.0$ \\
+\midrule
+\textbf{Uniform} & \textbf{42.63\%} & \textbf{32.50\%} & 10.47\% & 11.12\% & 10.43\% & 10.05\% \\
+\textbf{Variance} & 33.10\% & 26.20\% & 9.82\% & 9.77\% & 9.77\% & 10.05\% \\
+\textbf{Fisher-Real} & 40.07\% & 27.92\% & \textbf{11.32\%} & 9.77\% & 9.77\% & 10.05\% \\
+\textbf{Fisher-Syn} & 12.02\% & 15.33\% & 14.17\% & \textbf{15.72\%} & \textbf{12.25\%} & 10.05\% \\
+\bottomrule
+\end{tabular}
+}
+\end{small}
+\end{center}
+\end{table}
+
+\subsection{Test-Time Covariate Noise Robustness}
+Finally, we study the robustness of each strategy under test-time covariate shifts (additive Gaussian noise). 
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_noise.pdf}
+\caption{Robustness of each statistics-merging strategy under varying standard deviations ($\sigma$) of additive Gaussian noise at test-time. Gradient-Norm weighting is highly resilient to high noise levels ($\sigma=0.2$).}
+\label{fig:noise_robustness}
+\end{figure}
+
+As shown in Table \ref{tab:noise_robustness}, \textbf{Gradient-Norm Weighting} emerges as the most robust statistic-merging strategy, achieving \textbf{75.83\%} average accuracy under severe noise ($\sigma=0.2$), outperforming all other strategies. Uniform and Activation Variance remain highly competitive, while Real Fisher and Synthetic Fisher are slightly more susceptible to noise corruption.
+
+\begin{table}[h]
+\caption{Test-time noise robustness (average accuracy) under the best overall configuration schedule.}
+\label{tab:noise_robustness}
+\begin{center}
+\begin{small}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+Strategy & Noise $\sigma=0.0$ & Noise $\sigma=0.1$ & Noise $\sigma=0.2$ \\
+\midrule
+\textbf{Uniform} & \textbf{82.65\%} & 79.38\% & 75.05\% \\
+\textbf{Variance} & 82.49\% & 79.36\% & 75.29\% \\
+\textbf{Fisher-Real} & 82.49\% & 79.35\% & 74.46\% \\
+\textbf{Grad-Norm} & 82.50\% & \textbf{79.56\%} & \textbf{75.83\%} \\
+\textbf{Fisher-Syn} & 82.49\% & 79.20\% & 74.76\% \\
+\bottomrule
+\end{tabular}
+}
+\end{small}
+\end{center}
+\end{table}
+
+\subsection{Layer-Wise Activation Variance Deconstruction}
+While macroscopic accuracy sweeps reveal the downstream consequences of representation collapse, they do not directly expose the internal behavior of the merged backbone. To address this, we conduct a layer-by-layer deconstruction of the average channel-wise activation variance across all 20 BatchNorm layers of the ResNet-18 model under static evaluation ($\alpha=0.0$). We feed a representative validation batch of 128 images from CIFAR-10 through the merged network and hook the output activations of each \texttt{TestTimeBatchNorm2d} module.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_layer_variance.pdf}
+\caption{Average activation variance across all 20 BatchNorm layers of the ResNet-18 model under Task Arithmetic merging ($\lambda=0.7$). Raw Synthetic Fisher ($T=1.0$) exhibits highly erratic, uncalibrated variance, while softening ($T=0.20$) stabilizes the activation variances, matching the stable profiles of Uniform and Real Fisher.}
+\label{fig:layer_variance_deconstruction}
+\end{figure}
+
+As shown in Figure \ref{fig:layer_variance_deconstruction}, we observe distinct profiles across the merging strategies:
+\begin{itemize}
+    \item \textbf{Uniform, Activation Variance, and Gradient Norm:} These strategies exhibit extremely stable and smooth variance profiles, with activation variance remaining well-bounded across all depths. This confirms why Uniform behaves as such a robust baseline.
+    \item \textbf{Raw Synthetic Fisher ($T=1.0$):} This scheme triggers highly unstable and erratic variance propagation. In the early layers, the variance spikes to nearly 0.47, while in the deepest layers (Layer 20), it escalates uncontrollably to 2.04. This dramatic escalation and lack of calibration are direct consequences of ReLU-induced activation sparsity and gradient skewness under out-of-distribution inputs, explaining the catastrophic collapse at small batch sizes.
+    \item \textbf{Fisher-Soft Temperature Scaling ($T=0.20$ for Synthetic and $T=0.10$ for Real):} Applying our proposed softening regularizer completely tames this erratic behavior. For Synthetic Fisher, lowering the temperature from $T=1.0$ to $T=0.20$ flattens the extreme weight skewness and brings the activation variance profile back into a stable, well-behaved regime (peaking at 0.60 at Layer 20, matching the Uniform baseline's 0.59). This provides direct, empirical proof that Fisher-Soft acts as a robust bridge, preserving representation sanity while allowing for channel specialization.
+\end{itemize}
+
+\section{Discussion \& Pragmatic Recommendations}
+Our exhaustive empirical investigation yields several crucial, actionable recommendations for practitioners deploying merged models in production:
+\begin{enumerate}
+    \item \textbf{Do Not Use Out-of-Distribution Noise for Zero-Shot Fisher Estimation:} While data-free calibration is highly desirable, estimating Fisher Information using random white noise leads to sparse, highly skewed channel weightings due to ReLU-induced activation sparsity, causing severe representation collapse under small batch sizes.
+    \item \textbf{Uniform Merging is a Powerhouse:} Standard uniform averaging of BatchNorm buffers is exceptionally simple and acts as an incredibly robust baseline across all batch sizes, outperforming complex weighting schemes at $B=1$ and $B=4$.
+    \item \textbf{Leverage Test-Time Calibration:} For production-ready serving, test-time calibration (SP-TTBC) with $\alpha \approx 0.8$ completely resolves representation collapse, bringing performance back to near-expert levels as long as batch size is moderate ($B \ge 16$).
+\end{enumerate}
+
+\section{Conclusion}
+In this paper, we executed the most comprehensive empirical study of post-merge statistics calibration in multi-task model merging to date. Through an exhaustive 2,250-configuration sweep using ResNet-18, we systematically analyzed five statistics-merging strategies under various paradigms, test batch sizes, blending schedules, and noise levels. We deconstructed the fragility of zero-shot data-free Fisher estimation, established uniform merging as an exceptionally robust baseline, and validated test-time calibration as a powerful equalizer. Our findings provide a highly empirical, honest, and rigorous map for deploying merged models in production.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\end{document}

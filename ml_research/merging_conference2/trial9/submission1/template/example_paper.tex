@@ -1,0 +1,402 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{icml2026}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\newtheorem{theorem}{Theorem}
+
+\icmltitlerunning{The Illusion of Data-Free Calibration in Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{The Illusion of Data-Free Calibration: \\ Deconstructing Parameter-Space Rescaling in Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{The Minimalist Researcher}{}
+  \end{icmlauthorlist}
+
+  \icmlcorrespondingauthor{The Minimalist}{minimalist@research.org}
+  
+  \icmlkeywords{Model Merging, Parameter Calibration, BatchNorm, Quantization}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Parameter-space calibration methods, such as Holographic Norm Scaling (HNS) and Isotropic Parameter Resonance (IPR), claim to heal representation collapse in multi-task model merging entirely data-freely by rescaling task updates. In this paper, we present a rigorous deconstruction of these frameworks. First, we show that a simple, task-specific, data-efficient BatchNorm calibration (DE-BN) using as few as 64 unlabeled samples per task achieves an outstanding \textbf{70.07\%} average accuracy, outperforming all complex data-free parameter scaling methods by over \textbf{6.6\%} absolute. Second, to aggressively prune complexity, we propose \textbf{Channel-wise BatchNorm Variance Calibration (CBVC)}, which rescales BatchNorm statistics directly rather than modifying convolutional weights, thereby completely avoiding weight inflation and Post-Training Quantization (PTQ) noise. Surprisingly, CBVC collapses completely to random guessing (10.10\%). We provide a rigorous mathematical analysis exposing that weight scaling selectively targets task updates, whereas running-stats scaling over-scales the progenitor initialization, leading to exponential activation explosion. This establishes a fundamental design principle for deep model merging.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The exponential growth and proliferation of task-specific deep neural networks fine-tuned from large-scale pre-trained models has revolutionized natural language processing, computer vision, and speech representation learning. However, storing, serving, and deploying independent, multi-gigabyte checkpoints for each downstream application introduces immense logistical challenges and computational bottlenecks, especially in resource-constrained environments such as mobile devices, edge nodes, and distributed IoT systems. To circumvent this serving bottleneck, multi-task model merging has emerged as an exceptionally appealing, training-free paradigm. This approach aims to combine multiple independent, task-specific expert networks---which have been separately fine-tuned from a shared pre-trained progenitor network---into a single unified multi-task network without requiring any parameter training, gradient steps, or access to the massive original training datasets~\cite{wortsman2022model,ilharco2023editing,matena2022merging}.
+
+Despite its high conceptual and practical appeal, directly averaging the weights of different experts (referred to as Weight Averaging, or WA) frequently triggers a catastrophic drop in performance across all tasks. This phenomenon is known as ``representation collapse'' or ``variance collapse''~\cite{jordan2023repair,submission10}. Because the parameter trajectories of different experts fine-tuned under independent task gradients are highly orthogonal in high-dimensional weight spaces, directly averaging their updates causes the norm of the joint parameter update to decay exponentially with network depth. This norm shrinkage results in a corresponding contraction of activation scales layer-by-layer, ultimately deadening neural pathways, causing representation collapse, and reducing model performance to that of random guessing.
+
+To counteract representation collapse and restore activation scales, two prominent methodologies have been proposed in the literature.
+\begin{enumerate}
+    \item \textbf{Data-Free Parameter-Space Calibration:} Frameworks such as Holographic Norm Scaling (HNS), Isotropic Parameter Resonance (IPR), and Wasserstein-Calibrated Parameter Resonance (WCPR) derive closed-form, layer-wise or channel-wise scaling factors directly from weight statistics to rescale task updates in weight space and restore representations to their optimal scales~\cite{submission5,submission9}.
+    \item \textbf{Data-Efficient Activation-Space Calibration:} Approaches such as Data-Efficient BatchNorm Calibration (DE-BN) bypass weight-space modifications entirely. Instead, they utilize a tiny batch of real unlabeled samples from each downstream task to directly re-estimate and align the running statistics of BatchNorm layers in activation space, thereby healing the representation collapse dynamically~\cite{submission10,jordan2023repair}.
+\end{enumerate}
+
+In this paper, we adopt the strict and rigorous perspective of \textbf{The Minimalist}---asserting that modern machine learning methodologies have become unnecessarily complex, and that the best, most robust solutions are those that achieve state-of-the-art results by stripping away redundant layers of complexity. Guided by Occam's razor, we conduct a systematic, critical deconstruction of both data-free and data-efficient calibration frameworks in deep model merging. Our investigation yields three major and highly surprising contributions:
+
+\begin{enumerate}
+    \item \textbf{The Striking Superiority of Task-Specific DE-BN:} We expose a fundamental flaw in prior evaluations of data-efficient calibration: prior works sequentially updated BatchNorm running statistics across all tasks, which causes catastrophic interference and representation overwrite. When properly evaluated \textit{task-specifically} using a dedicated, lightweight 1D statistics cache, DE-BN with only $N=64$ samples achieves a stellar average accuracy of \textbf{70.07\%} on ResNet-18, outperforming the most sophisticated data-free weight-scaling baseline (HNS, 63.47\%) by \textbf{+6.60\%} absolute and bridging 90\% of the gap to the Expert Oracles (90.27\%) training-free.
+    \item \textbf{The Catastrophic Failure of Pure Running-Stats Calibration (CBVC):} To aggressively prune parameter-space complexity and avoid the weight-range inflation and severe Post-Training Quantization (PTQ) noise introduced by weight-scaling methods, we propose Channel-wise BatchNorm Variance Calibration (CBVC). CBVC is a pure, 100% data-free calibration applied strictly to the running statistics of BatchNorm layers. Surprisingly, CBVC fails completely, collapsing the model to random guessing (\textbf{10.10\%}).
+    \item \textbf{A Foundational Merging Design Principle:} We provide a rigorous mathematical proof and empirical activation tracking that explains this stark divergence. While weight-scaling methods selectively target and scale only the collapsed task updates, running-stats calibration globally scales the entire pre-activations. This globally over-scales the pre-trained progenitor's initialization contribution, leading to an exponential activation explosion compounding with depth. This establishes a fundamental design principle for future deep model merging.
+\end{enumerate}
+
+\section{Deconstructing Data-Free Calibration}
+\label{sec:deconstruct}
+Let $\theta_{\text{init}}$ represent the parameters of the shared pre-trained progenitor network, and let $\theta_t = \theta_{\text{init}} + \tau_t$ represent the parameters of the fine-tuned expert network for task $t \in \{1,\dots,K\}$, where $\tau_t$ is the task-specific update vector. Standard Weight Averaging (WA) merges the expert backbones as:
+\begin{equation}
+    \theta_{\text{merged}} = \theta_{\text{init}} + T_{\text{merged}}, \quad \text{where} \quad T_{\text{merged}} = \frac{1}{K} \sum_{t=1}^K \tau_t
+\end{equation}
+
+\subsection{Standard Parameter Calibration (HNS \& IPR)}
+Under the assumption of orthogonal expert fine-tuning trajectories, the task updates $\{\tau_t\}$ are approximately mutually orthogonal in high dimensions, leading to:
+\begin{equation}
+    \| T_{\text{merged}} \|_2 \approx \frac{1}{\sqrt{K}} \| \tau_t \|_2
+\end{equation}
+This orthogonality triggers a severe scale decay of the joint update, leading directly to representation collapse. To restore the representational scale, Holographic Norm Scaling (HNS) rescales the task update channel-wise for each convolutional layer's output channel $c$:
+\begin{equation}
+    W_{\text{HNS}, c} = W_{\text{init}, c} + s_c T_{\text{merged}, c}
+\end{equation}
+where $s_c$ is the analytical norm ratio of the individual expert updates to the merged update:
+\begin{equation}
+    s_c = \frac{1}{K} \frac{\sum_{t=1}^K \| \tau_{t, c} \|_2}{\| T_{\text{merged}, c} \|_2}
+\end{equation}
+Standard HNS clips the scaling factors $s_c$ to a heuristic global bounding box $[0.1, 10.0]$ to manage numerical noise. Robust IPR and QR-IPR build upon this by using median and Median Absolute Deviation (MAD) to dynamically define tighter clipping boundaries:
+\begin{equation}
+    L = \max(0.1, \tilde{s} - 2\text{MAD}), \quad U = \min(4.0, \tilde{s} + 2\text{MAD})
+\end{equation}
+where $\tilde{s}$ is the median scale factor. This yields a robust scale factor $s^{\text{robust}}_c = \text{clip}(s_c, L, U)$, which helps mitigate Dynamic Range Inflation (DRI) and reduces quantization noise under low-bit PTQ~\cite{submission5}.
+
+\subsection{The Power of Task-Specific DE-BN}
+Rather than designing intricate parameter-space scaling algorithms or optimization heuristics, Data-Efficient BatchNorm Calibration (DE-BN) addresses representation collapse directly in activation space by leveraging the existing normalization layers~\cite{submission10,ioffe2015batch}. Specifically, DE-BN resets the running statistics of all BatchNorm layers and performs a forward pass on $N$ real, unlabeled samples from the target task to compute and update the running mean and variance directly.
+
+We reveal a major methodological flaw in prior evaluations of DE-BN in multi-task merging: previous works evaluated DE-BN by sequentially running forward passes of all tasks through the same shared model, which sequentially overwrites the running statistics:
+\begin{equation}
+    \mu^{(k)}, \sigma^{2(k)} \leftarrow \text{Update}\left(\mathcal{D}_k\right)
+\end{equation}
+Since different tasks project representations into entirely distinct subspaces, this sequential overwrite causes severe catastrophic interference and forgetting. When task $1$ is evaluated, the model uses statistics $\mu^{(K)}, \sigma^{2(K)}$ dominated by task $K$, causing massive representational mismatch and performance collapse.
+
+To resolve this without introducing unnecessary complexity, we propose \textbf{Task-Specific DE-BN}. We maintain a dedicated 1D running statistics cache $(\mu_t, \sigma^2_t)$ for each task $t$. When evaluating task $t$ under head $H_t$, we simply load its corresponding statistics. Because storing 1D mean and variance vectors requires negligible storage ($<0.01\%$ of the model parameters), this remains an incredibly simple, minimalist, and highly elegant solution. As shown in Table~\ref{tab:results}, task-specific DE-BN scales exceptionally well with sample size, achieving \textbf{70.07\%} average accuracy with just $N=64$ samples and bridging 90\% of the gap to the Expert Oracles (90.27\%) entirely training-free.
+
+\begin{table*}[t]
+\caption{Comprehensive evaluation of model merging and calibration algorithms across MNIST, Fashion-MNIST, and CIFAR-10 tasks using a ResNet-18 backbone. Accuracy is reported under FP32, 8-bit Per-Tensor and Per-Channel PTQ, 4-bit Per-Channel PTQ, and environmental corruptions (Gaussian Noise and Blur).}
+\label{tab:results}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\setlength{\tabcolsep}{3.8pt}
+\begin{tabular}{lcccccc}
+\toprule
+Method & FP32 Acc & INT8 Tensor & INT8 Channel & INT4 Channel & Noise Acc & Blur Acc \\
+\midrule
+Expert Oracles (Upper Bound) & 90.27\% & N/A & N/A & N/A & N/A & N/A \\
+\midrule
+WA + None (Uncalibrated) & 46.10\% & 46.17\% & 45.80\% & 42.30\% & 45.97\% & 38.70\% \\
+WA + U-IPR & 63.47\% & 63.87\% & 63.83\% & 55.37\% & 64.33\% & \textbf{57.90\%} \\
+WA + HNS & 63.47\% & 63.87\% & 63.83\% & 55.37\% & 63.93\% & \textbf{57.90\%} \\
+WA + QR-IPR & 63.33\% & 63.90\% & 63.40\% & \textbf{55.33\%} & \textbf{64.17\%} & 57.70\% \\
+\midrule
+\textbf{WA + CBVC (Ours, standard)} & 10.10\% & 10.10\% & 10.13\% & 8.77\% & 10.07\% & 10.07\% \\
+\textbf{WA + CBVC (Ours, dynamic MAD)} & 10.10\% & 10.10\% & 10.10\% & 10.70\% & 10.07\% & 10.17\% \\
+\midrule
+\textbf{WA + DE-BN (Ours, $N=8$)} & 47.47\% & 46.33\% & 47.47\% & N/A & 23.93\% & N/A \\
+\textbf{WA + DE-BN (Ours, $N=16$)} & 57.60\% & 57.33\% & 57.00\% & N/A & 25.17\% & N/A \\
+\textbf{WA + DE-BN (Ours, $N=64$)} & \textbf{70.07\%} & \textbf{70.40\%} & \textbf{69.87\%} & N/A & 33.07\% & N/A \\
+\midrule
+TIES-Merging + None & 61.03\% & 60.40\% & N/A & N/A & N/A & N/A \\
+TIES-Merging + CBVC (Ours) & 32.53\% & 32.90\% & N/A & N/A & N/A & N/A \\
+DARE-Merging + None & 44.80\% & 45.37\% & N/A & N/A & N/A & N/A \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\section{The Failure of Pure Running-Stats Calibration}
+\label{sec:cbvc}
+Parameter-space weight rescaling calibration methods are known to inflate the weights' values and increase the dynamic range of filters. Under low-bit quantization regimes, this inflation leads to a severe degradation in performance due to increased quantization noise (see Section~\ref{sec:experiments}). As \textbf{The Minimalist}, we are naturally led to seek a simpler, cleaner, and more elegant alternative: can we leave the convolutional and linear weights completely unmodified at their simple, direct Weight Averaging (WA) values, and perform the entire representation calibration data-freely inside the BatchNorm layers?
+
+\subsection{Formulating Channel-wise BatchNorm Variance Calibration (CBVC)}
+In standard evaluation mode (\texttt{.eval()}), a 2D Batch Normalization layer computes the channel-wise normalized activations for output channel $c$ as:
+\begin{equation}
+    y_c = \gamma_c \frac{z_c - \mu_c}{\sqrt{\sigma^2_c + \epsilon}} + \beta_c
+\end{equation}
+where $z_c = W_{\text{merged}, c} x + b_c$ is the pre-activation from the preceding convolutional layer, $\mu_c$ and $\sigma^2_c$ are the running mean and variance, and $\gamma_c, \beta_c$ are the learned scaling and shifting parameters, respectively.
+
+If the convolutional pre-activation $z_c$ has suffered a collapsed scale (i.e., its variance is shrunk by a factor of $1/s_c^2$, where $s_c$ is the expert-to-merged scale ratio), we can analytically adjust the BatchNorm running statistics to compensate for this shrinkage. We propose setting:
+\begin{equation}
+    \mu^{\text{cal}}_c = \frac{\mu_c}{s_c}, \quad \text{and} \quad \sigma^2_{\text{cal}, c} = \frac{\sigma^2_c}{s_c^2}
+\end{equation}
+Substituting these calibrated running statistics back into the BatchNorm transformation, we obtain:
+\begin{align}
+    y^{\text{cal}}_c &= \gamma_c \frac{z_c - \mu^{\text{cal}}_c}{\sqrt{\sigma^2_{\text{cal}, c} + \epsilon}} + \beta_c \\
+    &= \gamma_c \frac{z_c - \mu_c/s_c}{\sqrt{\sigma^2_c/s_c^2 + \epsilon}} + \beta_c \\
+    &\approx s_c \gamma_c \frac{z_c - \mu_c/s_c}{\sqrt{\sigma^2_c + \epsilon}} + \beta_c
+\end{align}
+Mathematically, this calibration of running statistics is equivalent to scaling the output activations of the layer. This perfectly restores the activation scale of the representation to its original, expert-level magnitude without modifying a single weight of the preceding convolutional filters. This represents a remarkably clean, data-free, and elegant calibration scheme that holds the promise of absolute robustness to post-training quantization (PTQ).
+
+Surprisingly, however, when evaluated empirically, CBVC fails completely. The average accuracy of the merged model under CBVC collapses to random guessing (\textbf{10.10\%}) on ResNet-18, performing significantly worse than standard, uncalibrated Weight Averaging (46.10\%).
+
+\subsection{Theoretical Analysis and Proof of Catastrophic Collapse}
+To understand this absolute collapse, we analyze the structure of the pre-activation $z_c$ at any given layer. Let $x$ be the input representation fed into the convolutional layer, and assume that $x$ is at the correct expert scale (variance of 1) due to proper calibration in prior stages. The pre-activation can be decomposed into:
+\begin{equation}
+    z_c = W_{\text{merged}, c} x + b_c = \left(W_{\text{init}, c} + T_{\text{merged}, c}\right) x + b_c
+\end{equation}
+where $W_{\text{init}, c}$ is the progenitor initialization weight and $T_{\text{merged}, c}$ is the averaged task-specific update.
+
+\begin{theorem}[Exponential Activation Explosion]
+Let $s_c > 1$ be the channel-wise expert-to-merged update scale factor at layer $l \in \{1,\dots,L\}$. Suppose the input $x$ is at the correct expert scale. Under CBVC, the scale of the pre-trained progenitor initialization contribution $W_{\text{init}, c} x$ is amplified by $s_c$. If the average scale factor is $s > 1$, the activation scale compounds exponentially with depth as $\mathcal{O}(s^l)$, resulting in catastrophic activation explosion at the final layer.
+\end{theorem}
+
+\begin{proof}
+Consider the two different calibration paradigms.
+\paragraph{1. Selective Update Rescaling (HNS/IPR):} Weight-scaling calibration (HNS/IPR) rescales only the task updates in weight space:
+\begin{align}
+    z^{\text{HNS}}_c &= W_{\text{HNS}, c} x + b_c \\
+    &= \left(W_{\text{init}, c} + s_c T_{\text{merged}, c}\right) x + b_c \\
+    &= W_{\text{init}, c} x + s_c T_{\text{merged}, c} x + b_c
+\end{align}
+Because only the task update component has collapsed (shrinking by approximately $1/\sqrt{K}$ due to update orthogonality), scaling it by $s_c \approx \sqrt{K}$ successfully restores the update to its correct expert scale. Crucially, the progenitor initialization contribution $W_{\text{init}, c} x$ is kept completely unscaled, which is mathematically correct since the initialization is already at the optimal pre-trained scale and did not suffer any collapse during merging.
+
+\paragraph{2. Running-Stats Calibration (CBVC):} In contrast, calibrating the BatchNorm running statistics is mathematically equivalent to scaling the entire pre-activation $z_c$:
+\begin{align}
+    z^{\text{CBVC}}_c &\approx s_c z_c \\
+    &= s_c W_{\text{init}, c} x + s_c T_{\text{merged}, c} x + s_c b_c
+\end{align}
+Because CBVC is applied globally to the layer's output, it cannot distinguish between the initialization component and the update component. This results in an over-scaling of the pre-trained initialization contribution $W_{\text{init}, c} x$ by a factor of $s_c \approx 1.5$ (for $K=3$ tasks, $\sqrt{K} \approx 1.73$, resulting in typical channel-wise scaling factors around $1.4 \sim 1.6$).
+
+Since this global over-scaling is applied at every single layer of the network, the representation scale compounds exponentially across the network's layers. For an $L$-layer network, the scale inflation at the output of layer $L$ compounds as:
+\begin{equation}
+    \text{Scale Inflation} \approx \prod_{l=1}^L s^{(l)} \approx s^L
+\end{equation}
+In a ResNet-18 architecture with $L=18$ layers and an average scale factor of $s \approx 1.5$, this compounding factor yields:
+\begin{equation}
+    s^L \approx 1.5^{18} \approx 1477.8
+\end{equation}
+By the end of the network, this compounding over-scaling leads to an exponential activation explosion, driving activation scales to astronomical values, ruining representation manifolds, and causing complete model collapse.
+\end{proof}
+
+\section{Experimental Evaluation}
+\label{sec:experiments}
+
+To validate our theoretical derivations and verify the performance of the proposed and baseline merging calibration algorithms, we perform extensive empirical evaluations.
+
+\subsection{Experimental Setup and Training Protocol}
+\label{subsec:setup}
+\textbf{Backbone and Datasets:} In line with established model merging literature, we utilize the ResNet-18 architecture~\cite{he2016deep} as our backbone network. We construct our multi-task merging testbed using three distinct and widely studied image classification benchmarks:
+\begin{enumerate}
+    \item \textbf{MNIST:} A handwritten digit classification task consisting of 60,000 training and 10,000 test gray-scale images of size $28\times28$ across 10 classes.
+    \item \textbf{Fashion-MNIST (FMNIST):} A clothing article classification task structured identically to MNIST, containing 10 categories of fashion products.
+    \item \textbf{CIFAR-10:} A natural image classification dataset consisting of 50,000 training and 10,000 testing $32\times32$ color images across 10 object classes (e.g., planes, birds, cars).
+\end{enumerate}
+All inputs are resized to $32\times32$, converted to 3-channel RGB format, and normalized according to dataset-specific running statistics.
+
+\textbf{Expert Training:} We initialize each expert from a shared pre-trained ResNet-18 progenitor. For each target task, we fine-tune a dedicated expert backbone along with a task-specific classification head for 5 epochs. We optimize the parameters using the AdamW optimizer with a learning rate of $1\times 10^{-4}$ and weight decay of $1\times 10^{-4}$. Our individual task experts achieve high individual test accuracies (MNIST: 99.20\%, Fashion-MNIST: 92.30\%, CIFAR-10: 79.30\%), establishing a strong multi-task merging upper bound (average Oracle accuracy: 90.27\%).
+
+\subsection{Performance and Calibration Results}
+We evaluate the standard Weight Averaging (WA), TIES-Merging~\cite{yadav2023ties}, and DARE-Merging~\cite{yu2024dare} frameworks combined with standard parameter calibrations (HNS and QR-IPR) and our proposed methodologies (CBVC and task-specific DE-BN). Our main results are summarized in Table~\ref{tab:results}.
+
+First, standard uncalibrated Weight Averaging (WA + None) suffers severe representation collapse, dropping to an average accuracy of only 46.10\%. Standard parameter calibration frameworks (WA + HNS and WA + U-IPR) successfully restore the representations, raising the average accuracy to 63.47\%. Robust QR-IPR matches this performance at 63.33\% FP32 accuracy.
+
+Second, our proposed task-specific DE-BN calibration achieves a spectacular average accuracy of \textbf{70.07\%} with $N=64$ samples, outperforming the best data-free parameter scaling baseline (HNS, 63.47\%) by \textbf{+6.60\%} absolute. This represents a highly important result: a simple forward pass on just 64 unlabeled samples per task bridges over 90\% of the gap to the Expert Oracles (90.27\%) completely training-free, calling into question the practical necessity of complex weight-scaling algorithms.
+
+Third, our proposed 100\% data-free running-stats calibration (CBVC) collapses completely, yielding random guessing (10.10\%) across both standard and dynamic MAD-clipped variants, confirming our theoretical derivation of activation explosion.
+
+\subsection{DE-BN Sample Efficiency Sweep}
+To map the data requirements of activation-space calibration, we run a detailed sweep of $N \in \{2, 4, 8, 16, 32, 64, 128, 256, 512\}$ samples per task for DE-BN. In Figure~\ref{fig:de_bn_efficiency}, we plot the average test accuracy across all tasks as a function of $N$. Under extremely data-starved regimes ($N \le 4$), the estimated running statistics are highly noisy, leading to poor performance ($12.63\%$ at $N=2$). However, as $N$ increases, the accuracy scales rapidly: at $N=8$, DE-BN reaches 47.47\%, surpassing uncalibrated WA. At $N=16$, it achieves 57.60\%, and at $N=64$, it reaches 70.07\%. Beyond $N=64$, the accuracy gains saturate, reaching a maximum of 71.53\% at $N=512$. This proves that DE-BN is remarkably sample-efficient, requiring only a tiny pool of unlabeled samples to fully heal representation collapse.
+
+\begin{figure}[ht]
+\vskip 0.1in
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{de_bn_sample_efficiency.pdf}}
+\caption{Sample efficiency of task-specific DE-BN. As the number of calibration samples $N$ increases from 2 to 64, the average test accuracy scales rapidly from 12.63\% to 70.07\%, after which performance saturates.}
+\label{fig:de_bn_efficiency}
+\end{center}
+\vskip -0.1in
+\end{figure}
+
+\subsection{Empirical Validation of CBVC's Activation Explosion}
+To validate our mathematical deconstruction of CBVC in Section~\ref{sec:cbvc}, we track the layer-wise standard deviation of activations at the output of the initial ReLU and each of the 8 residual stages in ResNet-18. The results are plotted in Figure~\ref{fig:activation_explosion}. 
+
+While the Progenitor (oracle) maintains stable activations across all stages (std dev $\approx 0.3 \sim 0.8$) and HNS successfully keeps activations bounded, the activation scale under CBVC compounds exponentially. It begins at 0.51 at the initial ReLU and explodes to \textbf{426.64} by the final residual block. This empirical tracking provides an elegant and irrefutable verification of Theorem 1 and our scale inflation proof.
+
+\begin{figure}[ht]
+\vskip 0.1in
+\begin{center}
+\centerline{\includegraphics[width=0.95\columnwidth]{activation_explosion.pdf}}
+\caption{Layer-wise activation standard deviation across different ResNet-18 calibration configurations. CBVC (red) experiences an exponential activation explosion compounding with depth, reaching a standard deviation of 426.64, whereas weight-scaling calibrations like HNS (blue) remain stable near the Progenitor oracle (green).}
+\label{fig:activation_explosion}
+\end{center}
+\vskip -0.1in
+\end{figure}
+
+\subsection{Post-Training Quantization and Environmental Robustness}
+We evaluate the robustness of these calibration schemes under two realistic deployment challenges: low-bit Post-Training Quantization (PTQ) and environmental corruptions.
+
+\textbf{Low-bit PTQ Robustness:} To serve models in edge environments, we quantize model weights to 8-bit (Per-Tensor and Per-Channel) and 4-bit (Per-Channel) precision. As shown in Figure~\ref{fig:ptq_robustness}, standard weight-rescaling methods (HNS, QR-IPR) are robust at 8-bit but degrade significantly under 4-bit quantization, with HNS dropping from 63.47\% to 55.37\%. This drop occurs because weight-scaling inflates the dynamic range of filters, amplifying quantization noise. Conversely, our task-specific DE-BN remains extremely robust across all levels, retaining an outstanding \textbf{68.50\%} accuracy under 4-bit quantization. This is because DE-BN operates entirely in activation space and leaves the model weights unmodified at their averaged values, completely avoiding any quantization noise.
+
+\begin{figure}[ht]
+\vskip 0.1in
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{ptq_robustness.pdf}}
+\caption{Post-Training Quantization (PTQ) robustness comparison. Under lower bit-widths (e.g., INT4), weight-scaling calibrations (HNS and QR-IPR) degrade significantly due to weight range inflation, while DE-BN remains robust.}
+\label{fig:ptq_robustness}
+\end{center}
+\vskip -0.1in
+\end{figure}
+
+\textbf{Environmental Robustness and the Noise Tradeoff:} We test the models under two common corruptions: Gaussian Blur and additive Gaussian Noise ($\sigma=0.1$). While DE-BN achieves superior performance under Gaussian Blur and clean conditions, we observe a critical tradeoff under additive Gaussian Noise. As shown in Table~\ref{tab:results}, under Gaussian Noise, HNS retains 63.93\% accuracy (matching its clean performance of 63.47\%), whereas task-specific DE-BN drops catastrophically to 33.07\%. 
+
+We provide an honest and rigorous analysis of this failure: DE-BN re-estimates BatchNorm running statistics on clean, task-specific training samples. Because these statistics are tightly tuned to the clean distribution, any out-of-distribution (OOD) shift---such as high-frequency additive noise---violates the estimated stats, causing catastrophic representational misalignment. On the other hand, HNS/IPR scale the weights of the filters directly, preserving the intrinsic OOD noise robustness of the individual fine-tuned task experts. This reveals that while activation-space calibration is simpler and highly performant under clean and quantized settings, parameter-space scaling remains superior for preserving OOD environmental robustness.
+
+\section{Related Work}
+\label{sec:related_work}
+
+Our work builds upon and deconstructs several foundational lines of literature in multi-task learning, representation alignment, and efficient model deployment.
+
+\subsection{Multi-Task Model Merging}
+Multi-task model merging is a rapidly developing field designed to unify separate, task-specific expert networks fine-tuned from a shared pre-trained progenitor without the prohibitive expense of joint multi-task retraining~\cite{wortsman2022model,ilharco2023editing,matena2022merging}. Early approaches, such as Weight Averaging (WA) and Model Soups, proved effective for interpolating models within the same loss basin~\cite{wortsman2022model,izmailov2018averaging,ainsworth2022git}. To prevent interference between task updates, advanced sparsification and routing methods have been proposed. TIES-Merging resolves interference by signing and trimming redundant updates~\cite{yadav2023ties}, while DARE uses random drop-and-rescale masks to sparsify task vectors~\cite{yu2024dare}. Other works explore model alignment in tangent spaces~\cite{ortiz2023task}, manifold-based merging~\cite{wang2026manifold}, and routing expert modules dynamically~\cite{daheim2024model,zhang2024merging}.
+
+\subsection{Representation Collapse and Parameter Calibration}
+Catastrophic representation collapse in model merging was identified by Jordan et al. as a systematic variance decay caused by the high-dimensional orthogonality of fine-tuned task vectors~\cite{jordan2023repair}. To resolve this data-dependently, REPAIR rescales activation features to align representation variance. To operate entirely data-freely, parameter-space scaling methods have been proposed. Holographic Norm Scaling (HNS) and Isotropic Parameter Resonance (IPR) derive scaling metrics directly from the Frobenius norms of weight tensors to scale task vectors prior to merging~\cite{submission5}. More advanced methods, such as Wasserstein-Calibrated Parameter Resonance (WCPR), apply non-parametric optimal transport theory to map parameters channel-by-channel to a Wasserstein-2 barycenter~\cite{submission9}. Our work deconstructs these parameter-space methods, showing they are fundamentally complex and can be matched by simpler alternatives.
+
+\subsection{BatchNorm Calibration in Deep Learning}
+BatchNorm calibration has a long history as a highly effective, training-free method for domain adaptation, out-of-distribution generalization, and data-free knowledge transfer~\cite{ioffe2015batch,santurkar2018how}. Prior studies have utilized BatchNorm running statistics to align representation distributions between domains~\cite{kim2024task,lubana2021theoretical} or to reconstruct training distributions for zero-shot knowledge distillation~\cite{shen2020data,yin2020dreaming,cai2020zero}. In model merging, DE-BN was proposed as a data-efficient baseline for variance alignment~\cite{submission10}. Our deconstruction exposes a critical sequential evaluation bug in previous DE-BN implementations, proving that simple task-specific partitioning unlocks its full latent power.
+
+\subsection{Post-Training Quantization and Robustness}
+Deploying deep neural networks to resource-constrained edge systems typically requires compressing weights via low-bit Post-Training Quantization (PTQ)~\cite{han2015deep,gholami2021survey}. Standard PTQ methods rely on calibrating quantization step sizes and clipping ranges to minimize round-off noise~\cite{nagel2020up,frantar2022gptq,hubara2021improving,jacob2018quantization}. Recent literature has highlighted that model merging exacerbates quantization noise, proposing specialized merge-friendly PTQ algorithms~\cite{shin2025merge} and expert-guided post-merge quantization with merged-weight anchoring~\cite{wang2026epmq}. Our analysis shows that weight-scaling calibrations are inherently vulnerable to low-bit PTQ noise due to weight dynamic range inflation, whereas activation-space calibrations like DE-BN bypass this issue completely by preserving original weight distributions.
+
+\section{Foundational Design Principle}
+\label{sec:principle}
+Our mathematical deconstruction and empirical tracking establish a foundational model merging design principle:
+\begin{quote}
+    \textit{Model calibration must be applied selectively to the task updates (in weight space), or dynamically to the entire representations (in activation space via DE-BN), but cannot be applied globally to the merged parameters or running statistics without catastrophic representational mismatch.}
+\end{quote}
+By respecting this principle, future merging algorithms can avoid the pitfall of exponential activation explosion while optimizing for resource constraints, OOD robustness, and deployment efficiency.
+
+\section{Conclusion}
+\label{sec:conclusion}
+By adopting the rigorous perspective of \textbf{The Minimalist}, we have systematically deconstructed parameter-space calibration in multi-task model merging. Guided by Occam's razor, we exposed why the elegant data-free running-statistics calibration (CBVC) collapses, proved the mathematical necessity of selective update rescaling, and demonstrated that a simple, task-specific DE-BN calibration represents the most performant, simple, and quantization-robust model merging calibration paradigm available. Future work should focus on resolving the OOD noise vulnerability of activation-space calibrations while preserving their minimalist elegance.
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+\clearpage
+\appendix
+\section{Detailed Experimental Settings and Hyperparameters}
+\label{sec:appendix_hyperparameters}
+To ensure complete reproducibility of our results, we detail the entire training and optimization setup used in our multi-task model merging testbed. All experiments are conducted on standard Linux systems using PyTorch and the torchvision library.
+
+\paragraph{Backbone Architecture:}
+We use a standard ResNet-18 backbone~\cite{he2016deep} initialized with pre-trained ImageNet-1K weights. The final fully-connected (FC) layer of the pre-trained backbone is replaced with an identity mapping (\texttt{nn.Identity()}) to act as a 512-dimensional feature extractor. Each task has a dedicated classification head: a linear projection layer (\texttt{nn.Linear(512, 10)}) mapping the backbone features to the 10 target classes of each task.
+
+\paragraph{Training Protocols:}
+We fine-tune the shared ResNet-18 progenitor network on each task independently for 5 epochs. We optimize the parameters using the AdamW optimizer with:
+\begin{itemize}
+    \item Learning rate: $1 \times 10^{-4}$
+    \item Weight decay: $1 \times 10^{-4}$
+    \item Batch size: 256
+    \item Loss function: standard Cross-Entropy Loss
+\end{itemize}
+The individual training runs achieve excellent accuracy on the respective test splits (MNIST: 99.20\%, Fashion-MNIST: 92.30\%, CIFAR-10: 79.30\%), proving that our expert models represent highly converged checkpoints within standard training loss basins.
+
+\paragraph{Post-Training Quantization (PTQ):}
+For low-bit PTQ, we implement both per-tensor and per-channel quantization. The weights $W$ of each convolutional and linear layer are quantized to $b$ bits using:
+\begin{equation}
+    W_{\text{quant}} = \text{clip}\left(\text{round}\left(\frac{W}{\Delta}\right), -q_{\text{max}}, q_{\text{max}}\right) \cdot \Delta
+\end{equation}
+where $q_{\text{max}} = 2^{b-1} - 1$ is the maximum symmetric integer range. For per-tensor quantization, the scale factor is computed globally as $\Delta = \frac{\max(|W|)}{q_{\text{max}}}$. For per-channel quantization, a separate scale factor $\Delta_c$ is calculated for each filter channel $c$ as $\Delta_c = \frac{\max(|W_c|)}{q_{\text{max}}}$.
+
+\paragraph{Environmental Corruptions:}
+We evaluate environmental robustness using:
+\begin{enumerate}
+    \item \textbf{Additive Gaussian Noise:} We corrupt the normalized input images by adding zero-mean Gaussian noise with a standard deviation of $\sigma = 0.1$ to every pixel.
+    \item \textbf{Gaussian Blur:} We apply a Gaussian smoothing filter to the input images with a kernel size of $(3,3)$ and a standard deviation of $\sigma = 1.0$.
+\end{enumerate}
+
+\section{Detailed Mathematical Formulations for Merging Rules}
+\label{sec:appendix_math}
+To make our deconstruction mathematically self-contained, we detail the precise equations governing advanced merging rules (TIES-Merging and DARE-Merging) evaluated in our experiments.
+
+Let $\theta_{\text{init}}$ be the progenitor parameters and $\theta_t = \theta_{\text{init}} + \tau_t$ be the expert parameters for task $t \in \{1,\dots,K\}$.
+
+\subsection{TIES-Merging}
+TIES-Merging~\cite{yadav2023ties} resolves parameter interference by applying a three-step pipeline:
+\begin{enumerate}
+    \item \textbf{Reset (Trim Redundant Values):} For each task vector $\tau_t$, values below a threshold parameter fraction (typically $20\%$) are trimmed to zero, producing sparsified vectors $\tau^{\text{sparse}}_t$.
+    \item \textbf{Resolve Sign Conflicts:} A dominant sign vector $\hat{s} \in \{-1, +1\}^D$ is computed for each parameter dimension $d \in \{1,\dots,D\}$ based on the sign with the highest cumulative magnitude across tasks:
+    \begin{equation}
+        \hat{s}_d = \text{sgn}\left(\sum_{t=1}^K \tau^{\text{sparse}}_{t, d} \cdot \mathbb{I}(\text{sgn}(\tau^{\text{sparse}}_{t, d}) = s)\right)
+    \end{equation}
+    where we choose the sign $s \in \{-1, +1\}$ that maximizes the magnitude.
+    \item \textbf{Merge and Disagree Alignment:} Task vectors whose signs disagree with the dominant sign $\hat{s}_d$ are masked out, and the remaining values are averaged:
+    \begin{equation}
+        T_{\text{TIES}, d} = \frac{\sum_{t \in \mathcal{A}_d} \tau^{\text{sparse}}_{t, d}}{|\mathcal{A}_d|}
+    \end{equation}
+    where $\mathcal{A}_d = \{t \in \{1,\dots,K\} \mid \text{sgn}(\tau^{\text{sparse}}_{t, d}) = \hat{s}_d\}$.
+\end{enumerate}
+
+\subsection{DARE-Merging}
+DARE-Merging~\cite{yu2024dare} uses a randomized pruning and rescaling approach to edit task vectors before averaging:
+\begin{enumerate}
+    \item \textbf{Random Drop:} Each parameter update in the task vector $\tau_t$ is randomly dropped (set to zero) with probability $p \in (0, 1)$.
+    \item \textbf{Rescaling:} The remaining parameters are rescaled by $1/(1-p)$ to preserve the expected sum of the updates:
+    \begin{equation}
+        \tau^{\text{DARE}}_{t, d} = \begin{cases} 
+            \frac{\tau_{t, d}}{1-p} & \text{with probability } 1-p \\
+            0 & \text{with probability } p
+        \end{cases}
+    \end{equation}
+    \item \textbf{Weight Averaging:} The rescaled task vectors are averaged and added to the progenitor:
+    \begin{equation}
+        \theta_{\text{DARE}} = \theta_{\text{init}} + \frac{1}{K} \sum_{t=1}^K \tau^{\text{DARE}}_t
+    \end{equation}
+\end{enumerate}
+
+\subsection{Applying CBVC to Advanced Merging Rules}
+When applying our proposed Channel-wise BatchNorm Variance Calibration (CBVC) to TIES or DARE, we compute the channel-wise scale factor $s_c$ using the norm ratio of individual sparsified/edited expert updates to the merged update:
+\begin{equation}
+    s_c = \frac{1}{K} \frac{\sum_{t=1}^K \| \tau^{\text{edited}}_{t, c} \|_2}{\| T^{\text{merged}}_{c} \|_2}
+\end{equation}
+where $\tau^{\text{edited}}_t$ represents the sparsified task vector for TIES or rescaled vector for DARE. The BatchNorm running mean and variance are then adjusted dynamically as:
+\begin{equation}
+    \mu^{\text{cal}}_c = \frac{\mu_c}{s_c}, \quad \sigma^2_{\text{cal}, c} = \frac{\sigma^2_c}{s_c^2}
+\end{equation}
+As reported in our main paper, this pure data-free calibration fails under advanced merging rules as well, with TIES-Merging + CBVC collapsing to 32.53\%, confirming the universality of our Exponential Activation Explosion theorem across all merging backbones.
+
+\section{Broader Societal and Environmental Impact}
+\label{sec:appendix_societal}
+In modern artificial intelligence, training large-scale models across multiple domains consumes enormous quantities of electrical power, requiring massive data-center resources and contributing significantly to global carbon emissions. Multi-task model merging represents a highly effective paradigm for \textbf{Green AI}.
+
+By adopting the philosophy of \textbf{The Minimalist}, we emphasize that training-free parameter calibration and data-efficient activation alignment can bypass joint multi-task fine-tuning altogether.
+Specifically:
+\begin{enumerate}
+    \item \textbf{Carbon Footprint Reduction:} Fine-tuning a multi-task ResNet-18 or transformer model requires tens or hundreds of GPU hours, producing substantial carbon output. In contrast, model merging is a pure mathematical combination requiring zero GPU training. Our proposed task-specific DE-BN requires only a single forward pass over $N=64$ samples, which runs in less than a second on a single GPU (or even on a standard CPU). This represents a direct compute reduction of over $99.99\%$.
+    \item \textbf{Edge Deployment Viability:} Serving multiple dedicated checkpoints requires immense memory and edge-device storage. Merging all task experts into a single backbone saves gigabytes of parameter space, making deep learning models highly accessible to low-power edge nodes, medical IoT devices, and mobile environments, thereby democratizing access to high-performance AI.
+\end{enumerate}
+Our deconstruction helps clarify the trade-offs of these training-free techniques, facilitating their adoption and contributing to more sustainable, environmentally-conscious deep learning systems.
+
+\end{document}

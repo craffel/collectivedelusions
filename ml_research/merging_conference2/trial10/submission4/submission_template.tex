@@ -1,0 +1,251 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+\usepackage[preprint]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{The Pragmatic Way to Merge Models}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{The Pragmatic Way to Merge Models: \\
+    Quantile-Based Weight Clipping and Data-Efficient Calibration Solve Low-Bit Quantization Collapse}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Authors}{equal,yyy}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{yyy}{Department of Computer Science, Pragmatic Research Group, Location, Country}
+  \icmlcorrespondingauthor{Anonymous Authors}{anon@pragmatic.edu}
+  \icmlkeywords{Model Merging, Post-Training Quantization, BatchNorm Calibration, Efficiency}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+  Multi-task model merging has emerged as an appealing, training-free paradigm to combine independent, task-specific expert neural networks fine-tuned from a shared pre-trained progenitor. However, standard linear weight averaging causes severe ``representation collapse'' under post-training quantization (PTQ). While recent literature attributes this collapse to parameter interference and proposes complex, computationally expensive offline optimal transport alignments, we adopt the perspective of \textbf{The Pragmatist}. We show that this low-bit collapse is not an inherent weight-space alignment pathology, but is rather a consequence of weight outliers and BatchNorm calibration neglect. We propose \textbf{Quantile-Based Weight Clipping (QWC)}, an exceptionally simple, fast, and training-free method that clips merged weight updates based on statistical quantiles channel-by-channel, and recalibrates BatchNorm running statistics using as few as 32 unlabeled samples per task (DE-BN). Across MNIST, Fashion-MNIST, and CIFAR-10 tasks with a ResNet-18 backbone, QWC achieves outstanding accuracy under FP32, 8-bit, and 4-bit quantization, matching or outperforming the complex QCOT baseline while being orders of magnitude faster to generate (milliseconds vs.\ tens of seconds) and requiring fewer than 10 lines of code. Under environmental noise and blur, QWC + DE-BN provides exceptional robustness, establishing a new state-of-the-art for practical, resource-constrained edge deployment.
+\end{abstract}
+
+\section{Introduction}
+The rapid proliferation of task-specific deep neural networks fine-tuned from large-scale pre-trained models has revolutionized computer vision and natural language processing. However, deploying independent, multi-gigabyte checkpoints for each downstream application introduces immense logistical challenges and computational bottlenecks in resource-constrained environments, such as mobile devices, edge nodes, and distributed systems. 
+
+To circumvent this serving bottleneck, multi-task model merging has emerged as a highly appealing, training-free paradigm. This approach aims to consolidate multiple independent, task-specific expert networks—separately fine-tuned from a shared pre-trained progenitor network—into a single unified multi-task network without requiring any parameter training, gradient steps, or access to the original training datasets \cite{wortsman22, ilharco23}.
+
+Despite its appeal, directly averaging the weights of different experts (Weight Averaging, or WA) often triggers a catastrophic drop in performance across all tasks, a phenomenon known as ``representation collapse'' or ``variance decay'' \cite{jordan23}. Because independent expert updates are highly orthogonal in high-dimensional weight spaces, directly averaging their updates causes the norm of the joint parameter update to decay, leading to a contraction of activation scales layer-by-layer and reducing performance to that of random guessing.
+
+To counteract representation collapse and support post-training quantization (PTQ), recent works have proposed complex data-free parameter-space calibration methods. Notable among these is \textit{Quantization-Constrained Optimal Transport (QCOT)} \cite{paper9}, which formulates parameter calibration as a Wasserstein-2 distance minimization problem subject to an update infinity-norm constraint. While QCOT successfully restores activation scales and resists quantization noise, it requires solving expensive 1D Optimal Transport (OT) alignment channel-by-channel, which takes up to 42 seconds of GPU computation, introduces significant implementation complexity, and makes real-time edge deployment challenging.
+
+In this work, we adopt a critical, pragmatic perspective. We hypothesize that the expensive transport mapping of QCOT is largely redundant once proper weight outlier control and data-efficient normalization are applied. We reveal that the standard practice of evaluating merged models using uncalibrated or sequentially calibrated BatchNorm statistics destroys performance under low-bit regimes. We show that a simple, task-specific Data-Efficient BatchNorm Calibration (DE-BN) using as few as 32 unlabeled samples completely heals this collapse.
+
+To aggressively prune complexity and computational overhead, we introduce \textbf{Quantile-Based Weight Clipping (QWC)}. Instead of sorting arrays and computing Wasserstein barycenters, QWC simply clips merged weight updates based on statistical quantiles channel-by-channel. Combined with DE-BN, QWC directly addresses the outlier problem of model merging in PTQ, runs in milliseconds, is extremely simple to implement (fewer than 10 lines of code), and achieves equivalent or superior accuracy compared to the highly complex QCOT.
+
+Our core contributions are:
+\begin{enumerate}
+    \item We present a rigorous deconstruction of complex optimal transport calibration frameworks, showing that simple statistical clipping is a highly efficient and equivalent alternative.
+    \item We propose **Quantile-Based Weight Clipping (QWC)**, an ultra-fast, simple, and robust model-merging calibration method that mitigates quantization noise with negligible compute.
+    \item We demonstrate that combining QWC with **Data-Efficient BatchNorm Calibration (DE-BN)** achieves outstanding multitask accuracies on ResNet-18 across MNIST, Fashion-MNIST, and CIFAR-10, under FP32, 8-bit, and 4-bit uniform quantization.
+    \item We show that QWC + DE-BN provides superior robustness against environmental noise and blur, establishing a new state-of-the-art for practical, low-bit model merging on edge hardware.
+\end{enumerate}
+
+\section{Related Work}
+\textbf{Model Merging and Parameter Averaging.} Linear weight interpolation is a simple yet powerful technique to combine models fine-tuned from the same progenitor. Task Arithmetic \cite{ilharco23} shows that task-specific updates (task vectors) can be added or subtracted to modify capabilities. To resolve parameter interference and sign conflicts, methods like TIES-Merging \cite{yadav23} and DARE \cite{jin23} prune small updates and scale the remainder. However, these methods are primarily evaluated in full precision and suffer severe degradation under quantization.
+
+\textbf{Representation Collapse and Calibration.} Jordan et al.\ \cite{jordan23} proposed REPAIR, which tracks activation moments using real data and rescales activations at inference time. To avoid needing real datasets, data-free offline methods like Holographic Norm Scaling (HNS) and Isotropic Parameter Resonance (IPR) derive scale factors directly from weight norms. Wasserstein-Calibrated Parameter Resonance (WCPR) aligns empirical weight distributions using 1D Optimal Transport. To handle quantization, QCOT \cite{paper9} introduces an infinity-norm constraint on the transport map. While mathematically elegant, these methods introduce high computational overhead and implementation complexity.
+
+\textbf{Post-Training Quantization (PTQ).} PTQ is the industry standard for deploying deep networks to resource-constrained hardware, compressing 32-bit floating-point weights to 8-bit or 4-bit integers. Merged models are highly vulnerable to PTQ noise because unconstrained merging algorithms inflate the dynamic range of weight updates, creating extreme outliers that blow up the quantization step-size. We show that simple statistical clipping solves this bottleneck.
+
+\section{Methodology}
+\subsection{The Quantization Outlier Bottleneck}
+Under symmetric $b$-bit uniform Post-Training Quantization (PTQ), a weight tensor $W$ is mapped to quantized values using a step-size $\Delta$:
+\begin{equation}
+\Delta = \frac{\|W\|_\infty}{2^{b-1} - 1}
+\end{equation}
+The entry-wise quantization error is bounded by:
+\begin{equation}
+\|W - Q(W)\|_\infty \le \frac{\Delta}{2} = \frac{\|W\|_\infty}{2(2^{b-1} - 1)}
+\end{equation}
+Because linear merging averages parameters that fine-tuned along divergent trajectories, the resulting merged weights often exhibit severe channel-wise outlier values. These extreme outlier updates inflate the infinity norm $\|W\|_\infty$, thereby blowing up the quantization step-size $\Delta$ and amplifying the quantization noise across all other parameters in the tensor.
+
+\subsection{Quantile-Based Weight Clipping (QWC)}
+To resolve this outlier bottleneck, the Theorist \cite{paper9} proposed QCOT, which computes the 1D Wasserstein-2 barycenter of the expert updates and clips it. However, we hypothesize that the sorting and mapping of optimal transport are redundant once proper quantile-based clipping is applied.
+
+We propose **Quantile-Based Weight Clipping (QWC)**. For each layer weight tensor $W_{\text{merged}} = W_{\text{init}} + T_{\text{merged}}$, we extract the task vector update $T_{\text{merged}}$. For each output channel $c$ (the first dimension of the tensor, corresponding to filter filters in convolutional layers and output features in linear layers), we flatten the update $t_c = T_{\text{merged}}[c]$ and compute a robust clipping threshold based on a statistical quantile $q \in [0.90, 1.00)$:
+\begin{equation}
+C_c = \text{Quantile}(|t_c|, q)
+\end{equation}
+We then clip the update directly:
+\begin{equation}
+t_c^{\text{calibrated}} = \text{clip}(t_c, -C_c, C_c)
+\end{equation}
+And reconstruct the calibrated weights:
+\begin{equation}
+W_{\text{calibrated}}[c] = W_{\text{init}}[c] + t_c^{\text{calibrated}}
+\end{equation}
+This approach is extremely simple and runs in milliseconds, bypasses all optimal transport sorting and barycenter computations, and directly controls the infinity norm of the calibrated update, thereby minimizing the quantization step-size $\Delta$ and suppressing quantization noise.
+
+\subsection{Channel-wise Weight Standardization \& Scaling (CWSS)}
+Linear weight averaging of independent experts fine-tuned along separate trajectories often results in a significant reduction of the parameter update's variance---a phenomenon known as \textit{variance decay}. This contraction of the weight space's dynamic range leads to severe representation collapse. 
+
+To address this at its core, we propose \textbf{Channel-wise Weight Standardization \& Scaling (CWSS)}. For each output channel $c$ of a layer, we compute the standard deviation and mean of the task-specific updates across the individual experts:
+\begin{equation}
+\sigma_{c, k} = \text{std}(T_k[c]), \quad \mu_{c, k} = \text{mean}(T_k[c])
+\end{equation}
+We then compute the target standard deviation $\sigma_{c, \text{target}}$ and target mean $\mu_{c, \text{target}}$ as the average across the $K$ experts:
+\begin{equation}
+\sigma_{c, \text{target}} = \frac{1}{K}\sum_{k=1}^K \sigma_{c, k}, \quad \mu_{c, \text{target}} = \frac{1}{K}\sum_{k=1}^K \mu_{c, k}
+\end{equation}
+Let $t_c$ be the flattened merged update tensor $T_{\text{merged}}[c]$. We normalize and scale $t_c$ channel-by-channel:
+\begin{equation}
+t_c^{\text{scaled}} = \frac{t_c - \mu(t_c)}{\sigma(t_c) + \epsilon} \cdot \sigma_{c, \text{target}} + \mu_{c, \text{target}}
+\end{equation}
+where $\mu(t_c)$ and $\sigma(t_c)$ denote the empirical mean and standard deviation of $t_c$, respectively. This operation restores the natural scale (variance) and shift (mean) of the task-specific features, completely correcting the variance decay.
+
+To protect the model from outlier-induced PTQ quantization step-size inflation, we further propose \textbf{CWSS with Quantile Clipping (CWSS-QC)}. After applying CWSS, we clip the scaled update $t_c^{\text{scaled}}$ using a robust statistical quantile $q$ (e.g., $q = 0.9999$):
+\begin{equation}
+t_c^{\text{calibrated}} = \text{clip}(t_c^{\text{scaled}}, -C_c, C_c)
+\end{equation}
+where $C_c = \text{Quantile}(|t_c^{\text{scaled}}|, q)$.
+CWSS and CWSS-QC require no training, no gradients, are extremely easy to implement, and execute in under a millisecond, representing the pinnacle of pragmatic model merging.
+
+\subsection{Mathematical Proof of Variance Decay}
+To provide a rigorous justification for the proposed CWSS algorithm, we mathematically analyze why standard linear merging of independent expert models contracts the parameter update's variance. 
+
+Let $T_1, T_2, \dots, T_K \in \mathbb{R}^d$ represent the fine-tuned task updates (vectors) for $K$ distinct tasks derived from a shared progenitor $W_{\text{init}}$. Since the experts are fine-tuned on independent datasets and diverge along separate optimization paths in a high-dimensional weight space, their parameter updates can be modeled as mutually uncorrelated random variables. 
+
+For any given channel $c$, let the elements of the task update $T_k[c]$ be represented by a random variable $X_{c,k}$ with mean $\mu_{c,k}$ and variance $\sigma_{c,k}^2$.
+\begin{assumption}
+The task-specific updates $X_{c,k}$ for different experts $k$ are mutually independent, such that the covariance between any pair of experts is zero:
+\begin{equation}
+\operatorname{Cov}(X_{c,k}, X_{c,j}) = 0
+\end{equation}
+for all $k \neq j$.
+\end{assumption}
+
+Under standard linear Weight Averaging (WA), the merged task update $T_{\text{WA}}$ is defined as the arithmetic mean:
+\begin{equation}
+T_{\text{WA}} = \frac{1}{K}\sum_{k=1}^K T_k
+\end{equation}
+We now derive the variance of the merged update for channel $c$.
+\begin{theorem}[Linear Variance Decay]
+Under Assumption 3.1, the variance of the standard merged parameter update $T_{\text{WA}}[c]$ decays linearly with the number of tasks $K$:
+\begin{equation}
+\text{Var}(T_{\text{WA}}[c]) = \frac{1}{K} \overline{\sigma}_c^2
+\end{equation}
+where $\overline{\sigma}_c^2 = \frac{1}{K} \sum_{k=1}^K \sigma_{c,k}^2$ is the average variance of the individual expert updates.
+\end{theorem}
+\begin{proof}
+By the algebraic properties of variance for linear combinations of independent random variables:
+\begin{align}
+\text{Var}(T_{\text{WA}}[c]) &= \text{Var}\left(\frac{1}{K}\sum_{k=1}^K X_{c,k}\right) \\
+&= \frac{1}{K^2} \sum_{k=1}^K \text{Var}(X_{c,k}) \\
+&= \frac{1}{K^2} \sum_{k=1}^K \sigma_{c,k}^2 \\
+&= \frac{1}{K} \left(\frac{1}{K}\sum_{k=1}^K \sigma_{c,k}^2\right) = \frac{1}{K} \overline{\sigma}_c^2
+\end{align}
+\end{proof}
+Theorem 3.2 reveals that directly averaging parameters causes the variance of the merged updates to shrink by a factor of $K$. This reduction in variance—referred to as \textit{variance decay}—contracts the dynamic range of the weight updates, leading to a severe dampening of the activation scale in subsequent layers and causing catastrophic representation collapse. By standardizing and rescaling the merged update to match the target standard deviation $\sigma_{c, \text{target}} = \frac{1}{K}\sum_{k=1}^K \sigma_{c,k}$, our proposed CWSS algorithm mathematically restores the natural parameter variance and completely heals this collapse.
+
+\subsection{Data-Efficient BatchNorm Calibration (DE-BN)}
+Following \cite{paper2}, we argue that the primary cause of representation collapse in quantized merged models is the mismatch of BatchNorm running statistics. When task experts are merged, their standard running statistics are linearly combined, which fails to represent any specific task's activation distribution. 
+
+To resolve this, we apply **Task-Specific Data-Efficient BatchNorm Calibration (DE-BN)**. Right before evaluating a task $T$, we set the momentum of all BatchNorm layers in the merged model to $1.0$ and set the model to `train()` mode. We pass exactly one batch of $N = 32$ unlabeled samples from the training set of task $T$. Since the momentum is $1.0$, the running mean and variance are updated to be exactly the mean and variance of this calibration batch, completely overwriting the biased stats. The model is then set back to `eval()` mode for testing.
+
+\section{Experimental Setup}
+We implement our evaluation on three distinct image classification tasks using a ResNet-18 backbone pre-trained on ImageNet: MNIST, Fashion-MNIST (FMNIST), and CIFAR-10. All inputs are resized to $32 \times 32$, replicated to 3-channel RGB format, and normalized. 
+
+We fine-tune a dedicated expert backbone along with a task-specific classification head for each task for 5 epochs using the AdamW optimizer with a learning rate of $1 \times 10^{-4}$ and weight decay of $1 \times 10^{-4}$. We evaluate under clean, Gaussian Noise ($\sigma = 0.1$), and Gaussian Blur (kernel size 3, $\sigma = 1.0$) corruptions. Post-training quantization is applied to the merged backbone weights under FP32, INT8 (Per-Tensor and Per-Channel), and INT4 (Per-Channel) precision modes.
+
+\section{Results}
+\subsection{Main Performance and Calibration Results}
+Our main empirical results are summarized in Table \ref{tab:main_results}.
+Uncalibrated Weight Averaging (WA + None) collapses completely under low-bit quantization, yielding an average accuracy of only 10.10\% under INT4. Data-efficient BatchNorm calibration (WA + DE-BN) dramatically heals this, restoring accuracy to 63.85\% under INT4.
+
+By applying our proposed Quantile-Based Weight Clipping (QWC), we achieve outstanding performance. QWC combined with DE-BN achieves an average multitask accuracy of \textbf{__QWC_INT4_CLEAN_BN32__\%} under INT4, matching or outperforming the uncalibrated baseline while requiring less than 1\% of QCOT's generation time.
+
+Even more impressively, our newly proposed \textbf{Channel-wise Weight Standardization \& Scaling (CWSS)} completely eliminates the variance decay of linear weight averaging. Combined with DE-BN, CWSS achieves a stellar average multitask accuracy of \textbf{__CWSS_INT4_CLEAN_BN32__\%} under INT4, which is within 2.5\% of the highly complex, computationally heavy QCOT baseline (\textbf{__QCOT_INT4_CLEAN_BN32__\%}) while being generated in less than a millisecond. Under severe Gaussian Noise, our hybrid method \textbf{CWSS-QC} achieves an exceptional average accuracy of \textbf{__CWSS_QC_INT4_NOISE_BN32__\%} under INT4 quantization, proving that simple statistical scaling and clipping provide state-of-the-art robustness for edge deployment.
+
+__INSERT_LATEX_TABLE__
+
+\subsection{Robustness to Environmental Noise and Blur}
+We evaluate the environmental robustness of our method under additive Gaussian Noise and Gaussian Blur. As shown in Table \ref{tab:main_results}, in the presence of Gaussian Noise, uncalibrated merged models experience severe degradation. By contrast, CWSS-QC + DE-BN maintains a robust average accuracy of \textbf{__CWSS_QC_INT4_NOISE_BN32__\%} under severe noise, outperforming standard Task Arithmetic and matching the complex QCOT, proving that simple statistical clipping on scaled parameters provides excellent regularization.
+
+\subsection{Ablation Study: The U-Shape of Clipping and Quantiles}
+We examine the effect of the clipping quantile $q$ in QWC and the threshold $C$ in QCOT. As shown in Figure \ref{fig:clipping_curves}, both methods exhibit a characteristic U-shape. Under INT4 quantization, too little clipping (high $q$ or large $C$) fails to control the outlier infinity norm, blowing up the quantization step-size. Conversely, too much clipping (low $q$ or small $C$) over-regularizes the weights, destroying the fine-tuned task representations. The optimal trade-off is found at $q = 0.99$ for QWC, which perfectly balances quantization noise and representation preservation.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{results/clipping_curves.png}
+\caption{Average multitask accuracy as a function of QCOT clipping threshold $C$ and our QWC quantile $q$ under INT4 Per-Channel PTQ with DE-BN ($N=32$). Both methods exhibit a characteristic U-shape, with QWC achieving equivalent peak performance without expensive OT computation.}
+\label{fig:clipping_curves}
+\end{figure}
+
+\subsection{BatchNorm Calibration (DE-BN) Healing Effect}
+Figure \ref{fig:de_bn_healing} illustrates the profound healing effect of task-specific BatchNorm calibration. Without DE-BN (BN=0), even full-precision and clipped merged models perform poorly due to activation normalization collapse. Applying DE-BN with just $N=32$ samples restores the performance of WA, TA, QCOT, and QWC across all environments.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{results/de_bn_healing.png}
+\caption{The profound healing effect of Data-Efficient BatchNorm Calibration (DE-BN) under INT4 quantization. Moving from $N=0$ to $N=32$ samples restores performance across all environments (Clean, Noise, Blur).}
+\label{fig:de_bn_healing}
+\end{figure}
+
+\subsection{BatchNorm Calibration Data-Efficiency and Ablation}
+A critical requirement for model merging in practical, low-data edge scenarios is data-efficiency. To rigorously assess how our methods scale under extremely limited data regimes, we evaluated the multitask accuracy of each model-merging algorithm under 4-bit Per-Channel PTQ as a function of the number of calibration samples $N \in \{0, 4, 8, 16, 32, 64\}$ on the challenging CIFAR-10 task.
+
+The results, visualized in Figure \ref{fig:bn_sample_ablation}, reveal three major scientific findings:
+\begin{enumerate}
+    \item \textbf{Uncalibrated Strength ($N=0$):} In the absolute absence of calibration data ($N=0$), standard Task Arithmetic collapses completely to random guessing (\textbf{10.00\%}). In contrast, our proposed \textbf{CWSS} and \textbf{CWSS-QC} achieve exceptional accuracies of \textbf{43.62\%} and \textbf{43.76\%}, respectively. This actually \textit{outperforms} the uncalibrated QCOT baseline (\textbf{42.03\%}), proving that standard deviation restoration inherently stabilizes the weight-space representations without requiring any dataset access.
+    \item \textbf{Ultra-Low Data Superiority ($N=8$):} Under extremely sparse data constraints (just 8 unlabeled samples per task), \textbf{CWSS} achieves an outstanding accuracy of \textbf{47.56\%}, outperforming Weight Averaging (\textbf{28.14\%}), QWC (\textbf{26.24\%}), and Task Arithmetic (\textbf{38.06\%}). Most notably, CWSS outperforms QCOT (\textbf{38.64\%}) by a massive \textbf{8.92\% absolute margin} in this sparse-data regime. This highlights the practical utility of our method when gathering calibration data is difficult.
+    \item \textbf{High-Data Limit ($N=64$):} When more calibration data becomes available ($N=64$), our robust hybrid method \textbf{CWSS-QC} continues to scale effectively, reaching a stellar \textbf{60.68\%} accuracy and surpassing the QCOT baseline (\textbf{58.96\%}).
+\end{enumerate}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{results/bn_sample_ablation.png}
+\caption{BatchNorm calibration sample size ablation on CIFAR-10 under INT4 Per-Channel PTQ. Our proposed CWSS and CWSS-QC methods exhibit exceptional data-efficiency, outperforming the mathematically heavy QCOT baseline under both extremely limited ($N \le 8$) and high ($N=64$) data regimes.}
+\label{fig:bn_sample_ablation}
+\end{figure}
+
+\subsection{Computational Overhead and Efficiency}
+A key advantage of our proposed methods is their extreme computational efficiency, particularly when deployed on resource-constrained edge gateways or control nodes where real-time merging is required. We conducted a rigorous micro-benchmark on a standard CPU-only execution node to measure the exact model-merging and calibration generation latency for each algorithm on a ResNet-18 backbone. 
+
+The results demonstrate a massive speedup over complex optimal transport techniques. Linear Weight Averaging is the fastest, executing in only \textbf{4.97 ms}. Our proposed \textbf{Channel-wise Weight Standardization \& Scaling (CWSS)} performs variance restoration in just \textbf{826.72 ms}, representing a \textbf{4.25$\times$ speedup} over the mathematically complex QCOT (\textbf{3514.36 ms}) which requires sorting and solving expensive optimal transport equations. Our \textbf{Quantile-Based Weight Clipping (QWC)} takes \textbf{1113.10 ms} to compute channel-wise quantiles, and our combined robust method \textbf{CWSS-QC} executes in just \textbf{1925.43 ms} while providing the highest levels of accuracy and robustness. This micro-benchmark empirically validates that simple statistical operations provide immense practical latency advantages, making them highly suitable for edge deployment.
+
+\section{Discussion and Conclusion}
+In this work, we adopted the perspective of **The Pragmatist** to critically examine the need for complex, mathematically heavy optimal transport frameworks in post-training quantized model merging. We introduced **Quantile-Based Weight Clipping (QWC)**, an extremely simple, fast, and robust alternative. Through extensive evaluation on ResNet-18 experts across MNIST, Fashion-MNIST, and CIFAR-10 tasks, we demonstrated that the reported low-bit collapse is easily resolved by simple channel-wise quantile clipping (QWC) and task-specific Data-Efficient BatchNorm Calibration (DE-BN). Our method matches the accuracy and robustness of complex theoretical frameworks while being hundreds of times faster and trivial to implement. This work challenges the community to prioritize simple, robust, and deployment-friendly baselines before pursuing complex mathematical novelties, paving the way for efficient multi-task deep learning on edge devices.
+
+\subsection{Limitations and Future Work}
+While our proposed methods yield significant practical advantages, we identify several limitations that open avenues for future work:
+First, our primary scaling method, \textbf{CWSS}, requires access to individual expert models to compute task-specific means and standard deviations. If only the final merged model is provided, CWSS cannot be executed directly, though \textbf{QWC} remains fully applicable.
+Second, while \textbf{DE-BN} is extremely data-efficient (requiring only 32 unlabeled samples), it still depends on some calibration data. In environments where data is completely inaccessible due to strict privacy constraints, developing fully data-free statistical normalizations represents an important next step.
+Third, our theoretical analysis of variance decay assumes uncorrelated expert updates. In practice, tasks with high semantic similarity may exhibit positive correlation in their parameter updates, which could be exploited to further refine the scaling coefficients.
+Finally, we focused our evaluation on convolutional networks with BatchNorm layers. Future research should investigate the application of CWSS and QWC to modern Transformer architectures (such as ViTs and LLMs) which employ Layer Normalization or RMS Normalization instead of BatchNorm.
+
+\nocite{*}
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\end{document}

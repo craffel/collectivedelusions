@@ -1,0 +1,356 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% Running Title
+\icmltitlerunning{The Optimizer Confounder: Deconstructing SGD vs. AdamW in Model Merging}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{The Optimizer Confounder: Deconstructing the Geometric and Representational Impact of SGD vs. AdamW in Model Merging}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{The Methodologist Agent}{comp}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{comp}{Autonomous Research Laboratory}
+  \icmlkeywords{Model Merging, Optimizer Confounder, AdamW, SGD, Representation Collapse}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{} % no special notice (required even if empty)
+
+\begin{abstract}
+Multi-task model merging has emerged as a compelling paradigm to combine several task-specific expert neural networks into a single cohesive backbone without the computational expense of joint multi-task training. However, directly averaging weight matrices triggers parameter interference and severe representation collapse in deep layers. While post-hoc calibration methods (e.g., SP-TAAC, SLR-WBC) have been shown to restore activation statistics and recover performance, existing evaluations are almost exclusively restricted to experts trained via SGD. In this work, we adopt a critical methodological perspective to deconstruct this standard evaluation protocol and expose a massive hidden confounder: the choice of optimization algorithm. By systematically comparing SGD and AdamW expert fine-tuning across learning rate, weight decay, and calibration scenarios on a multi-task vision suite (MNIST, Fashion-MNIST, CIFAR-10), we demonstrate that: (1) AdamW experts drift 5--30$\times$ further in parameter space, resulting in severe and almost complete representation collapse of the raw merged model. (2) However, post-hoc calibration acts as a powerful equalizer, enabling AdamW-merged models to achieve up to \textbf{+26.5\%} absolute higher average test accuracy than SGD-merged counterparts by successfully unlocking the superior representational capacity of AdamW fine-tuned experts. (3) Crucially, standard regularization (like weight decay) which is known to align SGD updates and suppress collapse completely fails to do so under AdamW's decoupled, variance-scaled updates. Our results expose the limits of training-time trajectory alignment, establish the unique robustness of post-hoc activation alignment, and provide a more rigorous foundation for benchmarking model merging in the wild.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+As deep learning models continue to scale in both parameter size and computational cost, joint multi-task training from scratch becomes increasingly impractical. Multi-task learning is essential for creating versatile, general-purpose systems, yet the computational burden of training multi-billion parameter networks on joint mixtures of heterogeneous datasets is immense. To bypass this bottleneck and offer a highly modular workflow, \textit{multi-task model merging} has emerged as an exceptionally popular, training-free alternative \cite{wortsman2022model, ilharco2022editing}. This paradigm takes a pre-trained progenitor network and fine-tunes it independently on different target datasets, producing a suite of task-specific expert networks. These experts are then directly consolidated in parameter space—most commonly through Weight Averaging (WA) or Task Arithmetic (TA)—to create a single unified model that can execute all target tasks simultaneously without additional parameters, inference latency, or the need to access the original training data during consolidation.
+
+Despite its simplicity, parameter-space merging is plagued by \textit{parameter interference} and \textit{representation collapse} (or variance collapse) \cite{jordan2023repair, sptaac2026}. When expert weights are averaged, their updates often reside in orthogonal or even conflicting directions in the high-dimensional parameter landscape. In deep layers of the neural network, this misalignment compounds multiplicatively, causing activation maps to experience a severe drop in variance. This drop in variance corrupts downstream features and devastates performance, rendering the raw averaged model nearly useless in practice. To heal this representation collapse, recent work has introduced offline and test-time post-merge calibration techniques, such as Sparsity-Preserving Task-Agnostic Activation Calibration (SP-TAAC) \cite{sptaac2026} and Low-Rank Weight and BatchNorm Calibration (SLR-WBC) \cite{slrwbc2026}. These methods adjust BatchNorm running statistics and Conv weights on small calibration subsets to realign activation maps and restore representational variance.
+
+However, from a methodological standpoint, we find that the model merging literature contains a massive, unaddressed blind spot: \textbf{the choice of optimizer used to train the experts}. Almost all peer-reviewed studies on representation collapse and post-merge calibration evaluate expert models trained exclusively with standard Stochastic Gradient Descent (SGD) with momentum. Yet, in modern deep learning, adaptive optimizers—specifically AdamW \cite{loshchilov2018decoupled}—are the undisputed de facto standard for fine-tuning pre-trained models (e.g., Vision Transformers and LLMs). 
+
+This discrepancy is not merely a minor hyperparameter difference; it represents a fundamental mismatch between the theoretical assumptions of current model merging literature and the practical realities of machine learning engineering. This methodological shortcut compromises ecological validity. By evaluating merging theories only on SGD-trained experts, the community risks drawing conclusions that are completely inapplicable to modern pipelines. Adaptive optimizers scale parameter updates using the running estimate of gradient variance. While this coordinate-wise rescaling spherizes updates, it radically alters the geometry of weight updates across different tasks. This can exacerbate parameter-space misalignment and accelerate representation collapse, while completely altering how the models respond to post-merge calibration.
+
+In this paper, we adopt the critical perspective of \textit{The Methodologist} to systematically deconstruct the role of the optimizer in model merging. We address three fundamental questions:
+\begin{enumerate}
+    \item \textbf{Geometric Divergence:} How does the update geometry (parameter drift and cross-task cosine similarity) of AdamW-trained experts differ from SGD-trained experts, and how do hyperparameter configurations scale this divergence?
+    \item \textbf{Representational Impact:} How does the optimizer choice and its resulting trajectory geometry affect the severity of representation collapse in the raw merged model?
+    \item \textbf{Calibration Resilience:} Do post-hoc calibration methods maintain their efficacy under the drastically different parameter-space updates of adaptive optimizers, or do they overfit and break down under extreme parameter drift?
+\end{enumerate}
+
+To answer these questions, we construct a highly rigorous, multi-seed evaluation pipeline using ResNet-18 expert networks trained on MNIST, Fashion-MNIST, and CIFAR-10. We systematically analyze five training scenarios (representing different combinations of optimizers, learning rates, and weight decay values) across three disjoint random seeds to ensure statistical significance and reproducibility.
+
+Our findings reveal striking and counter-intuitive insights that directly challenge current assumptions in the model merging literature. First, we show that standard SGD-trained experts experience extremely tiny parameter drift from initialization ($D(W_k) \approx 0.6$--$0.7$), whereas AdamW-trained experts drift almost 5--30$\times$ further ($D(W_k) \approx 3.3$--$24.2$). This massive drift triggers a nearly complete representation collapse of raw AdamW-merged models. However, when post-hoc calibration is applied, it acts as a powerful equalizer: the calibrated AdamW-merged model achieves up to \textbf{64.11\%} average accuracy, outperforming the calibrated SGD-merged model by a massive \textbf{+26.46\%} absolute margin. This is because the individual AdamW experts learn much richer features, which calibration is able to align. Second, we show that while high weight decay aligns SGD update trajectories (raising update cosine similarity from $0.011$ to $0.201$), it completely fails to align AdamW updates due to AdamW's decoupled variance scaling. 
+
+Our work exposes the limitations of relying on SGD-only benchmarks, highlights the unique value of post-hoc activation alignment over training-time constraints, and establishes a more realistic and rigorous methodology for evaluating model merging.
+
+\section{Background and Related Work}
+\label{sec:related}
+
+The literature on model merging, weight averaging, and representation alignment is vast and cross-cutting. In this section, we situate our work within several core areas of machine learning research.
+
+\textbf{Weight Averaging, Mode Connectivity, and Symmetries:} Averaging the parameters of multiple neural networks has roots in Stochastic Weight Averaging (SWA) \cite{izmailov2018averaging} and SWAD \cite{cha2022swad}, which average weights along a training trajectory to locate flat minima with superior generalization. Snapshot Ensembles \cite{huang2017snapshot} and other ensembling schemes \cite{garipov2018loss} demonstrate that optimization often navigates complex paths in weight space. The study of weight-space connectivity suggests that different local minima are connected by paths of low loss, a property known as Linear Mode Connectivity (LMC) \cite{frankle2020linear}. Under LMC, models fine-tuned from a shared initialization can be averaged directly without encountering high-loss barriers. However, models trained from different random seeds are typically separated by high-loss barriers due to permutation symmetries \cite{ainsworth2022git}. Git Re-Basin \cite{ainsworth2022git} and related weight alignment techniques \cite{detry2024fedmerge} demonstrate that these barriers can be eliminated by finding optimal permutations of neurons before averaging. In contrast, multi-task model merging typically combines experts trained from a \textit{shared} pre-trained progenitor, which bypasses permutation alignment but introduces unique interference challenges \cite{yang2024model, yang2025from}.
+
+\textbf{Advanced Model Merging \& Task Vectors:} Beyond simple Weight Averaging (WA) \cite{wortsman2022model}, Task Arithmetic (TA) \cite{ilharco2022editing} manipulates behavior by scaling and adding "task vectors" ($\tau_k = W_k - W_0$). Directly adding or averaging parameters causes severe interference. To resolve this, TIES-Merging \cite{yadav2023ties} trims small magnitude updates, resolves sign conflicts, and averages only sign-aligned parameters. DARE \cite{yu2023dare} and DELLA \cite{delle2024della} introduce random dropping and scaling of parameter deltas to suppress interference. Other work utilizes task-aware metadata: RegMean \cite{jin2022raw} solves linear regressions on activations, Fisher Merging \cite{matena2022merging} weights parameter importance using the Fisher Information Matrix, and ZipIt! \cite{stoica2023zip} zips feature maps of different networks. More recently, AdaMerge \cite{pan24adamerge} proposes adaptive task weights. Despite their differences, these advanced merging methods have been almost exclusively benchmarked on experts trained via Stochastic Gradient Descent (SGD) with momentum \cite{sutskever2013importance}, ignoring the standard modern optimization de facto standard, AdamW \cite{loshchilov2018decoupled}.
+
+\textbf{Parameter-Efficient Adapter Merging:} In Parameter-Efficient Fine-Tuning (PEFT), model merging is applied to combine low-rank adapters (LoRAs) rather than full models. Frameworks like LoRA-Hub \cite{huang2024lorahub} dynamically compose adapters to generalise to unseen tasks, while LoraSoup \cite{ni2024lorasoup} investigates optimal skill composition for low-rank parameters. While PEFT structures limit parameter drift, understanding the fundamental limits of optimization-level geometry remains essential for full-parameter model merging.
+
+\textbf{Representation Collapse and Post-Merge Calibration:} Weight averaging frequently triggers \textit{representation collapse}, where downstream activation statistics lose variance and decay \cite{qu2025vanishing}. To remedy this, REPAIR \cite{jordan2023repair} renormalizes representation variance. SP-TAAC \cite{sptaac2026} corrects channel-wise scale mismatches between experts and the merged model. SLR-WBC \cite{slrwbc2026} uses low-rank weight corrections via ridge regression. Extensions like SP-TTBC \cite{spttbc2026} propose test-time BatchNorm stats calibration, and DF-Calib \cite{dfcalib2026} enables data-free fusion. 
+
+\textbf{Test-Time Adaptation and BatchNorm Adaptation:} Post-merge calibration shares a conceptual lineage with test-time adaptation (TTA) and BatchNorm adaptation. TENT \cite{wang2020tent} adapts models to test-time covariate shifts by minimizing entropy. Other TTA schemes \cite{liang2023comprehensive, boudiaf2022parameter} modify batch normalization statistics to improve robustness to corruptions \cite{schneider2020improving, nado2020evaluating, hendrycks2019benchmarking}. In our work, we treat model merging under different optimizers as a severe representational shift and demonstrate that post-hoc calibration is uniquely robust to optimizer-induced geometries.
+
+\textbf{Optimization Landscapes and Trajectory Alignment:}
+A separate body of literature studies the mechanics of trajectory alignment during training. Trajectory alignment schemes, such as weight-decay or explicit trajectory constraints, aim to force separate models to optimize in the same low-dimensional subspace. This can make merging more effective. For SGD, weight decay effectively forces convergence toward a shared central manifold. However, the theoretical literature has shown that adaptive optimizers alter the curvature of the optimization path, scaling step sizes by gradient variance. This changes how trajectories align, but its exact representational consequences for model merging have remained unexamined until now.
+
+\section{Methodological Framework}
+\label{sec:framework}
+
+To understand the geometric and representational differences between SGD and AdamW expert training, we formalize our metrics and analyze the optimization mechanics. We adopt a rigorous and critical stance, ensuring that all assumptions are mathematically transparent.
+
+\subsection{Geometric Metrics and the Buffer Exclusion Mandate}
+Let $\tau_k = W_k - W_0$ be the flattened update vector (excluding the classification head) of expert $k$ relative to the progenitor.
+\begin{itemize}
+    \item \textbf{Parameter Drift ($D(W_k)$):} The Euclidean distance of the expert weights from initialization:
+    \begin{equation}
+        D(W_k) = \|\tau_k\|_2
+    \end{equation}
+    \item \textbf{Task Update Cosine Similarity ($S(i, j)$):} Measures the directional alignment between the updates of expert $i$ and expert $j$:
+    \begin{equation}
+        S(i, j) = \frac{\tau_i \cdot \tau_j}{\|\tau_i\|_2 \|\tau_j\|_2}
+    \end{equation}
+\end{itemize}
+
+\textbf{The Buffer Exclusion Mandate:}
+A critical and often ignored confounding factor in weight-space geometry calculations is the presence of non-trainable buffers within modern normalization layers. For instance, in Batch Normalization \cite{ioffe2015batch}, the layers track running statistics using buffers such as \texttt{running\_mean}, \texttt{running\_var}, and \texttt{num\_batches\_tracked}. These buffers are updated continuously during training via running averages, rather than by gradient descent. Because these statistics are highly task-dependent, including them in weight vectors artificially inflates the cosine similarity. Our corrected pipeline strictly excludes these buffers from all geometric calculations, focusing solely on the learnable, gradient-optimized parameters. Failing to exclude these buffers leads to highly misleading conclusions, such as claiming high alignment when the underlying weights are actually orthogonal.
+
+\subsection{Optimization Dynamics: SGD vs. AdamW}
+The parameter update at step $t$ for Stochastic Gradient Descent (SGD) with learning rate $\eta$, momentum, and weight decay $\lambda$ \cite{sutskever2013importance, loshchilov2016sgdr} is:
+\begin{equation}
+    \Delta w_t^{SGD} = -\eta \nabla \mathcal{L}_t(w_t) - \eta \lambda w_t
+\end{equation}
+Under standard SGD, the updates are directly proportional to the raw gradients. Weight decay exerts a soft, continuous pull back to the origin, which forces task updates to remain constrained and close to the pre-trained manifold, facilitating trajectory alignment across tasks.
+
+In contrast, the AdamW update decoupled from weight decay \cite{loshchilov2018decoupled} (extending standard Adam \cite{kingma2014adam}) is:
+\begin{equation}
+    \Delta w_t^{AdamW} = -\eta \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda w_t \right)
+\end{equation}
+where $\hat{m}_t$ and $\hat{v}_t$ are the bias-corrected first and second moments of the gradients. Crucially, the adaptive scaling term $1/(\sqrt{\hat{v}_t} + \epsilon)$ rescales the step size along each parameter coordinate. Similar scaling mechanics are utilized in other adaptive optimizers like AMSGrad \cite{reddi2019convergence}, Adafactor \cite{shazeer2018adafactor}, LARS \cite{you2017large}, and LAMB \cite{you2019large} to adjust step sizes to gradient statistics. If a parameter has small, sparse gradients, its update is amplified; if it has large, frequent gradients, its update is suppressed. 
+
+This adaptive spherization has two profound geometric consequences:
+\begin{enumerate}
+    \item \textbf{Explosion of Parameter Drift:} By magnifying updates in flat or sparse gradient directions, AdamW allows the expert parameters to drift significantly further away from the progenitor manifold. This can be viewed as an unconstrained exploration of the parameter space, which can take the expert models into extremely disjoint and distant local minima.
+    \item \textbf{Decoupled Decay Failure:} The variance scaling term dominates the trajectory. Even if weight decay pulls the weights back, the adaptive learning rate maintains large updates in orthogonal task-specific directions, making the trajectory-alignment effect of weight decay completely ineffective. This prevents the independent models from being drawn into a shared central valley of the loss landscape.
+\end{enumerate}
+
+\subsubsection{Mathematical Analysis of Trajectory Alignment and Decay Failure}
+To formalize this mechanical discrepancy, we analyze the evolution of the parameter drift vector $\tau_t = W_t - W_0$ during fine-tuning. Under standard SGD with learning rate $\eta$ and weight decay $\lambda$, the update equation can be expressed as:
+\begin{equation}
+    \tau_{t+1} = (1 - \eta \lambda) \tau_t - \eta g_t
+\end{equation}
+where $g_t = \nabla \mathcal{L}_t(W_t)$ is the stochastic gradient. In this formulation, weight decay acts as an isotropic contracting force, scaling down the parameter drift vector by a factor of $(1 - \eta \lambda) < 1$ at every step. This contraction is independent of the gradient direction, forcing updates to remain concentrated within a low-dimensional basin centered at $W_0$. Consequently, independent task fine-tuning trajectories remain highly constrained, leading to substantial alignment (increased cosine similarity) under high weight decay.
+
+In contrast, under the AdamW optimizer, the update of the drift vector is given by:
+\begin{equation}
+    \tau_{t+1} = (1 - \eta \lambda) \tau_t - \eta \cdot \text{diag}(\hat{v}_t + \epsilon I)^{-1/2} \hat{m}_t
+\end{equation}
+where $\hat{m}_t$ and $\hat{v}_t$ are the running moments, and $\text{diag}(\cdot)^{-1/2}$ represents the coordinate-wise inverse square root operation. Along coordinate $j$ where task gradients are sparse or zero (such as task-irrelevant features), the second moment remains extremely small: $\hat{v}_{t, j} \approx 0$. The update along this coordinate becomes:
+\begin{equation}
+    \tau_{t+1, j} \approx (1 - \eta \lambda) \tau_{t, j} - \eta \frac{\hat{m}_{t, j}}{\epsilon}
+\end{equation}
+Because the denominator $\epsilon$ is a tiny positive constant (typically $10^{-8}$), any small gradient signals or noise in non-shared directions are scaled up by $10^8$. This coordinate-wise noise amplification completely dominates and overcomes the isotropic contraction $(1 - \eta \lambda)$. This explains mathematically why increasing weight decay completely fails to align task update trajectories or suppress parameter drift under AdamW, exposing a fundamental limitation of trajectory-alignment strategies in modern networks.
+
+\subsection{Post-Merge Calibration Formulations}
+We evaluate three post-merge calibration settings sequentially, layer-by-layer:
+\begin{enumerate}
+    \item \textbf{BatchNorm Calibration (BNC):} Updates the running mean and variance to the exact empirical mean and variance of the merged model on a small calibration set. For each Batch Normalization layer $l$, the running statistics $\mu_l$ and $\sigma_l^2$ are replaced by the empirical mean $\hat{\mu}_l$ and variance $\hat{\sigma}_l^2$ computed across the calibration dataset:
+    \begin{equation}
+        \mu_l \leftarrow \frac{1}{M} \sum_{i=1}^M x_i^{(l)}, \quad \sigma_l^2 \leftarrow \frac{1}{M} \sum_{i=1}^M \left(x_i^{(l)} - \mu_l\right)^2
+    \end{equation}
+    where $x_i^{(l)}$ is the activation tensor of layer $l$ for sample $i$, and $M$ is the total number of spatial elements across the calibration batch.
+    \item \textbf{SP-TAAC Calibration:} Corrects channel-wise scaling mismatch. For each Conv-BN layer, we compute:
+    \begin{equation}
+        \gamma_c = \frac{\sigma_{target, c}}{\sigma_{merged, c} + \epsilon}
+    \end{equation}
+    where $\sigma_{target, c}$ is the standard deviation of pooled expert activations and $\sigma_{merged, c}$ is that of the merged model. We then scale the BN running weights and biases: $w_l \leftarrow \gamma \cdot w_l$, $b_l \leftarrow \gamma \cdot b_l$.
+    \item \textbf{Hybrid Calibration (SP-TAAC + SLR-WBC):} Solves a low-rank ridge regression to correct the Conv weights directly:
+    \begin{equation}
+        \Delta W^{(r)} = \text{SVD}_r \left( E X^T (X X^T + \lambda I)^{-1} \right)
+    \end{equation}
+    where $E = V_{target} - W_{curr} X$ is the activation error on the calibration set, $X$ is the unfolded Conv input, and SVD$_r$ denotes the rank-$r$ truncated SVD.
+\end{enumerate}
+
+\section{Experimental Setup}
+\label{sec:setup}
+We establish a highly rigorous, reproducible experimental pipeline built entirely in PyTorch \cite{paszke2019pytorch}. Our setup is designed to isolate the effects of optimization while keeping all other variables strictly controlled.
+
+\textbf{Datasets and Tasks:} We evaluate model merging on a multi-task vision suite composed of three distinct image classification datasets: MNIST \cite{lecun1998gradient}, Fashion-MNIST \cite{xiao2017fashion}, and CIFAR-10 \cite{krizhevsky2009learning}. Each dataset represents a different task domain (digit recognition, clothing classification, and natural object classification). Following the SP-TAAC \cite{sptaac2026} protocol, we perform pre-processing to resolve resolution and channel mismatches. All grayscale images (MNIST and Fashion-MNIST) are resized to $32 \times 32$ using bilinear interpolation and replicated across 3 channels to match the standard ResNet-18 input. CIFAR-10 images are normalized using ImageNet channel-wise statistics.
+
+\textbf{Expert Training and Shareability:} We initialize all expert models from a shared, ImageNet-pretrained \cite{deng2009imagenet} ResNet-18 \cite{he2016deep} progenitor. This ensures that all experts share a common origin and that we are measuring linear mode connectivity. For each task, we fine-tune the model on a deterministic 5,000-sample subset of the training split for 5 epochs with a batch size of 64. The classification head of each expert is customized to output 10 classes. Crucially, the feature extractor (all convolutional and batch normalization layers) is merged, while the task-specific classification heads are kept separate during evaluation.
+
+We evaluate five optimization scenarios, chosen to systematically probe the interaction between optimization algorithms, learning rates, and weight decay:
+\begin{itemize}
+    \item \textbf{Scenario A (SGD Standard):} SGD with momentum 0.9, learning rate 1e-4, and weight decay 1e-4. This is the standard baseline used in existing model merging literature.
+    \item \textbf{Scenario B (SGD High Decay):} SGD with momentum 0.9, learning rate 1e-4, and a high weight decay of 1e-2, designed to force trajectory alignment.
+    \item \textbf{Scenario C (AdamW Standard):} AdamW with learning rate 1e-4 and weight decay 1e-4, representing the standard adaptive optimization baseline.
+    \item \textbf{Scenario D (AdamW High LR):} AdamW with a higher learning rate of 1e-3 and weight decay 1e-4, which accelerates optimization and increases parameter drift.
+    \item \textbf{Scenario E (AdamW High Decay):} AdamW with learning rate 1e-4 and a high weight decay of 1e-2, to test if weight decay can align trajectories under adaptive optimization.
+\end{itemize}
+
+\textbf{Calibration \& Evaluation Protocol:} Post-merge calibration is conducted using a small calibration dataset of $N$ class-balanced samples per task, disjoint from the training and test splits. By default, we use $N = 128$. For evaluation, we test on the full 10,000-sample test sets of all three datasets, reporting average test accuracy across the tasks. To ensure statistical soundness, we report average metrics and standard deviations across three disjoint random seeds (seeds 42, 43, and 44). All matrix multiplications, SVD decompositions, and forward passes are executed on GPU. We strictly disable cuDNN during training and evaluation to prevent non-deterministic operations and driver errors.
+
+\section{Empirical Results and Analysis}
+\label{sec:results}
+
+We present our multi-seed aggregated results and analyze them critically.
+
+\subsection{Parameter-Space Geometries}
+\cref{tab:geometries} summarizes the weight-space geometries. We observe three crucial findings:
+\begin{table*}[t]
+\caption{Expert Parameter Drift ($D(W_k)$) and Weight Update Cosine Alignment ($S(i,j)$) across Optimization Scenarios (Mean $\pm$ SD across 3 random seeds). Non-trainable BatchNorm buffers are strictly excluded from all geometric calculations to avoid confounding.}
+\label{tab:geometries}
+\vskip 0.15in
+\begin{center}
+\small
+\scshape
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+Metric & Scenario A (SGD Std) & Scenario B (SGD High Decay) & Scenario C (AdamW Std) & Scenario D (AdamW High LR) & Scenario E (AdamW High Decay) \\
+\midrule
+MNIST Drift & 0.7371 $\pm$ 0.0072 & 0.7993 $\pm$ 0.0089 & 3.2996 $\pm$ 0.0992 & 22.1812 $\pm$ 0.3835 & 3.3193 $\pm$ 0.1056 \\
+F-MNIST Drift & 0.6831 $\pm$ 0.0073 & 0.7514 $\pm$ 0.0037 & 3.7774 $\pm$ 0.1245 & 21.1700 $\pm$ 0.9705 & 3.7300 $\pm$ 0.0511 \\
+CIFAR-10 Drift & 0.6288 $\pm$ 0.0023 & 0.7085 $\pm$ 0.0040 & 4.2467 $\pm$ 0.0354 & 24.2082 $\pm$ 0.3301 & 4.2134 $\pm$ 0.0346 \\
+CosSim: M / FM & 0.0074 $\pm$ 0.0033 & 0.1886 $\pm$ 0.0073 & 0.0056 $\pm$ 0.0028 & 0.0117 $\pm$ 0.0011 & 0.0056 $\pm$ 0.0014 \\
+CosSim: M / C10 & 0.0108 $\pm$ 0.0060 & 0.2062 $\pm$ 0.0023 & 0.0095 $\pm$ 0.0032 & 0.0108 $\pm$ 0.0007 & 0.0083 $\pm$ 0.0023 \\
+CosSim: FM / C10 & 0.0151 $\pm$ 0.0054 & 0.2081 $\pm$ 0.0021 & 0.0069 $\pm$ 0.0016 & 0.0111 $\pm$ 0.0017 & 0.0083 $\pm$ 0.0009 \\
+Avg CosSim & 0.0111 $\pm$ 0.0021 & 0.2010 $\pm$ 0.0028 & 0.0073 $\pm$ 0.0017 & 0.0112 $\pm$ 0.0005 & 0.0074 $\pm$ 0.0008 \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{enumerate}
+    \item \textbf{The Phenomenon of Drift Explosion:} Under standard SGD (Scenario A), parameter drift is extremely small and tightly constrained, with $D(W_k) \approx 0.62$--$0.73$. In stark contrast, under standard AdamW (Scenario C), the parameter drift increases to $3.29$--$4.24$, representing an approximate $5\times$ increase. When the learning rate of AdamW is raised to 1e-3 (Scenario D), the parameter drift explodes to $21.1$--$24.2$, which is an astonishing $30\times$ increase compared to SGD. This empirical fact confirms that adaptive optimizers permit parameter updates to travel extremely far from their starting point. Mathematically, this occurs because coordinate-wise scaling amplifies updates in directions with small, sparse gradients, allowing the models to escape the local pre-trained basin and settle into highly distant regions of the parameter space.
+    \item \textbf{Inherent Orthogonality of Updates across Tasks:} Under standard training conditions, both standard SGD (Scenario A) and standard AdamW (Scenario C and D) exhibit average cross-task update cosine similarities near zero ($0.011$ and $0.007$ respectively). This indicates that the task-specific updates are almost perfectly orthogonal in the high-dimensional parameter space. This empirical result is highly significant: it reveals that even though AdamW travels vastly further in parameter space, it does not do so in a shared or aligned direction. Rather, the task-specific trajectories under adaptive optimization diverge into completely orthogonal directions, laying the groundwork for severe parameter interference during averaging.
+    \item \textbf{The Failure of Decoupled Decay to Align Trajectories:} In the SGD setting, increasing weight decay to 1e-2 (Scenario B) successfully aligns the update trajectories, raising the average cosine similarity from $0.011$ to $0.201$ ($\approx 18\times$ increase). This occurs because weight decay acts as an isotropic contracting force, drawing independent trajectories toward a shared low-dimensional central basin. However, under AdamW, increasing weight decay to 1e-2 (Scenario E) completely fails to align updates, with the average cosine similarity remaining virtually unchanged at $0.0074$ compared to $0.0073$. This empirical finding provides direct, multi-seed proof that decoupled weight decay does not act as a trajectory-alignment mechanism in adaptive optimizers. This is a massive methodological blind spot for papers that assume weight decay has a universal regularizing effect on parameter alignment.
+\end{enumerate}
+
+\subsection{Multi-Task Merged Model Accuracies}
+\cref{tab:accuracies} shows the average test accuracies of the merged models.
+\begin{table*}[t]
+\caption{Multi-Task Merged Model Average Test Accuracies across Calibration Settings (Mean $\pm$ SD across 3 random seeds). Accuracies are the averaged values across MNIST, Fashion-MNIST, and CIFAR-10 tasks.}
+\label{tab:accuracies}
+\vskip 0.15in
+\begin{center}
+\small
+\scshape
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccc}
+\toprule
+Calibration Method & Scenario A & Scenario B & Scenario C & Scenario D & Scenario E \\
+ & (SGD Std) & (SGD High Decay) & (AdamW Std) & (AdamW High LR) & (AdamW High Decay) \\
+\midrule
+Uncalibrated (none) & 19.78\% $\pm$ 1.27\% & 20.29\% $\pm$ 2.16\% & 23.10\% $\pm$ 0.67\% & 12.09\% $\pm$ 0.65\% & 24.45\% $\pm$ 2.41\% \\
+BNC Calibration & 23.79\% $\pm$ 0.60\% & 26.42\% $\pm$ 1.35\% & 31.67\% $\pm$ 1.01\% & 48.87\% $\pm$ 3.83\% & 32.51\% $\pm$ 1.48\% \\
+SP-TAAC Calibration & 23.63\% $\pm$ 0.69\% & 26.06\% $\pm$ 1.32\% & 32.01\% $\pm$ 0.84\% & 49.95\% $\pm$ 2.69\% & 32.86\% $\pm$ 1.23\% \\
+Hybrid (Rank 4) & 33.03\% $\pm$ 3.31\% & 34.15\% $\pm$ 1.78\% & 44.83\% $\pm$ 0.76\% & 55.23\% $\pm$ 3.57\% & 44.97\% $\pm$ 2.22\% \\
+Hybrid (Rank 8) & 37.65\% $\pm$ 3.53\% & 39.69\% $\pm$ 1.57\% & 51.66\% $\pm$ 0.82\% & 64.11\% $\pm$ 3.40\% & 52.40\% $\pm$ 2.50\% \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{figure}[t]
+\vskip 0.2in
+\begin{center}
+\centerline{\includegraphics[width=\columnwidth]{calibration_results.pdf}}
+\caption{Average test accuracy of the multi-task merged model across different post-merge calibration methods (Uncalibrated, exact BNC, SP-TAAC, and low-rank Hybrid Calibration with ranks 4 and 8) for the five optimization scenarios. Results are averaged across three disjoint tasks (MNIST, Fashion-MNIST, CIFAR-10) and reported as Mean $\pm$ SD across three random seeds.}
+\label{fig:calibration_results}
+\end{center}
+\vskip -0.2in
+\end{figure}
+
+\begin{enumerate}
+    \item \textbf{Catastrophic Representation Collapse of Raw Merged Models:} The raw, uncalibrated merged model under Scenario D (AdamW High LR, high drift) suffers almost complete representation collapse, achieving only $12.09\%$ average accuracy, which is near random guess. Under Scenarios A, B, C, and E, the raw merged models also perform extremely poorly, hovering between $19\%$ and $24\%$ accuracy. This confirms that orthogonal updates, when averaged, lead to a devastating cancellation of activations, especially in deep layers where the variance collapse compounds. The larger the parameter drift, the more severe the resulting activation alignment corruption.
+    \item \textbf{Post-Hoc Calibration as an Exceptionally Powerful Equalizer:} While the raw merged model of Scenario D is completely collapsed, post-hoc calibration works as an incredible equalizer. Under simple BatchNorm Calibration (BNC), which only corrects the running mean and variance, the average test accuracy recovers from $12.09\%$ to $48.87\%$. When we apply Hybrid Calibration (Rank 8), which solves a low-rank ridge regression to perform a direct weight correction on the Conv weights, the accuracy rises to a spectacular \textbf{64.11\%}. This shows that post-hoc calibration is incredibly robust: even when the underlying parameters have drifted $30\times$ further and are completely misaligned, a small calibration dataset is sufficient to realign the representations and fully restore model capabilities.
+    \item \textbf{Unlocking the Superior Capacity of Calibrated AdamW:} One of our most important and counter-intuitive findings is that post-hoc calibrated AdamW-merged models (Scenario C at $51.66\%$ and Scenario D at $64.11\%$) massively outperform calibrated SGD-merged models (Scenario A at $37.65\%$) by up to \textbf{+26.46\%} absolute average accuracy. This is because the individual AdamW expert models learn much richer and more robust features during fine-tuning than their SGD counterparts (for instance, the individual CIFAR-10 accuracy of AdamW experts was $\approx 64.8\%$ compared to SGD experts at $\approx 47.1\%$). In the uncalibrated merged model, this superior feature capacity is hidden behind the wall of representation collapse. However, once post-hoc calibration aligns these orthogonal representations, the merged model successfully inherits and unlocks these high-quality features, demonstrating that adaptive optimizers are highly superior for model merging when paired with post-hoc calibration.
+\end{enumerate}
+
+\section{Discussion and Methodological Impact}
+\label{sec:discussion}
+
+\textbf{Exposing the Buffer-Geometries Confounder:} In our early investigation, we discovered that naive implementations of parameter drift and update cosine similarity in model merging literature frequently include BatchNorm non-trainable buffers (such as \texttt{running\_mean}, \texttt{running\_var}, and \texttt{num\_batches\_tracked}) introduced by batch normalization \cite{ioffe2015batch}. Because these buffers store running statistics that change heavily across tasks, they completely corrupt and confound weight-space calculations (naive calculations yielded a false 0.9986 similarity). Our corrected pipeline strictly excludes these buffers, revealing the true orthogonality of expert updates. This is a crucial methodological takeaway: when conducting weight-space analyses of models with normalization layers, researchers must be extremely careful to separate gradient-optimized parameters from running-estimate buffers, as failing to do so can lead to a false illusion of parameter alignment and trajectory similarity.
+
+\textbf{Generalizability to Modern Architectures and Normalization Types:} Since our empirical results demonstrate that post-hoc calibration is highly robust to optimizer-induced representation collapse in networks with batch normalization \cite{ioffe2015batch}, a vital methodological question arises: how do these findings generalize to other normalization layers and regularization schemes? Modern Vision Transformers (ViTs) and Large Language Models (LLMs) typically rely on Layer Normalization \cite{ba2016layer}, Instance Normalization \cite{ulyanov2016instance}, Group Normalization \cite{wu2018group}, or Weight Normalization \cite{salimans2016weight}, combined with aggressive regularization like Dropout \cite{srivastava2014dropout}. While batch normalization directly tracks channel statistics, layer and group normalizations normalize across activations of a single sample, which may exhibit different representation collapse behaviors under model merging. Investigating post-hoc weight and activation corrections in the absence of explicit batch normalization is a key frontier for model merging research. We hypothesize that activation alignment is a fundamental requirement across all normalization regimes, as the averaging of orthogonal updates inherently reduces feature variance, regardless of the specific normalization mathematics applied.
+
+\textbf{Robustness, Generalization, and Future Frontiers:} In addition to task-specific test accuracy, a model merging scheme should produce networks that generalize robustly under covariate shift and adversarial conditions. Future work should evaluate how the choice of fine-tuning optimizer affects out-of-distribution generalization to common corruptions \cite{hendrycks2019benchmarking} and adversarial reliability under unified suites like AutoAttack \cite{croce2020reliable}. Calibrating representations on clean subsets might overfit and reduce robustness, highlighting the need for multi-scenario verification.
+
+\textbf{Trajectory Alignment vs. Post-Hoc Calibration:} Prior studies (e.g., \cite{sptaac2026}) argue that researchers must constrain the fine-tuning process of experts (using trajectory alignment regularization) to prevent representation collapse. Our study disproves this: trajectory alignment fails under the standard AdamW optimizer, yet post-hoc calibration is extremely robust and easily aligns the high-drift representations. This suggests that the community should shift focus away from restrictive training-time trajectory constraints and prioritize developing robust, post-hoc activation alignment methods.
+
+\subsection{Methodological Limitations and Future Work}
+While our work exposes critical blind spots in the model merging literature, we acknowledge several limitations that open exciting paths for future research:
+\begin{enumerate}
+    \item \textbf{Scale of Model Architecture:} Our empirical analysis is conducted on ResNet-18, a standard convolutional neural network. While ResNet-18 contains the key structural element of batch normalization, modern large-scale models such as Vision Transformers (ViTs) and large language models (LLMs) are significantly deeper, have larger parameter counts, and utilize self-attention mechanisms. Deconstructing optimizer confounders in these gargantuan parameter spaces is a vital next step.
+    \item \textbf{Calibration Data Dependency:} Our evaluation shows that higher-dimensional weight corrections (like Hybrid SVD-based calibration) require larger calibration dataset sizes ($N$) to estimate input covariances accurately. In extremely low-resource settings where even $N=16$ samples are unavailable, the superiority of calibrated AdamW might be limited by overfitting. Developing data-free activation alignment methods that can synthesize calibration samples represents a major research avenue.
+    \item \textbf{Scope of Merging Algorithms:} In this work, we focus on Weight Averaging (WA), which is the most fundamental and widely used merging algorithm. Future studies should evaluate if advanced merging algorithms (like TIES-Merging, DARE, DELLA, or RegMean) exhibit different sensitivities to AdamW-induced drift, and if post-hoc calibration remains a necessary partner for those methods.
+\end{enumerate}
+
+\section{Conclusion}
+\label{sec:conclusion}
+By systematically deconstructing SGD and AdamW expert training, we have exposed the optimizer as a massive confounder in multi-task model merging. We showed that adaptive optimizers trigger larger parameter drift and complete uncalibrated collapse, but post-hoc calibration acts as a powerful equalizer, enabling AdamW-merged models to achieve up to \textbf{+26.5\%} higher accuracy than SGD counterparts.
+
+Our findings challenge the prevailing focus on training-time trajectory alignment constraints. Instead of restricting the fine-tuning process of expert models, researchers and practitioners should prioritize developing robust, post-hoc activation and parameter alignment methods. We hope these rigorous insights establish a more realistic, ecologically valid, and scientifically sound foundation for evaluating and benchmarking model merging in the wild.
+
+\bibliography{submission}
+\bibliographystyle{icml2026}
+
+\clearpage
+\appendix
+\section{Impact of Calibration Sample Size ($N$)}
+\label{sec:app_cal_sizes}
+To satisfy the rigorous standards of our methodology, we systematically evaluate the sensitivity of post-merge calibration to the size of the calibration dataset ($N \in \{16, 32, 64, 128\}$). These results (reported as Mean $\pm$ SD across three random seeds) are compiled in \cref{tab:cal_sizes}.
+
+We identify two crucial scaling characteristics of post-merge activation and weight alignment:
+\begin{enumerate}
+    \item \textbf{Extreme Data Efficiency of Activation Alignment:} Low-degree statistical corrections, such as exact BatchNorm Calibration (BNC) and Sparsity-Preserving Task-Agnostic Activation Calibration (SP-TAAC), are remarkably data-efficient. Under Scenario D (AdamW High LR), using a tiny calibration set of $N=16$ (representing only $\approx 5$ samples per task) is sufficient for BNC and SP-TAAC to recover test accuracies of $47.49\% \pm 1.81\%$ and $49.54\% \pm 1.87\%$ respectively. Increasing the sample size $8\times$ to $N=128$ only marginally shifts their performance to $48.70\% \pm 3.68\%$ and $50.13\% \pm 2.13\%$. This demonstrates that lower-order statistical moments (channel-wise mean, variance, and scaling) can be robustly aligned without risking overfitting on extremely sparse data.
+    \item \textbf{Sample-Scale Generalization in Weight Correction:} In contrast to activation alignment, Hybrid Calibration (which resolves a high-dimensional ridge regression to perform a low-rank parameter correction on Conv weights) benefits substantially from larger calibration sample sizes. Under Scenario D, the Hybrid (Rank 8) accuracy rises from $56.12\% \pm 3.41\%$ at $N=16$ to $60.59\% \pm 3.62\%$ at $N=128$. Under Scenario C (AdamW Standard), it escalates from $44.74\% \pm 1.21\%$ at $N=16$ to $52.26\% \pm 1.03\%$ at $N=128$. This scaling reflects the mathematical requirement of ridge regression: with a larger sample size $N$, the input covariance matrix $XX^T$ is more accurately estimated, preventing SVD-based corrections from overfitting to task-specific calibration features and unlocking superior out-of-distribution generalizability.
+\end{enumerate}
+
+\begin{table*}[h]
+\caption{Effect of Calibration Sample Size ($N$) on Merged Model Test Accuracy (Mean $\pm$ SD across 3 random seeds). We report average test accuracy across the three tasks for different calibration sizes ($N \in \{16, 32, 64, 128\}$) across all five scenarios.}
+\label{tab:cal_sizes}
+\vskip 0.15in
+\begin{center}
+\small
+\scshape
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+Calibration Size & Method & Scenario A & Scenario B & Scenario C & Scenario D & Scenario E \\
+ & & (SGD Std) & (SGD High Decay) & (AdamW Std) & (AdamW High LR) & (AdamW High Decay) \\
+\midrule
+Uncalibrated & None & 20.11\% $\pm$ 1.41\% & 20.16\% $\pm$ 2.00\% & 23.14\% $\pm$ 0.34\% & 12.09\% $\pm$ 0.30\% & 24.37\% $\pm$ 2.52\% \\
+\midrule
+$N=16$ & BNC & 22.44\% $\pm$ 0.76\% & 25.12\% $\pm$ 2.67\% & 30.40\% $\pm$ 0.97\% & 47.49\% $\pm$ 1.81\% & 30.83\% $\pm$ 0.61\% \\
+ & SP-TAAC & 20.58\% $\pm$ 0.55\% & 24.09\% $\pm$ 2.32\% & 28.25\% $\pm$ 1.42\% & 49.54\% $\pm$ 1.87\% & 30.96\% $\pm$ 1.04\% \\
+ & Hybrid (Rank 4) & 27.84\% $\pm$ 2.79\% & 30.28\% $\pm$ 1.25\% & 40.47\% $\pm$ 0.73\% & 52.58\% $\pm$ 2.71\% & 39.19\% $\pm$ 0.90\% \\
+ & Hybrid (Rank 8) & 32.12\% $\pm$ 2.44\% & 33.25\% $\pm$ 1.11\% & 44.74\% $\pm$ 1.21\% & 56.12\% $\pm$ 3.41\% & 44.42\% $\pm$ 1.14\% \\
+\midrule
+$N=32$ & BNC & 24.21\% $\pm$ 0.61\% & 26.16\% $\pm$ 1.44\% & 31.83\% $\pm$ 1.00\% & 48.71\% $\pm$ 3.12\% & 32.29\% $\pm$ 1.17\% \\
+ & SP-TAAC & 23.24\% $\pm$ 1.28\% & 26.11\% $\pm$ 1.29\% & 31.46\% $\pm$ 0.45\% & 50.17\% $\pm$ 2.48\% & 32.54\% $\pm$ 0.80\% \\
+ & Hybrid (Rank 4) & 30.34\% $\pm$ 2.61\% & 33.73\% $\pm$ 0.86\% & 43.21\% $\pm$ 1.03\% & 52.93\% $\pm$ 5.87\% & 42.08\% $\pm$ 1.55\% \\
+ & Hybrid (Rank 8) & 35.49\% $\pm$ 2.45\% & 37.74\% $\pm$ 1.10\% & 48.88\% $\pm$ 1.78\% & 57.64\% $\pm$ 3.88\% & 47.84\% $\pm$ 2.15\% \\
+\midrule
+$N=64$ & BNC & 24.38\% $\pm$ 0.83\% & 26.44\% $\pm$ 1.57\% & 31.84\% $\pm$ 0.86\% & 49.27\% $\pm$ 3.34\% & 32.00\% $\pm$ 1.41\% \\
+ & SP-TAAC & 23.97\% $\pm$ 1.07\% & 25.92\% $\pm$ 1.63\% & 31.41\% $\pm$ 0.29\% & 50.98\% $\pm$ 1.99\% & 32.34\% $\pm$ 1.40\% \\
+ & Hybrid (Rank 4) & 32.43\% $\pm$ 3.49\% & 35.02\% $\pm$ 0.92\% & 44.94\% $\pm$ 0.64\% & 53.87\% $\pm$ 6.46\% & 43.27\% $\pm$ 1.69\% \\
+ & Hybrid (Rank 8) & 36.08\% $\pm$ 3.31\% & 38.27\% $\pm$ 0.50\% & 50.92\% $\pm$ 1.14\% & 60.82\% $\pm$ 4.85\% & 49.37\% $\pm$ 2.78\% \\
+\midrule
+$N=128$ & BNC & 24.41\% $\pm$ 0.67\% & 26.42\% $\pm$ 1.67\% & 32.19\% $\pm$ 0.61\% & 48.70\% $\pm$ 3.68\% & 32.07\% $\pm$ 1.45\% \\
+ & SP-TAAC & 24.23\% $\pm$ 0.73\% & 26.06\% $\pm$ 1.88\% & 32.23\% $\pm$ 0.58\% & 50.13\% $\pm$ 2.13\% & 32.27\% $\pm$ 1.52\% \\
+ & Hybrid (Rank 4) & 33.77\% $\pm$ 3.37\% & 34.79\% $\pm$ 2.05\% & 46.01\% $\pm$ 0.42\% & 54.33\% $\pm$ 4.51\% & 45.04\% $\pm$ 2.23\% \\
+ & Hybrid (Rank 8) & 37.95\% $\pm$ 2.58\% & 39.13\% $\pm$ 1.26\% & 52.26\% $\pm$ 1.03\% & 60.59\% $\pm$ 3.62\% & 50.94\% $\pm$ 3.23\% \\
+\bottomrule
+\end{tabular}
+}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\end{document}

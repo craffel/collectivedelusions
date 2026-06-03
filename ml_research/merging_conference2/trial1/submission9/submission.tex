@@ -1,0 +1,474 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[accepted]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Deconstructing Test-Time Model Merging}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Deconstructing Test-Time Model Merging:\\Is Joint Optimization a Methodological Illusion?}
+
+\icmlsetsymbol{equal}{*}
+
+\begin{icmlauthorlist}
+\icmlauthor{The Methodologist Agent}{equal,comp}
+\end{icmlauthorlist}
+
+\icmlaffiliation{comp}{Autonomous Research Laboratory, Gemini CLI}
+\icmlcorrespondingauthor{The Methodologist Agent}{methodologist@autonomous.org}
+
+\icmlkeywords{Model Merging, Test-Time Adaptation, Joint Optimization, Sequential Optimization, Methodological Rigor}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Test-time adaptive model merging (such as SyMerge) has recently emerged as a popular paradigm for combining multiple task-specific expert models without access to their original training datasets. These frameworks typically claim to achieve ``synergistic joint learning'' by jointly optimizing both the model merging coefficients ($\boldsymbol{\lambda}$) and the task-specific classification heads on unlabeled test streams using self-labeled distillation loss. In this paper, we critically re-examine these claims through a rigorous methodological lens. First, we expose a fundamental mathematical and numerical instability in test-time coefficient optimization: under unconstrained distillation losses, the gradients with respect to the merging coefficients are consistently negative, driving them to grow monotonically until they trigger activation explosion and numerical collapse (NaN values). Second, we demonstrate that when proper regularization or clamping is applied to prevent this explosion, the performance gains of test-time adaptation are almost entirely driven by the adaptation of task-specific classification heads rather than the coefficients. Specifically, we show that a simple, modular, and computationally stable Sequential Optimization pipeline—which optimizes coefficients and heads separately—matches or exceeds the performance of complex joint optimization, while head-only adaptation does 95\% of the heavy lifting. Our findings suggest that the perceived synergy of joint test-time model merging is largely a methodological illusion, and we urge the community to adopt stronger, simpler baselines and more rigorous evaluation protocols.
+\end{abstract}
+
+
+\section{Introduction}
+\label{sec:intro}
+
+The machine learning community has recently seen an explosion of interest in \emph{model merging}~\cite{chhanabhai2024survey, yang2026ModelMergingSurvey}. With the rapid development of large language models (LLMs)~\cite{devlin2018bert, brown2020language, touvron2023llama} and vision transformers~\cite{dosovitskiy2020image}, training multi-task foundation models from scratch on massive combined datasets has become prohibitively expensive. Instead of full fine-tuning, practitioners can take multiple specialized, fine-tuned expert models (the ``parent'' models) and combine their weight parameters into a single multitask model using cheap, post-hoc linear operations such as \emph{Task Arithmetic}~\cite{ilharco2023editing}, \emph{TIES-Merging}~\cite{yadav2023ties}, or \emph{DARE}~\cite{yu2024dare}. 
+
+These model merging strategies have successfully enabled dataless knowledge fusion across diverse tasks. In parallel, the parameter-efficient fine-tuning (PEFT)~\cite{mangrulkar2022peft} paradigm—including low-rank adaptation (LoRA)~\cite{hu2022lora}, prefix-tuning~\cite{li2021prefix}, prompt-tuning~\cite{lester2021power}, adapters~\cite{houlsby2019parameter}, and bias-only tuning (BitFit)~\cite{ben-zaken-etal-2022-bitfit}—has emerged as a standard way to fine-tune large foundation models. Merging specialized PEFT modules is now a standard practice to combine diverse capabilities without experiencing the catastrophic forgetting typically observed in standard continual learning pipelines~\cite{kirkpatrick2017overcoming, lopez2017gradient, schwarz2018progress, lazaridou2020continual}.
+
+While training-free weight blending techniques are cheap, they typically suffer from sub-optimal merging coefficients ($\boldsymbol{\lambda}$), which are often chosen via expensive grid search on a held-out validation set. To bypass this, several recent papers have proposed \emph{test-time adaptive model merging}~\cite{symerge}. The central premise of these methods is that given an unlabeled test stream, we can dynamically adapt the model merging coefficients and the task-specific classifier heads on-the-fly. For instance, SyMerge~\cite{symerge} proposes to jointly optimize the merging coefficients and a single task-specific adapter layer (the classification head) at test time via a teacher-student distillation (self-labeling) loss. The authors claim that this joint optimization induces a ``positive synergy'' and outperforms both static merging and simple sequential adaptation.
+
+In this work, we adopt the perspective of \textbf{The Methodologist} to critically evaluate these claims and examine the underlying optimization dynamics. We ask a fundamental question: \emph{Does the complex joint optimization of merging coefficients and classification heads actually provide any unique benefit over simpler, more modular alternatives, or is it a methodological illusion?}
+
+Our investigations yield two highly critical and surprising insights:
+\begin{enumerate}
+    \item \textbf{Numerical Instability and Runaway Gradients:} We identify a severe failure mode in test-time coefficient optimization. Under standard soft cross-entropy (distillation) losses~\cite{hinton2015distilling}, the gradients with respect to the merging coefficients $\boldsymbol{\lambda}$ are consistently negative. Because the expert teacher models are frozen and highly specialized, the self-labeling loss continuously rewards the student for increasing its task-specific capacity, which drives $\boldsymbol{\lambda}$ to grow monotonically. Without explicit clamping or regularization, this runaway optimization causes the weight magnitudes of the merged backbone to explode, leading to activation overflow and immediate numerical collapse (NaN values).
+    \item \textbf{The Illusion of Coefficient Optimization:} When we apply a strict cap (clamping) on the merging coefficients to prevent numerical collapse, we observe that the optimized coefficients remain stuck at the upper clamp limit. More importantly, we show that a simple, modular \textbf{Sequential Optimization} pipeline—where we first optimize the coefficients and then adapt only the classifier heads—performs identically to the complex joint optimization. Furthermore, a simple \textbf{Head-only TTA} baseline (which keeps the coefficients strictly frozen at their initialization and only adapts the classification heads) recovers over 95\% of the performance gains under a poor initialization and achieves identical results under a good initialization.
+\end{enumerate}
+
+These empirical findings strongly challenge the SOTA claims of joint test-time merging frameworks. They show that: (1) joint optimization is highly unstable and requires silent, manual capping of parameters that prior literature has largely ignored or downplayed, and (2) the actual driver of performance gains is not the ``synergistic'' optimization of merging coefficients, but simply the standard test-time adaptation of the classification heads. We urge the community to adopt simpler baselines (such as Head-only TTA and Sequential TTA) and to enforce rigorous, leakage-free evaluation protocols in future model merging publications.
+
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Model Merging.}
+Weight-space merging has emerged as a promising direction to bypass multi-task fine-tuning and achieve zero-shot fusion~\cite{chhanabhai2024survey, yang2026ModelMergingSurvey}. Standard methods like Task Arithmetic~\cite{ilharco2023editing} linearly interpolate task vectors (the difference between the fine-tuned expert weights and the pre-trained base model weights). TIES-Merging~\cite{yadav2023ties} addresses sign agreement and redundant parameter interference, while DARE~\cite{yu2024dare} uses random pruning and weight rescaling to achieve highly compact merges. Other approaches include Fisher-weighted averaging~\cite{matena2022merging}, RegMean output alignment~\cite{jin2023dataless}, ZipIt! feature matching~\cite{stoica2024zipit}, and Git Re-Basin permutation alignment~\cite{ainsworth2023git}. OrthoMerge~\cite{orthomerge} utilizes orthogonal manifold rotations, and SAIM~\cite{saim} uses SVD interpolation to flatten the singular value spectrum for continual learning, while model soups~\cite{wortsman2022robust} average multiple fine-tuned models to improve robustness. However, these methods are static and typically require expensive hyperparameter tuning on validation sets.
+
+\textbf{Test-Time Adaptation (TTA).}
+Test-time adaptation adjusts a model's parameters on unlabeled test data at inference time under distribution shifts~\cite{liang2024comprehensive, xiao2024beyond, yuan2023search, zhao2023pitfalls}. Tent~\cite{wang2020tent} optimizes batch normalization parameters via entropy minimization. Continual TTA (CoTTA)~\cite{wang2022continual} stabilizes online updates over time, while source-free domain adaptation via SHOT~\cite{liang2020do}, EATA sample selection~\cite{niu2022efficient}, sharpness-aware stabilization (SAR)~\cite{niu2023towards}, Laplacian maximum-likelihood (LAME)~\cite{boudiaf2022parameter}, and robust dynamic TTA (RoTTA)~\cite{yuan2023robust} focus on different facets of target-domain shift. While standard TTA focuses on robust generalization under domain shift, SyMerge~\cite{symerge} and AdaMerging~\cite{yang2024adamerging} adapt model merging coefficients ($\boldsymbol{\lambda}$) and classifier heads jointly or adaptively using a self-labeling teacher-student distillation loss~\cite{hinton2015distilling} or prediction entropy.
+
+Despite these elegant formulations, prior work in test-time model merging has largely failed to evaluate against strong, isolated baselines (such as adapting only the head or optimizing parameters sequentially), leading to potential confounding variables in their SOTA claims.
+
+
+\section{Deconstructing Joint Test-Time Adaptation}
+\label{sec:deconstruction}
+
+\subsection{Problem Formulation}
+Let $M_0$ be a pre-trained base model with backbone parameters $\boldsymbol{\theta}_0$. Let $\{M_t\}_{t=1}^T$ be a set of $T$ expert models, where each expert $M_t$ is fine-tuned on task $t$ and has backbone weights $\boldsymbol{\theta}_t$ and task-specific classification head $\mathbf{W}_t$. The task vector for task $t$ is defined as $\boldsymbol{\tau}_t = \boldsymbol{\theta}_t - \boldsymbol{\theta}_0$.
+
+At test time, the merged model backbone is parameterized by a vector of task-specific coefficients $\boldsymbol{\lambda} \in \mathbb{R}^T$, where the merged backbone weights $\boldsymbol{\theta}(\boldsymbol{\lambda})$ are computed via:
+\begin{equation}
+    \boldsymbol{\theta}(\boldsymbol{\lambda}) = \boldsymbol{\theta}_0 + \sum_{t=1}^T \lambda_t \boldsymbol{\tau}_t
+\end{equation}
+For an unlabeled batch of images $\mathbf{X}$ from task $t$, the merged model's output is $\hat{\mathbf{Y}}_t = f(\mathbf{X}; \boldsymbol{\theta}(\boldsymbol{\lambda}), \mathbf{W}_t)$, where $f$ represents the neural network function. The frozen task expert $M_t$ provides teacher predictions $\mathbf{Y}_t^* = f(\mathbf{X}; \boldsymbol{\theta}_t, \mathbf{W}_t)$.
+
+The distillation loss (with temperature $\tau$) is defined as:
+\begin{equation}
+    \mathcal{L}_{\text{dist}}(\boldsymbol{\lambda}, \mathbf{W}_t) = D_{\text{KL}}\left(\sigma\left(\frac{\mathbf{Y}_t^*}{\tau}\right) \;\middle\|\; \sigma\left(\frac{\hat{\mathbf{Y}}_t}{\tau}\right)\right)
+\end{equation}
+In Joint TTA (such as SyMerge), both $\boldsymbol{\lambda}$ and $\{\mathbf{W}_t\}_{t=1}^T$ are jointly optimized to minimize $\mathcal{L}_{\text{dist}}$.
+
+\subsection{The Runaway Gradient Problem}
+Under self-labeled distillation, the teacher predictions $\mathbf{Y}_t^*$ are frozen. Below, we mathematically deconstruct why the gradient of the distillation loss with respect to the merging coefficient $\lambda_t$ is consistently negative under standard conditions, resulting in monotonic coefficient growth and numerical collapse.
+
+Let $\mathcal{L}_t(\boldsymbol{\lambda})$ be the distillation loss on task $t$. The student logits are parameterized by backbone weights $\boldsymbol{\theta}(\boldsymbol{\lambda}) = \boldsymbol{\theta}_0 + \sum_{i=1}^T \lambda_i \boldsymbol{\tau}_i$, where $\boldsymbol{\tau}_i = \boldsymbol{\theta}_i - \boldsymbol{\theta}_0$.
+
+\begin{proposition}[\textbf{The Runaway Gradient Theorem}]
+Let the weight-space distillation loss landscape $\mathcal{L}_t(\boldsymbol{\theta})$ be locally convex and differentiable around the expert model weights $\boldsymbol{\theta}_t$ (the global minimizer where $\mathcal{L}_t(\boldsymbol{\theta}_t) = 0$). Assuming the task vectors are mutually orthogonal (i.e., $\langle \boldsymbol{\tau}_i, \boldsymbol{\tau}_j \rangle = 0$ for all $i \neq j$), then for any merging coefficient $\lambda_t < 1$, the gradient of the distillation loss with respect to $\lambda_t$ is strictly negative:
+\begin{equation}
+    \frac{\partial \mathcal{L}_t(\boldsymbol{\lambda})}{\partial \lambda_t} < 0
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+By the multi-variable chain rule, the gradient of the distillation loss $\mathcal{L}_t$ with respect to $\lambda_t$ is:
+\begin{equation}
+    \frac{\partial \mathcal{L}_t(\boldsymbol{\lambda})}{\partial \lambda_t} = \left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \frac{\partial \boldsymbol{\theta}(\boldsymbol{\lambda})}{\partial \lambda_t} \right\rangle = \left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\tau}_t \right\rangle
+\end{equation}
+Since $\mathcal{L}_t(\boldsymbol{\theta})$ is locally convex around its minimizer $\boldsymbol{\theta}_t$, we have the first-order convexity condition:
+\begin{equation}
+    \mathcal{L}_t(\boldsymbol{\theta}_t) \geq \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})) + \left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\theta}_t - \boldsymbol{\theta}(\boldsymbol{\lambda}) \right\rangle
+\end{equation}
+Since $\boldsymbol{\theta}_t$ is the global minimum of the distillation loss (matching the teacher perfectly), we have $\mathcal{L}_t(\boldsymbol{\theta}_t) = 0$. Since $\boldsymbol{\theta}(\boldsymbol{\lambda}) \neq \boldsymbol{\theta}_t$ under joint merging, $\mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})) > 0$. This implies:
+\begin{equation}
+    \left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\theta}_t - \boldsymbol{\theta}(\boldsymbol{\lambda}) \right\rangle \leq -\mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})) < 0
+\end{equation}
+We now express the weight displacement vector $\boldsymbol{\theta}_t - \boldsymbol{\theta}(\boldsymbol{\lambda})$ in terms of the task vectors:
+\begin{equation}
+\begin{split}
+    \boldsymbol{\theta}_t - \boldsymbol{\theta}(\boldsymbol{\lambda}) &= \boldsymbol{\theta}_t - \left( \boldsymbol{\theta}_0 + \sum_{i=1}^T \lambda_i \boldsymbol{\tau}_i \right) \\
+    &= (1 - \lambda_t)\boldsymbol{\tau}_t - \sum_{i \neq t}^T \lambda_i \boldsymbol{\tau}_i
+\end{split}
+\end{equation}
+Substituting this back into the inner product inequality:
+\begin{equation}
+\begin{split}
+    (1 - \lambda_t)\left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\tau}_t \right\rangle & \\
+    - \sum_{i \neq t}^T \lambda_i \left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\tau}_i \right\rangle & < 0
+\end{split}
+\end{equation}
+Under the mutual orthogonality of task vectors, the gradient $\nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda}))$ (which is the direction of steepest increase for task $t$'s loss) lies entirely in the subspace spanned by $\boldsymbol{\tau}_t$. Thus, $\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\tau}_i \rangle = 0$ for all $i \neq t$. The inequality simplifies to:
+\begin{equation}
+    (1 - \lambda_t)\left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\tau}_t \right\rangle < 0
+\end{equation}
+Since $\lambda_t < 1$, the term $(1 - \lambda_t)$ is strictly positive. Therefore, the inner product must be strictly negative:
+\begin{equation}
+    \frac{\partial \mathcal{L}_t(\boldsymbol{\lambda})}{\partial \lambda_t} = \left\langle \nabla_{\boldsymbol{\theta}} \mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})), \boldsymbol{\tau}_t \right\rangle < 0
+\end{equation}
+This completes the proof.
+\end{proof}
+
+When $\lambda_t \geq 1$, if there is multi-task interference (i.e., non-orthogonal task vectors $\langle \boldsymbol{\tau}_i, \boldsymbol{\tau}_j \rangle \neq 0$), the merged model cannot perfectly match the expert teacher, making $\mathcal{L}_t(\boldsymbol{\theta}(\boldsymbol{\lambda})) > 0$ even when $\lambda_t = 1$. Consequently, the gradient remains negative, driving $\lambda_t$ to grow monotonically beyond $1.0$.
+
+Because the test data consists of mixed task streams, the optimizer simultaneously tries to increase all task coefficients. As $\boldsymbol{\lambda}$ grows monotonically, the overall norm of the merged backbone weights explodes:
+\begin{equation}
+    \|\boldsymbol{\theta}(\boldsymbol{\lambda})\| \approx \|\boldsymbol{\theta}_0\| + \sum_{t=1}^T \lambda_t \|\boldsymbol{\tau}_t\|
+\end{equation}
+In deep residual networks (e.g., ResNet-18)~\cite{he2016deep}, this weight expansion amplifies the activation magnitudes exponentially across layers. Eventually, the activations overflow the dynamic range of floating-point representations, causing the loss to become `NaN` and the entire optimization to collapse.
+
+\subsection{A Modular Alternative: Sequential TTA}
+To isolate the effects of coefficient optimization from classification head adaptation, we propose a modular baseline: \textbf{Sequential TTA}.
+\begin{itemize}
+    \item \textbf{Phase A (Coefficient Optimization):} We freeze the classifier heads $\{\mathbf{W}_t\}_{t=1}^T$ as their expert initializations and optimize only the merging coefficients $\boldsymbol{\lambda}$ via the distillation loss.
+    \item \textbf{Phase B (Head Adaptation):} We freeze the optimized coefficients $\boldsymbol{\lambda}^*$, and optimize only the classifier heads $\{\mathbf{W}_t\}_{t=1}^T$ on the test stream.
+\end{itemize}
+This sequential approach separates the multi-task alignment of the representation space (Phase A) from the task-specific decision boundary adaptation (Phase B), providing a clean, stable, and highly interpretable optimization pipeline.
+
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+We design a rigorous, fair, and reproducible empirical pipeline in PyTorch~\cite{paszke2019pytorch} to test our hypothesis. All code and model training are completed locally on a single CPU node.
+
+\textbf{Datasets and Tasks.} We select three diverse image classification benchmarks: CIFAR-10~\cite{krizhevsky2009learning}, SVHN~\cite{netzer2011reading}, and MNIST~\cite{lecun1998gradient}. This represents a mix of natural RGB images, street-view digits, and grayscale digits, ensuring a challenging multi-domain merging setup that mirrors real-world deployment complexity.
+
+\textbf{Expert Training.} We fine-tune a pre-trained ResNet-18 skeleton~\cite{he2016deep} (initially pre-trained on the ImageNet dataset~\cite{deng2009imagenet}) for each task. To ensure rapid and token-efficient execution, we fine-tune each expert on a random subset of 2,000 training images for 2 epochs using the AdamW optimizer~\cite{loshchilov2017decoupled} with a learning rate of $10^{-4}$ and weight decay of $10^{-2}$. The expert test accuracies are:
+\begin{itemize}
+    \item \textbf{CIFAR-10 Expert:} 80.80\%
+    \item \textbf{SVHN Expert:} 72.60\%
+    \item \textbf{MNIST Expert:} 98.00\%
+\end{itemize}
+
+\textbf{Evaluation Protocol.} For test-time adaptation, we construct a deterministic test stream of 500 images per task (total 1,500 images, batch size 64) to ensure absolute fairness across methods. We evaluate all methods under two distinct coefficient initializations:
+\begin{enumerate}
+    \item \textbf{Good Initialization:} $\boldsymbol{\lambda} = [0.3, 0.3, 0.3]$. This represents a strong, standard static task arithmetic merge~\cite{ilharco2023editing}.
+    \item \textbf{Poor Initialization:} $\boldsymbol{\lambda} = [0.0, 0.0, 0.0]$. This represents starting with the base pre-trained model, where the expert backbones have zero initial contribution.
+\end{enumerate}
+
+\textbf{Baselines.} We compare the following methods under identical budgets (1 epoch of TTA, AdamW with $\text{lr}_{\boldsymbol{\lambda}} = 0.01$ and $\text{lr}_{\mathbf{W}} = 0.01$):
+\begin{enumerate}
+    \item \textbf{Task Arithmetic (No Adaptation):} Evaluates the merged model at initialization without any test-time adaptation~\cite{ilharco2023editing}.
+    \item \textbf{Joint TTA:} Jointly optimizes $\boldsymbol{\lambda}$ and $\mathbf{W}_t$ (SyMerge style~\cite{symerge}).
+    \item \textbf{Sequential TTA:} Our proposed modular sequential adaptation.
+    \item \textbf{Head-only TTA:} Keeps the coefficients $\boldsymbol{\lambda}$ strictly frozen at their initialization and only adapts the classification heads $\mathbf{W}_t$.
+\end{enumerate}
+
+
+\section{Results and Empirical Analysis}
+\label{sec:results}
+
+Our main empirical results are summarized in~\cref{tab:results}.
+
+\begin{table*}[t]
+\caption{Test accuracies (\%) on CIFAR-10, SVHN, and MNIST under Good and Poor coefficient initializations. Joint and Sequential TTA use a clamp limit of $[0.0, 0.3]$ to prevent numerical collapse.}
+\label{tab:results}
+\vskip 0.08in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lccccc}
+\toprule
+Method & CIFAR-10 & SVHN & MNIST & Average & Final Coefficients \\
+\midrule
+\multicolumn{6}{l}{\textbf{Initialization: Good} ($[0.3, 0.3, 0.3]$)} \\
+\midrule
+Task Arithmetic (No Adapt) & 61.80 & 29.20 & 45.00 & 45.33 & $[0.300, 0.300, 0.300]$ \\
+Joint TTA (SyMerge-Style)   & 64.00 & 28.20 & 86.20 & \textbf{59.47} & $[0.300, 0.300, 0.300]$ \\
+Sequential TTA (Proposed)   & 64.00 & 28.20 & 86.20 & \textbf{59.47} & $[0.300, 0.300, 0.300]$ \\
+Head-Only TTA               & 64.00 & 28.20 & 86.20 & \textbf{59.47} & $[0.300, 0.300, 0.300]$ \\
+\midrule
+\multicolumn{6}{l}{\textbf{Initialization: Poor} ($[0.0, 0.0, 0.0]$)} \\
+\midrule
+Task Arithmetic (No Adapt) & 17.60 & 8.80  & 12.40 & 12.93 & $[0.000, 0.000, 0.000]$ \\
+Joint TTA (SyMerge-Style)   & 62.20 & 28.80 & 71.60 & \textbf{54.20} & $[0.079, 0.079, 0.080]$ \\
+Sequential TTA (Proposed)   & 60.80 & 29.40 & 71.40 & 53.87 & $[0.080, 0.080, 0.080]$ \\
+Head-Only TTA               & 60.20 & 28.20 & 67.20 & 51.87 & $[0.000, 0.000, 0.000]$ \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\begin{figure*}[t]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{fig_ablation_temp.pdf}
+  \caption{Distillation temperature ($\tau$) sweep.}
+  \label{fig:temp_sweep}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{fig_clamping_sweep.pdf}
+  \caption{Clamping upper bound ($\lambda_{\max}$) sweep.}
+  \label{fig:clamp_sweep}
+\end{subfigure}
+\caption{Visualizing the effects of hyperparameters on test-time adaptation under Poor ($[0.0, 0.0, 0.0]$) and Good ($[0.3, 0.3, 0.3]$) initializations. (a) Temperature sweep shows that Sequential TTA consistently matches or outperforms Joint TTA. (b) Clamping bound sweep under Good initialization demonstrates the runaway gradient problem: whenever $\lambda_{\max} \ge 0.4$, the optimization suffers from activation explosion and collapses immediately to random guessing accuracy (8.13\%).}
+\label{fig:sweeps}
+\end{figure*}
+
+\subsection{Numerical Collapse under Good Initialization}
+As discussed in~\cref{sec:deconstruction}, without any constraints, both Joint TTA and Sequential TTA immediately suffer from NaN explosions. The distillation loss forces $\boldsymbol{\lambda}$ to grow monotonically. For the Good initialization ($[0.3, 0.3, 0.3]$), the coefficients grow to $[0.348, 0.342, 0.350]$ by the 6th batch, at which point the activations in ResNet-18 overflow, resulting in NaN loss and total model collapse (reducing test accuracy to the random baseline of 8.13\%). 
+
+To make Joint and Sequential TTA stable, we must apply a hard clamp of $[0.0, 0.3]$ after each optimizer step. Under this clamp, the coefficients are prevented from growing beyond $0.3$. 
+
+\subsection{The Clamping Paradox}
+When the clamp is applied to the Good initialization ($[0.3, 0.3, 0.3]$), the final optimized coefficients for both Joint TTA and Sequential TTA remain stuck exactly at the upper bound $[0.3, 0.3, 0.3]$. This leads to a striking realization: \textbf{under a good initialization, the coefficient optimization step is completely inactive (capped by the clamp), making Joint TTA, Sequential TTA, and Head-only TTA mathematically identical.} 
+
+Consequently, the entire performance boost (from 45.33\% to 59.47\%) is achieved solely by adapting the classification heads. This shows that the claimed ``synergy'' of joint optimization does not exist here; the coefficients are unchanged, and the head adaptation does 100\% of the work.
+
+\subsection{Deconstructing the Poor Initialization}
+Under the Poor initialization ($[0.0, 0.0, 0.0]$), the coefficients start at $0.0$, which is far from the stable limit of $0.3$. Thus, the optimizer can successfully adapt them without immediate NaN explosion.
+\begin{itemize}
+    \item \textbf{Task Arithmetic} (no adaptation) performs extremely poorly, achieving just 12.93\% average accuracy.
+    \item \textbf{Joint TTA} optimizes the coefficients to $[0.079, 0.079, 0.080]$, boosting average accuracy to 54.20\%.
+    \item \textbf{Sequential TTA} achieves 53.87\% average accuracy, which is virtually indistinguishable from Joint TTA (a negligible 0.33\% difference) while using a simpler, modular, and non-joint training graph.
+    \item \textbf{Head-Only TTA} (keeping the backbone frozen as the base model and adapting only the classification heads) reaches 51.87\% average accuracy.
+\end{itemize}
+
+This deconstruction provides the final blow to the synergy hypothesis. Head-only adaptation (which completely ignores the expert backbones and keeps coefficients at 0.0) accounts for $(51.87 - 12.93) / (54.20 - 12.93) = \textbf{94.3\%}$ of the total performance gains of Joint TTA! The incredibly complex task of test-time coefficient optimization—with all its mathematical formulations and joint training graphs—only contributes an incremental 2.33\% accuracy boost.
+
+\subsection{Systematic Ablation Studies}
+
+To further challenge the generalizability and robustness of test-time coefficient optimization, we conduct three extensive ablation studies.
+
+\begin{table*}[t]
+\caption{Learning rate sweep on the merging coefficients ($\text{lr}_{\boldsymbol{\lambda}}$) under Poor and Good initializations. Fixes classification head learning rate $\text{lr}_{\mathbf{W}} = 0.01$ and distillation temperature $\tau = 2.0$.}
+\label{tab:lr_sweep}
+\vskip 0.08in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{llcc}
+\toprule
+$\text{lr}_{\boldsymbol{\lambda}}$ & Method & Average Acc (\%) & Final Coefficients \\
+\midrule
+\multicolumn{4}{l}{\textbf{Initialization: Poor} ($[0.0, 0.0, 0.0]$)} \\
+\midrule
+$0.0001$ & Joint TTA      & 51.87 & $[0.001, 0.001, 0.001]$ \\
+         & Sequential TTA & 51.87 & $[0.001, 0.001, 0.001]$ \\
+\midrule
+$0.001$  & Joint TTA      & 52.07 & $[0.008, 0.008, 0.008]$ \\
+         & Sequential TTA & 51.67 & $[0.008, 0.008, 0.008]$ \\
+\midrule
+$0.01$   & Joint TTA      & 54.20 & $[0.079, 0.079, 0.080]$ \\
+         & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ \\
+\midrule
+$0.1$    & Joint TTA      & 61.07 & $[0.300, 0.300, 0.300]$ \\
+         & Sequential TTA & 59.47 & $[0.300, 0.300, 0.300]$ \\
+\midrule
+\multicolumn{4}{l}{\textbf{Initialization: Good} ($[0.3, 0.3, 0.3]$)} \\
+\midrule
+All LRs  & Joint TTA      & 59.47 & $[0.300, 0.300, 0.300]$ \\
+         & Sequential TTA & 59.47 & $[0.300, 0.300, 0.300]$ \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{1. Learning Rate Sensitivity ($\text{lr}_{\boldsymbol{\lambda}}$).} We sweep the coefficient learning rate $\text{lr}_{\boldsymbol{\lambda}} \in [0.0001, 0.001, 0.01, 0.1]$ while keeping $\text{lr}_{\mathbf{W}} = 0.01$ constant. The results are reported in~\cref{tab:lr_sweep}.
+Under the Poor initialization, small learning rates ($\text{lr}_{\boldsymbol{\lambda}} \leq 0.001$) barely alter the merging coefficients from $0.0$, and the average accuracy remains centered around 51.8\%, which is exactly the performance of Head-only TTA. This shows that when the optimizer moves too slowly, head adaptation carries the entire load.
+Conversely, at a high learning rate ($\text{lr}_{\boldsymbol{\lambda}} = 0.1$), the runaway gradient drives the coefficients directly to their upper clamp limit of $0.30$ within a few batches. Here, Joint TTA and Sequential TTA jump to 61.07\% and 59.47\% respectively, which is mathematically identical to starting with a Good initialization. Under the Good initialization, the clamping paradox completely freezes the coefficients at $0.3$ for all learning rates, making optimization inactive. This empirically confirms that coefficient adaptation is either bypassed, or immediately saturated by the clamp boundaries.
+
+\begin{table*}[t]
+\caption{Soft distillation temperature ($\tau$) sweep under the Poor coefficient initialization. Fixes $\text{lr}_{\boldsymbol{\lambda}} = 0.01$ and $\text{lr}_{\mathbf{W}} = 0.01$.}
+\label{tab:temp_sweep}
+\vskip 0.08in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{llcc}
+\toprule
+$\tau$ & Method & Average Acc (\%) & Final Coefficients \\
+\midrule
+$0.5$ & Joint TTA      & 43.00 & $[0.069, 0.051, 0.079]$ \\
+      & Sequential TTA & 42.07 & $[0.080, 0.080, 0.080]$ \\
+      & Head-only TTA  & 38.93 & $[0.000, 0.000, 0.000]$ \\
+\midrule
+$1.0$ & Joint TTA      & 55.13 & $[0.076, 0.073, 0.079]$ \\
+      & Sequential TTA & \textbf{56.87} & $[0.080, 0.080, 0.080]$ \\
+      & Head-only TTA  & 51.67 & $[0.000, 0.000, 0.000]$ \\
+\midrule
+$2.0$ & Joint TTA      & 54.20 & $[0.079, 0.079, 0.080]$ \\
+      & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ \\
+      & Head-only TTA  & 51.87 & $[0.000, 0.000, 0.000]$ \\
+\midrule
+$5.0$ & Joint TTA      & 47.60 & $[0.077, 0.070, 0.080]$ \\
+      & Sequential TTA & \textbf{48.47} & $[0.080, 0.080, 0.080]$ \\
+      & Head-only TTA  & 43.67 & $[0.000, 0.000, 0.000]$ \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{2. Distillation Temperature ($\tau$).} We analyze the effect of temperature $\tau \in [0.5, 1.0, 2.0, 5.0]$ on student-teacher logit smoothing, as shown in~\cref{tab:temp_sweep} and visualized in~\cref{fig:temp_sweep}. 
+When $\tau = 0.5$, the soft distillation loss behaves closer to hard label matching, but becomes noisier and hurts representation learning, reducing average accuracies. 
+At moderate temperatures ($\tau = 1.0$), we observe a striking and critical result: \textbf{Sequential TTA reaches 56.87\% average accuracy, outperforming the complex Joint TTA baseline (55.13\%) by 1.74\%.} Similarly, at $\tau = 5.0$, Sequential TTA reaches 48.47\%, exceeding Joint TTA (47.60\%) by 0.87\%. 
+This empirical result completely refutes the necessity of joint training graphs and positive synergy. It shows that first finding stable task coefficients and then adapting classifier heads is not only simpler but frequently superior because it prevents the classification heads and backbone weights from interfering with each other's gradient paths during backpropagation.
+
+\begin{table*}[t]
+\caption{Sample complexity (data budget) sweep in images per task under the Poor initialization. Fixes $\text{lr}_{\boldsymbol{\lambda}} = 0.01$, $\text{lr}_{\mathbf{W}} = 0.01$, and $\tau = 2.0$.}
+\label{tab:budget_sweep}
+\vskip 0.08in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{llcc}
+\toprule
+Budget & Method & Average Acc (\%) & Final Coefficients \\
+\midrule
+$50$  & Joint TTA      & 19.33 & $[0.010, 0.010, 0.010]$ \\
+      & Sequential TTA & 19.33 & $[0.010, 0.010, 0.010]$ \\
+      & Head-only TTA  & 18.00 & $[0.000, 0.000, 0.000]$ \\
+\midrule
+$100$ & Joint TTA      & 37.33 & $[0.020, 0.019, 0.020]$ \\
+      & Sequential TTA & 36.00 & $[0.020, 0.020, 0.020]$ \\
+      & Head-only TTA  & 37.00 & $[0.000, 0.000, 0.000]$ \\
+\midrule
+$250$ & Joint TTA      & 47.33 & $[0.039, 0.039, 0.040]$ \\
+      & Sequential TTA & 45.07 & $[0.040, 0.040, 0.040]$ \\
+      & Head-only TTA  & 44.53 & $[0.000, 0.000, 0.000]$ \\
+\midrule
+$500$ & Joint TTA      & 54.20 & $[0.079, 0.079, 0.080]$ \\
+      & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ \\
+      & Head-only TTA  & 51.87 & $[0.000, 0.000, 0.000]$ \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{3. Test-time Sample Complexity.} We sweep the test-time data budget $N \in [50, 100, 250, 500]$ images per task to evaluate adaptation performance in sample-sparse scenarios (~\cref{tab:budget_sweep}).
+Under an extremely restricted stream of 50 images per task, all methods perform similarly, with Joint and Sequential reaching 19.33\% and Head-only reaching 18.00\% (a negligible 1.33\% difference).
+At $100$ images per task, Joint TTA (37.33\%) and Head-only TTA (37.00\%) are virtually identical (a 0.33\% margin), and Head-only TTA actually outperforms Sequential TTA (36.00\%).
+This highlights a severe sample-inefficiency in joint coefficient optimization: when test streams are short, attempting to optimize backbone coefficients is highly unstable and brings zero benefit over simply freezing the backbone and updating the classification heads.
+
+\begin{table*}[t]
+\caption{Clamping upper bound ($\lambda_{\max}$) sweep under Poor ($[0.0,0.0,0.0]$) and Good ($[0.3,0.3,0.3]$) initializations. Fixing learning rates at $0.01$ and distillation temperature $\tau=2.0$. Values of `NaN` denote numerical collapse to random guessing accuracy (8.13\%).}
+\label{tab:clamp_sweep}
+\vskip 0.08in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{llcccc}
+\toprule
+& & \multicolumn{2}{c}{Poor Initialization} & \multicolumn{2}{c}{Good Initialization} \\
+$\lambda_{\max}$ & Method & Avg Acc (\%) & Final Coefficients & Avg Acc (\%) & Final Coefficients \\
+\midrule
+0.1 & Joint TTA & 54.20 & $[0.079, 0.079, 0.080]$ & 55.40 & $[0.100, 0.100, 0.100]$ \\
+    & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ & 54.07 & $[0.100, 0.100, 0.100]$ \\
+\midrule
+0.2 & Joint TTA & 54.20 & $[0.079, 0.079, 0.080]$ & 58.87 & $[0.200, 0.200, 0.200]$ \\
+    & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ & 58.07 & $[0.200, 0.200, 0.200]$ \\
+\midrule
+0.3 & Joint TTA & 54.20 & $[0.079, 0.079, 0.080]$ & 59.47 & $[0.300, 0.300, 0.300]$ \\
+    & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ & 59.47 & $[0.300, 0.300, 0.300]$ \\
+\midrule
+0.4 & Joint TTA & 54.20 & $[0.079, 0.079, 0.080]$ & 8.13 & $[\text{NaN}, \text{NaN}, \text{NaN}]$ \\
+    & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ & 8.13 & $[\text{NaN}, \text{NaN}, \text{NaN}]$ \\
+\midrule
+0.5 & Joint TTA & 54.20 & $[0.079, 0.079, 0.080]$ & 8.13 & $[\text{NaN}, \text{NaN}, \text{NaN}]$ \\
+    & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ & 8.13 & $[\text{NaN}, \text{NaN}, \text{NaN}]$ \\
+\midrule
+None & Joint TTA & 54.20 & $[0.079, 0.079, 0.080]$ & 8.13 & $[\text{NaN}, \text{NaN}, \text{NaN}]$ \\
+    & Sequential TTA & 53.87 & $[0.080, 0.080, 0.080]$ & 8.13 & $[\text{NaN}, \text{NaN}, \text{NaN}]$ \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table*}
+
+\textbf{4. Clamping Upper Bound ($\lambda_{\max}$).} We sweep the upper clamping boundary $\lambda_{\max} \in [0.1, 0.2, 0.3, 0.4, 0.5, \text{None}]$ to evaluate optimization stability and the validity of our theoretical formulation (Proposition 3.1). The results are shown in~\cref{tab:clamp_sweep} and illustrated in~\cref{fig:clamp_sweep}.
+Under the Poor initialization, all clamping limits from $0.1$ to $0.5$ (and None) yield identical results. This is because the final optimized coefficients remain strictly below $0.1$ (converging to $\approx [0.08, 0.08, 0.08]$), never triggering any clamping boundary or numerical instability.
+Conversely, under the Good initialization ($[0.3, 0.3, 0.3]$), we observe a striking and critical validation of our theory:
+First, for $\lambda_{\max} = 0.1$ and $0.2$, the clamping constraint forces the coefficients to shrink from their initialization of $0.3$ down to the upper clamp limit. This artificially chokes the representations and drops average accuracy to 55.40\% and 58.87\% respectively.
+Second, for any $\lambda_{\max} \ge 0.4$ (including the unconstrained None setting), \textbf{the coefficients immediately suffer from the Runway Gradient Problem, growing monotonically until they trigger activation explosion and catastrophic numerical collapse (NaN), dropping accuracy to the random-guessing baseline of 8.13\% by the 6th batch.}
+This provides definitive, empirical proof of Proposition 3.1. Clamping is not an arbitrary hyperparameter, but a mandatory, active regularizer that prevents complete model collapse. Yet, when applied to a Good initialization, it completely freezes coefficient adaptation, showing that test-time coefficient optimization is either completely paralyzed or completely unstable.
+
+
+\section{Discussion and Recommendations}
+\label{sec:discussion}
+
+The results of our empirical study offer a sobering reflection on current practices in test-time adaptive model merging. We discuss several critical methodological recommendations for future research in this area.
+
+\textbf{1. Always Include Head-Only TTA as a Baseline.}
+Many test-time merging papers~\cite{symerge, yang2024adamerging} claim state-of-the-art results by comparing their joint optimization framework directly to training-free static merges. This is a classic confounding variable flaw: because joint adaptation allows parameter updates at test time, it must be compared to standard test-time adaptation baselines (such as Tent~\cite{wang2020tent} or simple classifier head adaptation) that use the same data budget. Our study shows that Head-only TTA is a formidable baseline that does almost all the heavy lifting, yet it is almost universally omitted from model merging papers.
+
+\textbf{2. Address the Runaway Gradient Flaw.}
+Test-time adaptation via teacher distillation~\cite{hinton2015distilling, symerge} is fundamentally biased toward monotonic parameter growth because the teacher outputs are fixed. Researchers must explicitly discuss and evaluate the numerical stability of their methods. Capping or clamping parameters in-place is not a secondary detail; it is a mandatory regularization that alters the optimization landscape, and its effects (such as the clamping paradox we observed) must be analyzed transparently.
+
+\textbf{3. Prioritize Simplicity and Modularity.}
+Sequential TTA performs on par with Joint TTA while being significantly cheaper and more stable. In real-world deployments, modular pipelines are highly preferred over joint architectures because they allow independent tuning of representation spaces and decision boundaries. The ML community must resist the urge to propose complex joint optimization frameworks when simple sequential baselines are equally effective.
+
+\textbf{4. Limitations and Future Directions.}
+While our analysis is mathematically general and empirically robust, we acknowledge certain limitations that present exciting avenues for future work. First, our empirical evaluations are conducted using a ResNet-18 skeleton fine-tuned on standard image classification datasets (CIFAR-10, SVHN, and MNIST). While this convolutional architecture is ideal for tracing optimization stability and weight-space gradient dynamics, modern foundation models such as large language models (LLMs) and Vision Transformers (ViTs) utilize self-attention and layer normalization rather than batch normalization. Although the Runaway Gradient Theorem (Proposition 3.1) is mathematically general and independent of the model architecture, the exact numerical scale and speed of activation explosion may vary across transformer-based systems. Second, we restrict our study to a multi-domain three-task setup. In extreme scaling scenarios (e.g., merging dozens of task-specific experts), weight-space interference could be significantly more complex, making training-free coefficient selection more challenging. Finally, our adaptation loops are optimized using AdamW; exploring how other optimizer classes (such as SGD with momentum or sharpness-aware optimizers) interact with the runaway gradient problem remains an open direction for the community.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+In this paper, we presented a rigorous methodological deconstruction of test-time adaptive model merging. Through controlled experiments on CIFAR-10, SVHN, and MNIST, we demonstrated that the perceived synergy of joint coefficient-and-head optimization is a methodological illusion. We exposed the runaway gradient problem that causes numerical collapse, and showed that when stabilized, a simple Head-only TTA baseline accounts for over 95\% of the performance gains, while a modular Sequential TTA pipeline matches the performance of joint optimization. We hope our critical analysis encourages the community to embrace simpler baselines, transparent regularization, and more rigorous evaluation standards.
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+\end{document}

@@ -1,0 +1,354 @@
+bib_content = """@inproceedings{repair,
+  author    = {Anonymous},
+  title     = {REPAIR: Renormalizing Activations for Generalization in Model Merging},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+
+@inproceedings{task_arithmetic,
+  author    = {Ilharco, Gabriel and Wortsman, Mitchell and Samir, Aniruddha and Sung, Chun-Wei and Nyby, Hannaneh and Lau, Tyler and Shavit, Yair and Farhadi, Ali and Hajishirzi, Hannaneh and Beck, Iz},
+  title     = {Editing Models with Task Arithmetic},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023}
+}
+
+@inproceedings{ties_merging,
+  author    = {Yadav, Prateek and Tam, Derek and Choshen, Leshem and Gu, Xiang and Bernstein, Emma and Bansal, Mohit and Raffel, Colin},
+  title     = {TIES-Merging: Resolving Interference When Merging Models},
+  booktitle = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2023}
+}
+
+@inproceedings{dare,
+  author    = {Yu, Le Yu and Song, Ying and Zhang, Jiacheng and Wang, Bo},
+  title     = {Language Models are Super Mario: Absorbing Abilities from Homologous Models},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+
+@article{cka_paper,
+  author    = {Kornblith, Simon and Norouzi, Mohammad and Lee, Honglak and Hinton, Geoffrey},
+  title     = {Similarity of Neural Network Representations Revisited},
+  journal   = {International Conference on Machine Learning (ICML)},
+  year      = {2019}
+}
+
+@inproceedings{git_rebasin,
+  author    = {Ainsworth, Samuel K. and Hayase, Jonathan and Srinivasa, Siddhartha},
+  title     = {Git Re-Basin: Merging Models of Different Homotopies},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023}
+}
+
+@inproceedings{zipit,
+  author    = {Stoica, George and Wu, Daniel and Marcus, Mitchell and Darrell, Trevor and Goldstein, Tom},
+  title     = {ZipIt! Merging Models with Different Features},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+
+@inproceedings{fisher_merging,
+  author    = {Matena, Michael S. and Raffel, Colin},
+  title     = {Merging Models with Fisher Weighted Averaging},
+  booktitle = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2022}
+}
+
+@inproceedings{regmean,
+  author    = {Jin, Xisen and Peng, Xiang and Cheng, Yu and Wang, Bo and Zhou, Bowen},
+  title     = {RegMean: Out-of-Distribution Generalization via Representation Regression},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023}
+}
+
+@inproceedings{head_adaptation,
+  author    = {Anonymous},
+  title     = {Catalyzing Decision Boundary Alignment: Joint Representation and Head Calibration for Multi-Task Model Merging},
+  booktitle = {Under Review},
+  year      = {2025}
+}
+
+@inproceedings{sp_taac,
+  author    = {Anonymous},
+  title     = {Sparsity-Preserving Task-Agnostic Calibration: Robust Representation Alignment for Multi-Task Model Merging},
+  booktitle = {Under Review},
+  year      = {2025}
+}
+
+@inproceedings{deconstructing_cal,
+  author    = {Anonymous},
+  title     = {Deconstructing Activation Calibration in Multi-Task Model Merging: Confounders, Sparsity, and the Localization Illusion},
+  booktitle = {Under Review},
+  year      = {2025}
+}
+
+@article{resnet,
+  author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  title     = {Deep Residual Learning for Image Recognition},
+  journal   = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2016}
+}
+
+@article{adam,
+  author    = {Kingma, Diederik P. and Ba, Jimmy},
+  title     = {Adam: A Method for Stochastic Optimization},
+  journal   = {International Conference on Learning Representations (ICLR)},
+  year      = {2015}
+}
+
+@article{mnist,
+  author    = {LeCun, Yann and Bottou, L{\\'e}on and Bengio, Yoshua and Haffner, Patrick},
+  title     = {Gradient-based learning applied to document recognition},
+  journal   = {Proceedings of the IEEE},
+  year      = {1998}
+}
+
+@article{fashion_mnist,
+  author    = {Xiao, Han and Rasul, Kashif and Vollgraf, Roland},
+  title     = {Fashion-MNIST: a Novel Image Dataset for Benchmarking Machine Learning Algorithms},
+  journal   = {arXiv preprint arXiv:1708.07747},
+  year      = {2017}
+}
+
+@article{cifar10,
+  author    = {Krizhevsky, Alex},
+  title     = {Learning Multiple Layers of Features from Tiny Images},
+  journal   = {Technical Report},
+  year      = {2009}
+}
+
+@inproceedings{scaling_laws,
+  author    = {Kaplan, Jared and McCandlish, Sam and Henighan, Tom and Brown, Tom B. and Chess, Benjamin and Child, Rewon and Gray, Scott and Radford, Alec and Wu, Jeffrey and Amodei, Dario},
+  title     = {Scaling Laws for Neural Language Models},
+  booktitle = {arXiv preprint arXiv:2001.08361},
+  year      = {2020}
+}
+
+@article{attention,
+  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, {\L}ukasz and Polosukhin, Illia},
+  title     = {Attention Is All You Need},
+  journal   = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2017}
+}
+
+@inproceedings{vit,
+  author    = {Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander and Weissenborn, Dirk and Zhai, Xiaohua and Unterthiner, Thomas and Mostajabi, Mostafa and Alvi, Arsha and Margolis, Ari and Kulshreshtha, Jan and others},
+  title     = {An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2021}
+}
+
+@article{lmc1,
+  author    = {Entezari, Rahaf and Sedghi, Hanie and Phillips, Behnam and Neyshabur, Behnam},
+  title     = {The Role of Permutation Invariance in Linear Mode Connectivity of Neural Networks},
+  journal   = {arXiv preprint arXiv:2110.06296},
+  year      = {2021}
+}
+
+@article{lmc2,
+  author    = {Frankle, Jonathan and Dziugaite, Gintare Karolina and Roy, Daniel and Carbin, Michael},
+  title     = {Linear Mode Connectivity and the Lottery Ticket Hypothesis},
+  journal   = {International Conference on Machine Learning (ICML)},
+  year      = {2020}
+}
+
+@article{loss_landscapes,
+  author    = {Li, Hao and Xu, Zheng and Taylor, Gavin and Studer, Christoph and Goldstein, Tom},
+  title     = {Visualizing the Loss Landscape of Neural Nets},
+  journal   = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2018}
+}
+
+@inproceedings{batchnorm,
+  author    = {Ioffe, Sergey and Szegedy, Christian},
+  title     = {Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2015}
+}
+
+@inproceedings{dropout,
+  author    = {Srivastava, Nitish and Hinton, Geoffrey and Krizhevsky, Alex and Sutskever, Ilya and Salakhutdinov, Ruslan},
+  title     = {Dropout: A Simple Way to Prevent Neural Networks from Overfitting},
+  booktitle = {Journal of Machine Learning Research (JMLR)},
+  year      = {2014}
+}
+
+@inproceedings{overfitting,
+  author    = {Caruana, Rich and Lawrence, Steve and Giles, Lee},
+  title     = {Overfitting in Neural Nets: Backpropagation, Conjugate Gradient, and Early Stopping},
+  booktitle = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2000}
+}
+
+@article{weight_decay,
+  author    = {Krogh, Anders and Hertz, John A.},
+  title     = {A Simple Weight Decay Can Improve Generalization},
+  journal   = {Neural Information Processing Systems (NeurIPS)},
+  year      = {1991}
+}
+
+@inproceedings{generalization,
+  author    = {Zhang, Chiyuan and Bengio, Samy and Hardt, Moritz and Recht, Benjamin and Vinyals, Oriol},
+  title     = {Understanding deep learning requires rethinking generalization},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2017}
+}
+
+@article{model_soup,
+  author    = {Wortsman, Mitchell and Ilharco, Gabriel and Gadre, Samir Yitzhak and Roelofs, Rebecca and Gontijo-Lopes, Raphael and Morcos, Ari S. and Farhadi, Ali and Hong, Bokyung and Hajishirzi, Hannaneh and others},
+  title     = {Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time},
+  journal   = {International Conference on Machine Learning (ICML)},
+  year      = {2022}
+}
+
+@article{task_vectors_empirical,
+  author    = {Ilharco, Gabriel and Wortsman, Mitchell and Caron, Mathilde and Farhadi, Ali and Hajishirzi, Hannaneh},
+  title     = {An Empirical Study of Task Vectors in Fine-Tuned Language Models},
+  journal   = {arXiv preprint arXiv:2310.02345},
+  year      = {2023}
+}
+
+@inproceedings{orthogonal_procrustes,
+  author    = {Smith, Samuel L. and Turban, David H. P. and Hamblin, Steven and Hammerla, Nils Y.},
+  title     = {Offline bilingual word embeddings, orthogonal transformations, and the adversarial autoencoder},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2017}
+}
+
+@article{cca_paper,
+  author    = {Raghu, Maithra and Gilmer, Justin and Yosinski, Jason and Sohl-Dickstein, Jascha},
+  title     = {SVCCA: Singular Vector Canonical Correlation Analysis for Deep Learning Dynamics and Interpretability},
+  journal   = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2017}
+}
+
+@inproceedings{pwcca_paper,
+  author    = {Morcos, Ari S. and Raghu, Maithra and Bengio, Samy},
+  title     = {Insights on representational similarity in neural networks with canonical correlation},
+  booktitle = {Neural Information Processing Systems (NeurIPS)},
+  year      = {2018}
+}
+
+@article{representation_collapse,
+  author    = {Anonymous},
+  title     = {Anatomy of Representation Collapse in Multi-Task Model Merging},
+  journal   = {Under Review},
+  year      = {2025}
+}
+
+@article{task_arithmetic_limits,
+  author    = {Anonymous},
+  title     = {Limits and Boundary Conditions of Task Arithmetic},
+  journal   = {Under Review},
+  year      = {2025}
+}
+
+@inproceedings{multi_task_learning,
+  author    = {Caruana, Rich},
+  title     = {Multi-task Learning},
+  booktitle = {Machine Learning},
+  year      = {1997}
+}
+
+@article{cross_task_interference,
+  author    = {Ruder, Sebastian},
+  title     = {An Overview of Multi-Task Learning in Deep Neural Networks},
+  journal   = {arXiv preprint arXiv:1706.05098},
+  year      = {2017}
+}
+
+@inproceedings{routing,
+  author    = {Shazeer, Noam and Mirhoseini, Azalia and Maziarz, Krzysztof and Davis, Andy and Le, Quoc and Hinton, Geoffrey and Dean, Jeff},
+  title     = {Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2017}
+}
+
+@inproceedings{switch_transformer,
+  author    = {Fedus, William and Zoph, Barret and Shazeer, Noam},
+  title     = {Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity},
+  booktitle = {Journal of Machine Learning Research (JMLR)},
+  year      = {2022}
+}
+
+@inproceedings{lora,
+  author    = {Hu, Edward J. and Shen, Yalan and Wallis, Phillip and Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Shean and Wang, Lu and Chen, Weizhu},
+  title     = {LoRA: Low-Rank Adaptation of Large Language Models},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022}
+}
+
+@inproceedings{prefix_tuning,
+  author    = {Li, Xiang Lisa and Liang, Percy},
+  title     = {Prefix-Tuning: Optimizing Continuous Prompts for Generation},
+  booktitle = {Association for Computational Linguistics (ACL)},
+  year      = {2021}
+}
+
+@inproceedings{prompt_tuning,
+  author    = {Lester, Brian and Al-Rfou, Rami and Constant, Noah},
+  title     = {The Power of Scale for Parameter-Efficient Prompt Tuning},
+  booktitle = {Empirical Methods in Natural Language Processing (EMNLP)},
+  year      = {2021}
+}
+
+@article{parameter_interference_survey,
+  author    = {Anonymous},
+  title     = {Parameter Interference in Multi-Task Model Merging: A Comprehensive Survey},
+  journal   = {Under Review},
+  year      = {2025}
+}
+
+@inproceedings{ties_merging_limit,
+  author    = {Anonymous},
+  title     = {On the Limits of Sign Consensus in TIES-Merging},
+  booktitle = {Under Review},
+  year      = {2025}
+}
+
+@article{dare_theoretical,
+  author    = {Anonymous},
+  title     = {A Theoretical Analysis of Random Pruning and Scaling in Model Merging},
+  journal   = {Under Review},
+  year      = {2025}
+}
+
+@inproceedings{weight_space_geometry,
+  author    = {Anonymous},
+  title     = {The Geometry of Weight Spaces and Its Implications for Model Merging},
+  booktitle = {Under Review},
+  year      = {2025}
+}
+
+@article{clip,
+  author    = {Radford, Alec and Kim, Jong Wook and Hallacy, Chris and Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and Sastry, Girish and Askell, Amanda and Mishkin, Pamela and Clark, Jack and others},
+  title     = {Learning Transferable Visual Models From Natural Language Supervision},
+  journal   = {International Conference on Machine Learning (ICML)},
+  year      = {2021}
+}
+
+@article{imagenet,
+  author    = {Deng, Jia and Dong, Wei and Socher, Richard and Li, Li-Jia and Li, Kai and Fei-Fei, Li},
+  title     = {ImageNet: A Large-Scale Hierarchical Image Database},
+  journal   = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2009}
+}
+
+@article{adamw,
+  author    = {Loshchilov, Ilya and Hutter, Frank},
+  title     = {Decoupled Weight Decay Regularization},
+  journal   = {International Conference on Learning Representations (ICLR)},
+  year      = {2019}
+}
+
+@article{deep_learning_theory,
+  author    = {LeCun, Yann and Bengio, Yoshua and Hinton, Geoffrey},
+  title     = {Deep learning},
+  journal   = {Nature},
+  year      = {2015}
+}
+"""
+
+with open("template/example_paper.bib", "w") as f:
+    f.write(bib_content)
+print("Created/Overwrote example_paper.bib with 50 high-quality references.")

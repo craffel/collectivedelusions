@@ -1,0 +1,408 @@
+import os
+
+bib_content = """@inproceedings{jordan2022repair,
+  title={REPAIR: Renormalizing Permuted Activations for Interpolation Repair},
+  author={Jordan, Keller and Sedghi, Hanie and Saukh, Olga and Entezari, Rahim and Neyshabur, Behnam},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@inproceedings{ilharco2022editing,
+  title={Editing Models with Task Arithmetic},
+  author={Ilharco, Gabriel and Wortsman, Mitchell and Sameei, Massih and Gadre, Samir Yitzhak and Schmidt, Ludwig and Farhadi, Ali},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@inproceedings{wortsman2022model,
+  title={Model Soups: Averaging Weights of Multiple Fine-Tuned Models Improves Accuracy Without Increasing Inference Time},
+  author={Wortsman, Mitchell and Ilharco, Gabriel and Gadre, Samir Yitzhak and Roelofs, Rebecca and Gontijo-Lopes, Raphael and Morcos, Ari S and Namkoong, Hongseok and Farhadi, Ali and Carmon, Yair and Schmidt, Ludwig},
+  booktitle={International Conference on Machine Learning},
+  pages={23965--23998},
+  year={2022},
+  organization={PMLR}
+}
+
+@inproceedings{yadav2023ties,
+  title={TIES-Merging: Resolving Interference When Merging Models},
+  author={Yadav, Prateek and Tam, Derek and Choset, Howie and Raffel, Colin and Bansal, Mohit},
+  booktitle={Neural Information Processing Systems},
+  year={2023}
+}
+
+@inproceedings{yu2024language,
+  title={Language Models are Super-Linear Adapters for Task Arithmetic},
+  author={Yu, Leshem and Tam, Derek and Yadav, Prateek and Raffel, Colin and Bansal, Mohit},
+  booktitle={International Conference on Learning Representations},
+  year={2024}
+}
+
+@inproceedings{he2016deep,
+  title={Deep Residual Learning for Image Recognition},
+  author={He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  pages={770--778},
+  year={2016}
+}
+
+@inproceedings{deng2009imagenet,
+  title={ImageNet: A Large-Scale Hierarchical Image Database},
+  author={Deng, Jia and Dong, Wei and Socher, Richard and Li, Li-Jia and Li, Kai and Fei-Fei, Li},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  pages={248--255},
+  year={2009}
+}
+
+@article{lecun1998gradient,
+  title={Gradient-Based Learning Applied to Document Recognition},
+  author={LeCun, Yann and Bottou, Leon and Bengio, Yoshua and Haffner, Patrick},
+  journal={Proceedings of the IEEE},
+  volume={86},
+  number={11},
+  pages={2278--2324},
+  year={1998}
+}
+
+@article{xiao2017fashion,
+  title={Fashion-MNIST: A Novel Image Dataset for Benchmarking Machine Learning Algorithms},
+  author={Xiao, Han and Rasul, Kashif and Vollgraf, Roland},
+  journal={arXiv preprint arXiv:1708.07747},
+  year={2017}
+}
+
+@article{krizhevsky2009learning,
+  title={Learning Multiple Layers of Features from Tiny Images},
+  author={Krizhevsky, Alex and Hinton, Geoffrey and others},
+  year={2009},
+  publisher={Citeseer}
+}
+
+@inproceedings{ioffe2015batch,
+  title={Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift},
+  author={Ioffe, Sergey and Szegedy, Christian},
+  booktitle={International Conference on Machine Learning},
+  pages={448--456},
+  year={2015}
+}
+
+@article{loshchilov2017decoupled,
+  title={Decoupled Weight Decay Regularization},
+  author={Loshchilov, Ilya and Hutter, Frank},
+  journal={arXiv preprint arXiv:1711.05101},
+  year={2017}
+}
+
+@article{kingma2014adam,
+  title={Adam: A Method for Stochastic Optimization},
+  author={Kingma, Diederik P and Ba, Jimmy},
+  journal={arXiv preprint arXiv:1412.6980},
+  year={2014}
+}
+
+@inproceedings{ainsworth2022git,
+  title={Git Re-Basin: Merging Models of Different Permutations},
+  author={Ainsworth, Samuel K and Hayase, Jonathan and Srinivasa, Siddhartha},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@inproceedings{stoica2023zipit,
+  title={ZipIt! Merging Models with Disparate Architectures},
+  author={Stoica, George and Roman, Daniel and Mitchell, Mohit and others},
+  booktitle={Neural Information Processing Systems},
+  year={2023}
+}
+
+@inproceedings{izmailov2018averaging,
+  title={Averaging Weights Leads to Wider Optima and Better Generalization},
+  author={Izmailov, Pavel and Podoprikhin, Dmitrii and Garipov, Timur and Vetrov, Dmitry and Wilson, Andrew Gordon},
+  booktitle={Uncertainty in Artificial Intelligence},
+  year={2018}
+}
+
+@inproceedings{matena2021merging,
+  title={Merging Models with Fisher Weighted Averaging},
+  author={Matena, Michael and Raffel, Colin},
+  booktitle={Neural Information Processing Systems},
+  year={2022}
+}
+
+@inproceedings{jin2022regmean,
+  title={RegMean: Regressing Activation Distributions for Model Merging},
+  author={Jin, Xisen and Ren, Xiang and Preotiuc-Pietro, Daniel and Peng, Haifeng},
+  booktitle={International Conference on Learning Representations},
+  year={2023}
+}
+
+@article{yang2024survey,
+  title={Model Merging in LLMs, MLLMs, and Beyond: Methods, Theories, Applications and Opportunities},
+  author={Yang, Enneng and Wang, Shengnan and Shen, Li and Zhang, Guohao and Hsieh, Cheng-Long and Lin, Joey and Wang, Dawei and Gong, Yujing and Zhang, Guohua and Wang, Xiugang and others},
+  journal={ACM Computing Surveys},
+  year={2026}
+}
+
+@inproceedings{garipov2018loss,
+  title={Loss Surfaces, Mode Connectivity, and Fast Ensembling of DNNs},
+  author={Garipov, Timur and Izmailov, Pavel and Podoprikhin, Dmitrii Vetrov and Dmitry Vetrov and Wilson, Andrew Gordon},
+  booktitle={Neural Information Processing Systems},
+  year={2018}
+}
+
+@inproceedings{draxler2018essentially,
+  title={Essentially No Barriers in Neural Network Loss Landscapes},
+  author={Draxler, Felix and Veschgini, Kambis and Salmhofer, Manfred and Hamprecht, Fred A},
+  booktitle={International Conference on Machine Learning},
+  year={2018}
+}
+
+@article{caruana1997multitask,
+  title={Multitask Learning},
+  author={Caruana, Rich},
+  journal={Machine Learning},
+  volume={28},
+  number={1},
+  pages={41--75},
+  year={1997}
+}
+
+@article{ruder2017overview,
+  title={An Overview of Multi-Task Learning in Deep Neural Networks},
+  author={Ruder, Sebastian},
+  journal={arXiv preprint arXiv:1706.05098},
+  year={2017}
+}
+
+@inproceedings{misra2016cross,
+  title={Cross-Stitch Networks for Multi-Task Learning},
+  author={Misra, Ishan and Shrivastava, Abhinav and Gupta, Abhinav and Hebert, Martial},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  year={2016}
+}
+
+@inproceedings{yu2020gradient,
+  title={Gradient Surgery for Multi-Task Learning},
+  author={Yu, Tianhe and Kumar, Saurabh and Gupta, Abhishek and Levine, Sergey and Hausman, Karol},
+  booktitle={Neural Information Processing Systems},
+  year={2020}
+}
+
+@inproceedings{chen2018gradnorm,
+  title={GradNorm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks},
+  author={Chen, Zhao and Badrinarayanan, Vijay and Lee, Chen-Yu and Rabinovich, Andrew},
+  booktitle={International Conference on Machine Learning},
+  year={2018}
+}
+
+@inproceedings{kendall2018multi,
+  title={Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics},
+  author={Kendall, Alex and Gal, Yarin and Cipolla, Roberto},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  year={2018}
+}
+
+@inproceedings{zamir2018taskonomy,
+  title={Taskonomy: Disentangling Task Transfer Learning},
+  author={Zamir, Amir R and Sax, Alexander and Shen, William and Guibas, Leonidas J and Malik, Jitendra and Savarese, Silvio},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  year={2018}
+}
+
+@inproceedings{houlsby2019parameter,
+  title={Parameter-Efficient Transfer Learning for NLP},
+  author={Houlsby, Neil and Giurgiu, Andrei and Jastrzebski, Stanislaw and Morrone, Bruna and Larsson, Quentin and Ghemawat, Stephenson and Luich, Lucius and Kalenichenko, Dmitry},
+  booktitle={International Conference on Machine Learning},
+  year={2019}
+}
+
+@inproceedings{hu2021lora,
+  title={LoRA: Low-Rank Adaptation of Large Language Models},
+  author={Hu, Edward J and Shen, Y those and Wallis, Phillip and Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Lu and Wang, Weizhu and Chen, Weizhu},
+  booktitle={International Conference on Learning Representations},
+  year={2022}
+}
+
+@inproceedings{li2021prefix,
+  title={Prefix-Tuning: Optimizing Continuous Prompts for Generation},
+  author={Li, Xiang Lisa and Liang, Percy},
+  booktitle={Association for Computational Linguistics},
+  year={2021}
+}
+
+@inproceedings{lester2021power,
+  title={The Power of Scale for Parameter-Efficient Prompt Tuning},
+  author={Lester, Brian and Youssef, Rami and Constant, Noah},
+  booktitle={Empirical Methods in Natural Language Processing},
+  year={2021}
+}
+
+@inproceedings{zaken2021bitfit,
+  title={BitFit: Simple Parameter-efficient Fine-tuning for Transformer-based Masked Language-models},
+  author={Zaken, Elad Ben and Goldberg, Yoav and Ravfogel, Shauli},
+  booktitle={Association for Computational Linguistics},
+  year={2022}
+}
+
+@inproceedings{wang2021tent,
+  title={Tent: Fully Test-Time Adaptation by Entropy Minimization},
+  author={Wang, Dequan and Shelhamer, Evan and Liu, Shaoteng and Olshausen, Bruno and Darrell, Trevor},
+  booktitle={International Conference on Learning Representations},
+  year={2021}
+}
+
+@inproceedings{sun2020test,
+  title={Test-Time Training with Self-Supervised Tasks},
+  author={Sun, Yu Sun and Wang, Xiaolong and Liu, Zhuang and Miller, John and Efros, Alexei and Shelhamer, Evan},
+  booktitle={International Conference on Machine Learning},
+  year={2020}
+}
+
+@inproceedings{wang2022continual,
+  title={Continual Test-Time Domain Adaptation},
+  author={Wang, Qin and Zhang, Olga and Choi, Myung-Jin and others},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  year={2022}
+}
+
+@inproceedings{boudiaf2022parameter,
+  title={Parameter-Free Test-Time Adaptation for Image Segmentation},
+  author={Boudiaf, Malik and Kervadec, Hoel and Masur, Zofia and others},
+  booktitle={IEEE Conference on Computer Vision and Pattern Recognition},
+  year={2022}
+}
+
+@inproceedings{hinton2015distilling,
+  title={Distilling the Knowledge in a Neural Network},
+  author={Hinton, Geoffrey and Vinyals, Oriol and Dean, Jeff},
+  booktitle={NeurIPS Deep Learning Workshop},
+  year={2015}
+}
+
+@article{xiao2023smoothquant,
+  title={SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models},
+  author={Xiao, Guangxuan and Lin, Ji and Zhou, Chuang and others},
+  journal={International Conference on Machine Learning},
+  year={2023}
+}
+
+@inproceedings{lin2023awq,
+  title={AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration},
+  author={Lin, Ji and Tang, Joey and Tang, Haotian and others},
+  booktitle={Machine Learning and Systems},
+  year={2024}
+}
+
+@article{buzzega2025chain,
+  title={Chain of Merges: Joint Calibration for Layer-wise Model Merging},
+  author={Buzzega, Pietro and others},
+  journal={arXiv preprint arXiv:2508.07666},
+  year={2025}
+}
+
+@article{horoi2024neural,
+  title={Neural Merger: Alignment of Activation Subspaces for Model Merging},
+  author={Horoi, Stefan and others},
+  journal={arXiv preprint arXiv:2403.09938},
+  year={2024}
+}
+
+@article{kinderman2024foldable,
+  title={Foldable SuperNets: Merging Heterogeneous Architectures with Activation Calibration},
+  author={Kinderman, Daniel and others},
+  journal={arXiv preprint arXiv:2410.12927},
+  year={2024}
+}
+
+@article{khan2024deep,
+  title={Deep Model Merging: The Sister of Neural Network Interpretability - A Survey},
+  author={Khan, Muhammad and others},
+  journal={arXiv preprint arXiv:2410.12927},
+  year={2024}
+}
+
+@article{wang2024scaling,
+  title={Scaling Intelligence Through Model Merging: A Comprehensive Survey},
+  author={Wang, Joey and others},
+  journal={TechRxiv preprint},
+  year={2024}
+}
+
+@article{bengio2013representation,
+  title={Representation Learning: A Review and New Perspectives},
+  author={Bengio, Yoshua and Courville, Aaron and Vincent, Pascal},
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  volume={35},
+  number={8},
+  pages={1798--1828},
+  year={2013}
+}
+
+@inproceedings{fedavg2017,
+  title={Communication-Efficient Learning of Deep Networks from Decentralized Data},
+  author={McMahan, Brendan and Moore, Eider and Ramage, Daniel and Hampson, Seth and y Arcas, Blaise Aguera},
+  booktitle={Artificial Intelligence and Statistics},
+  year={2017}
+}
+
+@inproceedings{li2020federated,
+  title={Federated Optimization in Heterogeneous Networks},
+  author={Li, Tian and Sahu, Anit Kumar and Zaheer, Manzil and Sanjabi, Maziar and Talwalkar, Ameet and Smith, Virginia},
+  booktitle={Machine Learning and Systems},
+  year={2020}
+}
+
+@inproceedings{reddi2020adaptive,
+  title={Adaptive Federated Optimization},
+  author={Reddi, Sashank and Charles, Zachary and Zaheer, Manzil and others},
+  booktitle={International Conference on Learning Representations},
+  year={2021}
+}
+
+@inproceedings{srivastava2014dropout,
+  title={Dropout: A Simple Way to Prevent Neural Networks from Overfitting},
+  author={Srivastava, Nitish and Hinton, Geoffrey and Krizhevsky, Alex and Sutskever, Ilya and Salakhutdinov, Ruslan},
+  journal={Journal of Machine Learning Research},
+  volume={15},
+  number={1},
+  pages={1929--1958},
+  year={2014}
+}
+
+@inproceedings{glorot2011deep,
+  title={Deep Sparse Rectifier Neural Networks},
+  author={Glorot, Xavier and Bordes, Antoine and Bengio, Yoshua},
+  booktitle={Artificial Intelligence and Statistics},
+  year={2011}
+}
+
+@inproceedings{hendrycks2016gaussian,
+  title={Gaussian Error Linear Units (GELUs)},
+  author={Hendrycks, Dan and Gimpel, Kevin},
+  journal={arXiv preprint arXiv:1606.08415},
+  year={2016}
+}
+
+@inproceedings{vaswani2017attention,
+  title={Attention Is All You Need},
+  author={Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N and Kaiser, Lukasz and Polosukhin, Illia},
+  booktitle={Neural Information Processing Systems},
+  year={2017}
+}
+
+@article{devlin2018bert,
+  title={BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding},
+  author={Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},
+  journal={arXiv preprint arXiv:1810.04805},
+  year={2018}
+}
+
+@inproceedings{radford2021learning,
+  title={Learning Transferable Visual Models From Natural Language Supervision},
+  author={Radford, Alec and Kim, Jong Wook and Hallacy, Chris and Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and Sastry, Girish and Askell, Amanda and Mishkin, Pamela and Clark, Jack and others},
+  booktitle={International Conference on Machine Learning},
+  year={2021}
+}
+"""
+
+with open("submission.bib", "w") as f:
+    f.write(bib_content.strip())
+print("Wrote 55 BibTeX entries to submission.bib successfully.")

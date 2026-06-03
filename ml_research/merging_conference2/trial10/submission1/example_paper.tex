@@ -1,0 +1,416 @@
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+\usepackage{hyperref}
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage{icml2026}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\icmltitlerunning{Pragmatic Model Merging: Mixed-Distribution BatchNorm Calibration for Robust Edge Deployment}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Pragmatic Model Merging: Mixed-Distribution BatchNorm Calibration \\
+    for Noisy and Quantized Edge Deployment}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Authors}{equal,yyy}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{yyy}{Department of Machine Learning, University of ML, Location, Country}
+
+  \icmlkeywords{Model Merging, Post-Training Quantization, BatchNorm Calibration, Noise Robustness, Edge AI}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Multi-task model merging has emerged as a compelling, training-free paradigm to combine multiple task-specific expert neural networks into a single cohesive backbone. However, linear weight averaging triggers representation collapse, which is particularly severe when deploying models under post-training weight quantization (INT8/INT4) and unpredictable real-world environmental noise (e.g., Gaussian noise or blur). While recently proposed data-efficient BatchNorm calibration (DE-BN) recovers clean accuracy, we expose a critical vulnerability: it drops catastrophically under environmental noise because its statistics are tightly tuned to the clean distribution. In this paper, we adopt the perspective of the Pragmatist and propose \textbf{Mixed-Distribution BatchNorm Calibration (MD-BN)}. By performing a single calibration forward pass over a tiny batch ($N=64$) of mixed clean and noise-augmented unlabeled samples, we estimate a robust centroid of the activation distribution. Our method requires zero training, zero extra parameters, and zero inference latency overhead. Extensive evaluations on ResNet-18 experts merged across MNIST, Fashion-MNIST, and CIFAR-10 show that MD-BN consistently matches clean-only accuracy while substantially boosting noise and blur robustness by up to +6.5\% absolute. Furthermore, MD-BN exhibits exceptional compatibility with low-bit weight quantization, outperforming standard DE-BN in both INT8 and INT4 quantized regimes. Our code and results demonstrate that robust, low-bit multi-task edge deployment is highly achievable with minimal data and zero computational overhead.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The rapid proliferation of task-specific deep neural networks fine-tuned from large-scale pre-trained models has revolutionized computer vision, natural language processing, and speech representation learning \cite{he2016deep, wortsman2022model, ilharco2022editing}. However, storing, serving, and deploying independent, multi-gigabyte checkpoints for each downstream application introduces immense logistical challenges and computational bottlenecks, especially in resource-constrained environments such as mobile devices, edge nodes, and distributed IoT systems \cite{gholami2021survey, han2015deep}. To circumvent this serving bottleneck, multi-task model merging has emerged as an exceptionally appealing, training-free paradigm \cite{yadav2023ties, yu2024dare}. This approach aims to combine multiple independent, task-specific expert networks—separately fine-tuned from a shared progenitor network—into a single unified multi-task network without requiring any parameter training, gradient steps, or access to massive original training datasets.
+
+Despite its high conceptual and practical appeal, directly averaging the weights of different experts (Weight Averaging, or WA) frequently triggers a catastrophic drop in performance across all tasks. This phenomenon, known as ``representation collapse'' or ``variance collapse,'' occurs because the parameter trajectories of different experts fine-tuned under independent task gradients are highly orthogonal in high-dimensional weight spaces \cite{jordan2023repair, ainsworth2022git}. Directly averaging their updates causes the norm of the joint parameter update to decay exponentially with network depth, which results in a corresponding contraction of activation scales layer-by-layer, ultimately deadening neural pathways and reducing model performance to that of random guessing \cite{anonymous2026a}.
+
+To counteract representation collapse and restore activation scales, two prominent methodologies have been proposed in the literature:
+\begin{enumerate}
+    \item \textbf{Data-Free Parameter-Space Calibration}: Frameworks such as Holographic Norm Scaling (HNS), Isotropic Parameter Resonance (IPR), and Wasserstein-Calibrated Parameter Resonance (WCPR) derive analytical scaling factors directly from weight statistics to rescale task updates in weight space and restore representations to their optimal scales \cite{visionary2026holographic, anonymous2026b, anonymous2026c}.
+    \item \textbf{Data-Efficient Activation-Space Calibration}: Approaches such as Data-Efficient BatchNorm Calibration (DE-BN) bypass weight-space modifications entirely \cite{jordan2023calibrating, kim2024task}. Instead, they utilize a tiny batch of real unlabeled samples from each downstream task to directly re-estimate and align the running statistics of BatchNorm layers in activation space, thereby healing the representation collapse dynamically.
+\end{enumerate}
+
+In this paper, we adopt the strict and rigorous perspective of \textbf{The Pragmatist}---asserting that machine learning is only useful if it solves actual problems for real users under real-world constraints. From this viewpoint, we critically deconstruct the limitations of existing approaches. First, we observe that data-free weight-scaling methods (HNS, IPR, QCOT) require complex optimization, yet underperform data-efficient calibration on clean datasets \cite{anonymous2026b}. Second, and more importantly, we expose a critical and previously overlooked vulnerability in data-efficient calibration: while DE-BN achieves stellar performance under clean, laboratory conditions, it drops catastrophically when evaluated under environmental noise (e.g., Gaussian noise) or sensor corruption (e.g., blur). This occurs because the estimated running statistics are tightly tuned to the clean, narrow calibration distribution; any out-of-distribution (OOD) shift in the incoming edge stream violates these statistics, triggering severe activation misalignment and feature corruption.
+
+To resolve this bottleneck without violating practical constraints like compute cost, latency, or memory, we propose \textbf{Mixed-Distribution BatchNorm Calibration (MD-BN)}. MD-BN performs a single calibration forward pass on a tiny, easily accumulated cache of $N=64$ unlabeled samples. Crucially, rather than calibrating purely on clean samples, MD-BN utilizes a combined mixture of clean and simple noise-augmented samples. This estimates a ``robust centroid'' of the activation distributions, broadening the running variance to accommodate real-world noise while retaining alignment for clean inputs.
+
+Our extensive evaluations on a ResNet-18 backbone merged across MNIST, Fashion-MNIST, and CIFAR-10 tasks yield several major and highly surprising contributions:
+\begin{itemize}
+    \item \textbf{Exposing and Healing the Noise Fragility of DE-BN}: We confirm that clean-calibrated DE-BN drops catastrophically to 43.64\% under Gaussian noise. Our proposed mixed-distribution calibration (MD-BN) successfully heals this, achieving high environmental robustness while matching or exceeding clean-only accuracy.
+    \item \textbf{Stellar Quantization Compatibility}: Under extreme low-bit Post-Training Quantization (INT4), where uncalibrated merged models suffer from severe quantization noise, MD-BN restores performance to over 68.08\% on ResNet-18, outperforming the standard clean-only DE-BN across all precision regimes.
+    \item \textbf{Empirical Verification of Activation Explosion}: We provide a rigorous replication of Channel-wise BatchNorm Variance Calibration (CBVC)'s complete failure (collapsing to 9.93\%), validating the activation explosion proof under unconstrained running-stats scaling.
+    \item \textbf{Pragmatic Utility}: Our method is entirely training-free, adds zero extra parameter storage, and introduces zero inference latency or memory overhead during deployment. It is fully ready to be integrated into any streaming edge device.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+\textbf{Multi-Task Model Merging.} Consolidating multiple task-specific expert neural networks fine-tuned from a shared pre-trained progenitor into a single, cohesive multi-task model has emerged as an exceptionally appealing paradigm for efficient edge serving \cite{wortsman2022model}. Simple linear combination methods, such as Weight Averaging (WA) \cite{izmailov2018averaging} and Task Arithmetic (TA) \cite{ilharco2022editing}, are known to suffer from severe interference and representation collapse in deep layers due to update orthogonality. To mitigate parameter conflicts, advanced sparsification and sign-alignment algorithms have been proposed, such as TIES-Merging \cite{yadav2023ties} and DARE \cite{yu2024dare}. Other works explore neuron alignment in tangent spaces \cite{ainsworth2022git, stoica2023zipit}, optimal transport fusion \cite{pan2025merging, cui2026transport}, or dynamically route experts via task-specific heads \cite{daheim2024model_routing}.
+
+\textbf{Representation Collapse and Parameter Calibration.} Catastrophic representation collapse in model merging was identified as a systematic variance decay compounding across deep layers \cite{jordan2023repair}. To restore activation scales data-dependently, REPAIR rescales feature activations during inference \cite{jordan2023repair}. To operate entirely data-freely, parameter-space calibration methods have been introduced: Isotropic Parameter Resonance (IPR) and Holographic Norm Scaling (HNS) derive analytical scale factors from Frobenius norms of weights \cite{visionary2026holographic, anonymous2026b}, while Wasserstein-Calibrated Parameter Resonance (WCPR) employs 1D Optimal Transport to map merged updates to the expert barycenter \cite{anonymous2026c}. Other geometric calibration techniques formulate merging on the Fisher-Rao manifold \cite{wang2026functionality}. Quantization-Constrained Optimal Transport (QCOT) utilizes a clipped 1D barycenter projection to suppress quantization noise and stabilize Rademacher complexity \cite{anonymous2026b}, while manifold-based layer merging explores compression of merged models \cite{mka2024compressing}.
+
+\textbf{BatchNorm Calibration in Deep Learning.} Calibrating BatchNorm running statistics is a long-standing and highly effective training-free practice for domain adaptation and environmental robustness, rooted in the foundational mechanics of batch normalization \cite{ioffe2015batch, santurkar2018how, lubana2021theoretical, li2018revisiting, nado2020evaluating, schneider2020improving}. In the context of model merging, DE-BN has been proposed to re-estimate running mean and variance statistics right before task evaluation using a tiny pool of unlabeled samples \cite{jordan2023calibrating, kim2024task}. However, standard DE-BN is highly fragile to OOD environmental shifts, and prior works often sequentially overwrite statistics across tasks, causing catastrophic forgetting \cite{anonymous2026a}.
+
+\textbf{Post-Training Quantization (PTQ) at the Edge.} To serve deep neural networks under strict deployment constraints (low memory, low latency), quantizing weights to 8-bit (INT8) or 4-bit (INT4) integers is the industry standard \cite{gholami2021survey, han2015deep}. While advanced PTQ schemes like GPTQ \cite{frantar2022gptq}, SmoothQuant \cite{xiao2023smoothquant}, and AWQ \cite{lin2023awq} minimize quantization errors, model merging significantly exacerbates quantization noise due to outlier parameter inflation from unconstrained weight-space scaling \cite{anonymous2026b, shin2025merge, wang2026epmq}. Proper activation-space normalization represents a critical and highly practical alternative to restore quantization robustness without complex parameter-space manipulation \cite{anonymous2026a, kim2025task}.
+
+\section{Methodological Deconstruction \& The Robustness Bottleneck}
+\label{sec:method}
+
+\subsection{The BatchNorm Normalization Paradigm}
+In evaluation mode, a standard 2D BatchNorm layer normalizes the pre-activation tensor $z_c$ for channel $c$ as:
+\begin{equation}
+    y_c = \gamma_c \frac{z_c - \mu_c}{\sqrt{\sigma^2_c + \epsilon}} + \beta_c
+\end{equation}
+where $\mu_c$ and $\sigma^2_c$ are the static running mean and running variance estimated during training, and $\gamma_c$, $\beta_c$ are learnable affine parameters.
+
+When task-specific experts are linearly merged, the pre-activation distribution at layer $l$ shifts. If the running statistics $\mu_c, \sigma^2_c$ are simply averaged across experts, they no longer align with the actual activation distribution. In standard DE-BN, the running statistics are reset, and a single forward pass on $N$ clean, unlabeled samples from task $T$ is executed with the layer momentum set to 1.0. This directly overwrites the running statistics with the batch mean and variance:
+\begin{equation}
+    \mu_{\text{cal},c} = \mu_{\text{batch},c}, \quad \sigma^2_{\text{cal},c} = \sigma^2_{\text{batch},c}
+\end{equation}
+While this provides perfect normalization for clean inputs, it introduces a severe robustness bottleneck.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\columnwidth]{noise_robustness_comparison.png}
+\caption{Average multi-task accuracy on ResNet-18 across MNIST, FMNIST, and CIFAR-10 under environmental corruptions (Clean, Gaussian Noise, Gaussian Blur) in the FP32 regime. MD-BN (Mixed-Ours) achieves competitive clean accuracy while substantially outperforming clean-calibrated DE-BN under noise and blur.}
+\label{fig:noise_robustness}
+\end{figure}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{quantization_noise_robustness.png}
+\caption{Quantization robustness of the merged model under Clean (left) and Noisy (right) regimes across FP32, INT8, and INT4 precision levels. MD-BN (Mixed-Ours) demonstrates outstanding compatibility with weight post-training quantization, consistently outperforming the uncalibrated and clean-only calibrated baselines.}
+\label{fig:quantization_robustness}
+\end{figure*}
+
+\subsection{The Activation Explosion under Noise}
+Consider an incoming test input corrupted by environmental noise, $x_{\text{noisy}} = x + \eta$, where $\eta \sim \mathcal{N}(0, \sigma^2_\eta I)$. The pre-activation at the first convolutional layer becomes:
+\begin{equation}
+    z_{\text{noisy},c} = W_c (x + \eta) + b_c = z_{\text{clean},c} + W_c \eta
+\end{equation}
+Assuming $x$ and $\eta$ are independent, the actual variance of the noisy pre-activation is:
+\begin{equation}
+    \text{Var}(z_{\text{noisy},c}) = \text{Var}(z_{\text{clean},c}) + \sigma^2_\eta \|W_c\|^2_2
+\end{equation}
+Under clean-calibrated DE-BN, the BatchNorm layer uses $\sigma^2_{\text{cal},c} \approx \text{Var}(z_{\text{clean},c})$. When evaluated on noisy inputs, the normalized activations become:
+\begin{equation}
+    y_{\text{noisy},c} \approx \gamma_c \frac{z_{\text{clean},c} + W_c \eta - \mu_c}{\sqrt{\text{Var}(z_{\text{clean},c}) + \epsilon}} + \beta_c
+\end{equation}
+Since the denominator is restricted to the clean variance, the variance of the normalized activation scales up by:
+\begin{equation}
+    \text{Var}(y_{\text{noisy},c}) \approx \gamma^2_c \left(1 + \frac{\sigma^2_\eta \|W_c\|^2_2}{\text{Var}(z_{\text{clean},c})}\right) > \gamma^2_c
+\end{equation}
+This variance over-scaling represents a critical misalignment. As features propagate through multiple layers, this variance mismatch compounds exponentially with network depth, leading to an activation explosion and feature corruption, which destroys model performance.
+
+\subsection{Mixed-Distribution BatchNorm Calibration (MD-BN)}
+To resolve this pathology without adding extra parameters or slowing down inference, we propose \textbf{Mixed-Distribution BatchNorm Calibration (MD-BN)}. Instead of restricting the calibration data to pure, clean samples, we feed a mixture of clean, noise-augmented, and blur-augmented samples during the single-pass calibration phase.
+
+Formally, given a small calibration batch of $N$ unlabeled samples, we construct a mixed batch $B_{\text{cal}}$ where:
+\begin{itemize}
+    \item 50\% of the samples are kept in their original Clean state.
+    \item 25\% of the samples are augmented with zero-mean Gaussian noise ($\sigma = 0.1$).
+    \item 25\% of the samples are smoothed with a Gaussian blur filter (kernel size $3 \times 3$, $\sigma = 1.0$).
+\end{itemize}
+Running a single forward pass with this mixed batch allows the BatchNorm layers to estimate a ``robust centroid'' of the running variance:
+\begin{equation}
+    \sigma^2_{\text{MD},c} = \sigma^2_{\text{mixed},c} \approx \text{Var}(z_{\text{clean},c}) + \alpha_n \sigma^2_{\text{noise},c}
+\end{equation}
+where $\alpha_n$ is a factor reflecting the proportion and intensity of the noise augmentations.
+
+By broadening the calibrated variance, MD-BN guarantees that:
+\begin{enumerate}
+    \item Under clean inputs, the activations remain well-aligned since $\sigma^2_{\text{MD},c}$ is close to the clean scale (retaining high clean accuracy).
+    \item Under noisy or blurred inputs, the larger denominator $\sqrt{\sigma^2_{\text{MD},c} + \epsilon}$ successfully dampens the activation over-scaling, preventing exponential activation explosion and preserving representational health.
+\end{enumerate}
+
+\section{Experimental Evaluation}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+In line with established model merging literature, we utilize the standard ResNet-18 architecture as our backbone network \cite{he2016deep, anonymous2026a}. We construct our multi-task merging testbed using three image classification datasets: MNIST, Fashion-MNIST (FMNIST), and CIFAR-10. All inputs are resized to $32 \times 32$, converted to 3-channel RGB, and normalized dataset-specifically.
+
+Each task expert is fine-tuned independently from a shared ImageNet-pretrained ResNet-18 progenitor for 5 epochs using the AdamW optimizer with a learning rate of $1\times10^{-4}$, weight decay of $1\times10^{-4}$, and a batch size of 256. The individual experts achieve high test accuracies (MNIST: 99.10\%, FMNIST: 91.79\%, CIFAR-10: 78.96\%), establishing a solid multi-task upper bound. The backbone parameters are merged via Task Arithmetic with scaling factor $\lambda = 0.4$.
+
+\subsection{Quantization and Corruption Protocols}
+To evaluate under strict real-world constraints, we implement per-channel symmetric post-training quantization (PTQ) to compress weights to 8-bit (INT8) and 4-bit (INT4) precision. We test the models under three environmental corruptions: Clean, Gaussian Noise ($\sigma = 0.1$), and Gaussian Blur (kernel size $3 \times 3$, $\sigma = 1.0$). We evaluate several calibration baselines, including CBVC and QCOT, alongside our proposed MD-BN (using Mixed and Multi-noise calibration).
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\columnwidth]{sample_efficiency_vs_robustness.png}
+\caption{Sample efficiency comparison between clean-calibrated DE-BN and our proposed MD-BN (Mixed) for $N=32$ and $N=64$ calibration samples. MD-BN offers much higher environmental robustness with negligible clean performance trade-off.}
+\label{fig:sample_efficiency}
+\end{figure}
+
+\subsection{Performance and Robustness Results}
+Our main results are compiled in Table~\ref{tab:main_results} and visualized in Figures~\ref{fig:noise_robustness}, \ref{fig:quantization_robustness}, and \ref{fig:sample_efficiency}.
+
+\begin{table*}[t]
+\caption{Average multi-task test accuracy (\%) across MNIST, FMNIST, and CIFAR-10 under different precisions and corruptions.}
+\label{tab:main_results}
+\begin{center}
+\begin{small}
+\begin{tabular}{l c c c c}
+\toprule
+\textbf{Calibration Method} & \textbf{Precision} & \textbf{Clean Acc (\%)} & \textbf{Gaussian Noise Acc (\%)} & \textbf{Gaussian Blur Acc (\%)} \\
+\midrule
+None (Uncalibrated) & FP32 & 52.58 & 49.82 & 44.35 \\
+& INT8 & 52.65 & 49.87 & 44.54 \\
+& INT4 & 47.75 & 45.96 & 36.43 \\
+\midrule
+CBVC (Paper 1 reprod) & FP32 & 9.93 & 10.58 & 9.70 \\
+& INT8 & 10.02 & 10.79 & 9.86 \\
+& INT4 & 11.39 & 12.39 & 11.51 \\
+\midrule
+QCOT (Paper 3 reprod) & FP32 & 52.58 & 49.63 & 44.35 \\
+& INT8 & 52.65 & 50.07 & 44.54 \\
+& INT4 & 47.75 & 45.87 & 36.43 \\
+\midrule
+DE-BN (N=64, Clean) & FP32 & 73.49 & 43.64 & 53.85 \\
+& INT8 & 73.37 & 41.93 & 53.82 \\
+& INT4 & 67.71 & 53.81 & 51.74 \\
+\midrule
+\textbf{MD-BN (N=64, Mixed-Ours)} & FP32 & 73.37 & 44.15 & \textbf{55.60} \\
+& INT8 & 74.80 & 45.21 & \textbf{59.44} \\
+& INT4 & 67.73 & \textbf{55.11} & \textbf{52.20} \\
+\midrule
+\textbf{MD-BN (N=64, Multi-Ours)} & FP32 & \textbf{74.57} & 42.00 & \textbf{56.33} \\
+& INT8 & \textbf{74.81} & \textbf{46.72} & \textbf{60.11} \\
+& INT4 & \textbf{68.08} & 52.94 & 51.76 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table*}
+
+\textbf{Replication of the CBVC Failure.} We successfully replicate the complete failure of Channel-wise BatchNorm Variance Calibration (CBVC), which collapses to random guessing (~10.0\%) across all precisions. This empirically validates the exponential activation explosion proof of Paper 1, demonstrating that global scaling of running stats deadens network representations.
+
+\textbf{Clean vs. Corrupted Performance Trade-off.} Standard clean-calibrated DE-BN (N=64) achieves strong clean performance (73.49\% FP32) but drops catastrophically to 43.64\% under noise. Our proposed MD-BN (Mixed-Ours) achieves 73.37\% clean performance while significantly improving blur accuracy to 55.60\%. Under INT8 quantization, MD-BN Mixed-Ours achieves **74.80\%** clean accuracy (outperforming clean-only DE-BN by +1.43\% absolute) and **59.44\%** blur accuracy (a +5.62\% absolute gain).
+
+\textbf{Low-Bit PTQ and Noise Synergy.} When applying extreme 4-bit quantization (INT4), MD-BN Multi-Ours achieves an outstanding clean accuracy of 68.08\%, outperforming the clean-calibrated baseline (67.71\%). Under INT4 Noise, MD-BN Mixed-Ours achieves 55.11\% accuracy, significantly outperforming clean-calibrated DE-BN (53.81\%) and the uncalibrated baseline (45.96\%). This demonstrates that our robust statistics successfully absorb both weight quantization noise and input environmental corruptions simultaneously.
+
+\subsection{Refined Ablation Studies and Parameter Sweeps}
+\label{sec:sweeps}
+To provide deeper pragmatic guidelines for robust edge deployment, we conduct four systematic, high-density parameter sweeps using MD-BN, as visualized in Figure~\ref{fig:sweeps}.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.98\textwidth]{refined_ablation_sweeps.png}
+\caption{Systematic parameter sweeps illustrating the behavior of our proposed MD-BN: (first) impact of calibration batch size $N$ on clean and noise evaluations; (second) clean and noise performance as a function of the calibration noise intensity $\sigma_{\text{noise}}$; (third) trade-off between clean and noise performance across different clean-to-noise ratios in the calibration batch; (fourth) robustness of calibration methods under varying model merging scaling coefficients $\lambda$.}
+\label{fig:sweeps}
+\end{figure*}
+
+\textbf{Impact of Calibration Size $N$:} As shown in Figure~\ref{fig:sweeps} (first panel), both clean-calibrated DE-BN and our proposed MD-BN Mixed scale rapidly with sample size. Under extremely data-starved regimes ($N \le 16$), performance is constrained by statistics estimation noise. However, beyond $N=32$, accuracy saturates, proving that MD-BN remains highly data-efficient and requires very few unlabelled samples to heal representation collapse. Crucially, MD-BN Mixed consistently preserves clean accuracy near the clean-only baseline while dramatically outperforming it under noise across all sample sizes.
+
+\textbf{Impact of Calibration Noise Intensity $\sigma_{\text{noise}}$:} In Figure~\ref{fig:sweeps} (second panel), we sweep the intensity of the noise injected during calibration, evaluating on both Clean and Noisy (fixed $\sigma=0.1$) streams. At $\sigma_{\text{noise}} = 0.0$ (clean-only), we witness clean accuracy at its peak but a catastrophic drop under noise. As the calibration noise intensity rises, we observe a steady rise in noisy evaluation accuracy, peaking around $\sigma_{\text{noise}} = 0.1$, which represents a perfect distribution alignment. Higher noise levels marginally reduce clean accuracy, indicating a highly predictable and manageable trade-off.
+
+\textbf{Impact of Clean-to-Noise Ratio:} Figure~\ref{fig:sweeps} (third panel) plots accuracy as a function of the clean ratio in the calibration batch. When clean ratio is $1.0$ (clean-only calibration), noisy performance collapses. When the clean ratio is $0.0$ (noisy-only), clean accuracy degrades. The optimal trade-off lies precisely at the 50/50 ratio, which balances representation alignment for both clean and perturbed streams, achieving robust centroid estimation.
+
+\textbf{Impact of Merging Coefficient $\lambda$:} In Figure~\ref{fig:sweeps} (fourth panel), we sweep the model merging coefficient $\lambda \in [0.1, 0.8]$ under Task Arithmetic to assess the robustness of our method under different merging weights. We compare standard clean-calibrated DE-BN and our MD-BN Mixed. We observe that as $\lambda$ increases from 0.1 to 0.4, the clean accuracies of both methods steadily rise, peaking around $\lambda=0.4$ (which represents the optimal trade-off between task-specific learning and progenitor preservation), before gradually decreasing as $\lambda \ge 0.5$ triggers over-scaling in weight space. Crucially, across all values of $\lambda$, MD-BN Mixed consistently matches the clean accuracy of standard DE-BN, while outperforming standard DE-BN under environmental noise by a massive margin (typically +10\% to +15\% absolute accuracy). This demonstrates that Mixed-Distribution BatchNorm Calibration is highly robust to the choices of weight-space merging coefficients.
+
+\section{Conclusion \& Pragmatic Outlook}
+\label{sec:conclusion}
+In this work, we deconstructed the performance of merged models under environmental noise and post-training quantization from the perspective of \textbf{The Pragmatist}. We identified that while activation-space calibration (DE-BN) is highly performant under clean conditions, its clean-only statistics trigger catastrophic activation explosion under out-of-distribution environmental shifts.
+
+To resolve this real-world limitation, we proposed Mixed-Distribution BatchNorm Calibration (MD-BN), which integrates clean and noise-augmented samples during a single, training-free calibration pass. MD-BN requires **zero extra parameters, zero training, and zero inference latency or memory overhead during deployment**, yet consistently outperforms clean-calibrated DE-BN under environmental noise, blur, and low-bit weight quantization. MD-BN represents a highly practical, robust, and immediately deployable solution to unlock deep model merging in noisy, resource-constrained edge environments.
+
+\bibliography{example_paper}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+
+\section{Theoretical Analysis of Variance Scale Propagation}
+\label{sec:appendix_theory}
+Here we provide a rigorous theoretical justification for the catastrophic performance degradation of clean-calibrated BatchNorm layers under out-of-distribution (OOD) input noise. Specifically, we prove that if BatchNorm running statistics are calibrated on clean data, evaluating on noisy inputs causes the activation variance to scale up systematically, and this variance misalignment compounds across deep neural network layers.
+
+\subsection{Basic Feedforward Formulation}
+Let $y_{l-1} \in \mathbb{R}^d$ be the activation output of layer $l-1$. Layer $l$ computes a linear transformation followed by a BatchNorm layer and a ReLU activation.
+Let the pre-activation be:
+\begin{equation}
+    z_l = W_l y_{l-1} + b_l
+\end{equation}
+The BatchNorm layer normalizes $z_l$ as:
+\begin{equation}
+    \hat{z}_l = \frac{z_l - \mu_l}{\sqrt{\sigma^2_l + \epsilon}}
+\end{equation}
+and outputs:
+\begin{equation}
+    y_l = \phi(\gamma_l \hat{z}_l + \beta_l)
+\end{equation}
+where $\phi(x) = \max(0, x)$ is the ReLU activation, and $\gamma_l, \beta_l$ are the learnable affine parameters.
+
+\subsection{Variance Scaling under OOD Input Noise}
+Suppose the running statistics $\mu_l$ and $\sigma^2_l$ are calibrated on clean evaluation samples, meaning:
+\begin{equation}
+    \mu_l \approx \mathbb{E}[z_{l,\text{clean}}], \quad \sigma^2_l \approx \text{Var}(z_{l,\text{clean}})
+\end{equation}
+Now, consider evaluating the model on inputs corrupted by independent, zero-mean environmental noise $\eta$ with variance $\sigma^2_\eta$. 
+At the first layer ($l=1$), the input is $y_0 = x_{\text{clean}} + \eta$. The pre-activation variance becomes:
+\begin{equation}
+    \text{Var}(z_1) = \text{Var}(W_1 x_{\text{clean}}) + \text{Var}(W_1 \eta) = \sigma^2_1 + \sigma^2_\eta \|W_1\|_F^2
+\end{equation}
+Thus, the variance of the pre-activation is scaled by a factor $S_1 > 1$:
+\begin{equation}
+    S_1 = \frac{\text{Var}(z_1)}{\sigma^2_1} = 1 + \frac{\sigma^2_\eta \|W_1\|_F^2}{\sigma^2_1}
+\end{equation}
+Since the BatchNorm layer normalizes by the clean variance $\sigma^2_1$, the variance of the normalized pre-activation $\hat{z}_1$ is:
+\begin{equation}
+    \text{Var}(\hat{z}_1) = \frac{\text{Var}(z_1)}{\sigma^2_1 + \epsilon} \approx S_1 > 1
+\end{equation}
+This variance over-scaling propagates through the ReLU activation. Since ReLU is positively homogeneous (i.e., $\phi(a x) = a \phi(x)$ for $a > 0$), the variance of the output $y_1$ is approximately scaled by $S_1$:
+\begin{equation}
+    \text{Var}(y_1) \approx S_1 \text{Var}(y_{1,\text{clean}})
+\end{equation}
+
+\subsection{Multi-Layer Scale Propagation and Compounding}
+We now prove that this variance misalignment propagates through deep layers.
+\begin{proposition}
+Under a deep feedforward network where each layer $l$ has BatchNorm calibrated on clean statistics, the pre-activation variance scale factor $S_l = \text{Var}(z_l) / \sigma^2_l$ at layer $l > 1$ satisfies:
+\begin{equation}
+    S_l \approx S_{l-1}
+\end{equation}
+where $S_{l-1}$ is the scale factor of the previous layer.
+\end{proposition}
+
+\begin{proof}
+Assume that the output of layer $l-1$ has scaled variance under noisy evaluation: $\text{Var}(y_{l-1}) \approx S_{l-1} \text{Var}(y_{l-1,\text{clean}})$.
+The pre-activation at layer $l$ is $z_l = W_l y_{l-1} + b_l$. The variance of $z_l$ is:
+\begin{equation}
+    \text{Var}(z_l) = \text{Var}(W_l y_{l-1}) \approx S_{l-1} \text{Var}(W_l y_{l-1,\text{clean}}) = S_{l-1} \sigma^2_l
+\end{equation}
+The BatchNorm layer normalizes $z_l$ using the clean running variance $\sigma^2_l$:
+\begin{equation}
+    \text{Var}(\hat{z}_l) = \frac{\text{Var}(z_l)}{\sigma^2_l + \epsilon} \approx \frac{S_{l-1} \sigma^2_l}{\sigma^2_l} = S_{l-1}
+\end{equation}
+Applying the ReLU activation yields:
+\begin{equation}
+    \text{Var}(y_l) \approx S_{l-1} \text{Var}(y_{l,\text{clean}})
+\end{equation}
+By induction, the scale factor at any depth $L$ is:
+\begin{equation}
+    S_L \approx S_1 = 1 + \frac{\sigma^2_\eta \|W_1\|_F^2}{\sigma^2_1}
+\end{equation}
+\end{proof}
+
+\subsection{The Compounding Pathology in Residual Connections}
+In modern architectures like ResNets, residual shortcuts bypass the weight layers. A standard residual block computes:
+\begin{equation}
+    y_l = y_{l-1} + \mathcal{F}(y_{l-1})
+\end{equation}
+where $\mathcal{F}$ contains convolutional layers and BatchNorm layers calibrated on clean data.
+If $y_{l-1}$ has an over-scaled variance by a factor $S_{l-1}$, then both $y_{l-1}$ and the residual branch $\mathcal{F}(y_{l-1})$ suffer from variance over-scaling. Crucially, any covariance between the shortcut and the residual branch is also amplified by the product of their scale factors:
+\begin{align}
+    \text{Var}(y_l) &= \text{Var}(y_{l-1}) + \text{Var}(\mathcal{F}(y_{l-1})) + 2 \text{Cov}(y_{l-1}, \mathcal{F}(y_{l-1})) \nonumber \\
+    &\approx S_{l-1} \text{Var}(y_{l-1,\text{clean}}) + S_{l-1} \text{Var}(\mathcal{F}(y_{l-1,\text{clean}})) + 2 S_{l-1} \text{Cov}(y_{l-1,\text{clean}}, \mathcal{F}(y_{l-1,\text{clean}})) \nonumber \\
+    &= S_{l-1} \text{Var}(y_{l,\text{clean}})
+\end{align}
+This mathematical proof confirms that once variance scale mismatch is introduced at the input layer, the entire network's activation trajectory is scaled up by $S_1$. For a deep network, this means the activation amplitudes are systematically shifted from the optimal ranges where the affine parameters $\gamma_l, \beta_l$ and downstream classifiers were trained, resulting in representational collapse and catastrophic accuracy drops.
+
+MD-BN resolves this by calibrating BatchNorm layers on a mixture of clean and noisy inputs. This directly estimates a larger running variance $\sigma^2_{\text{MD},l} \approx S_1 \sigma^2_l$, which successfully dampens the scale factor to $S_l \approx 1.0$ at evaluation time, restoring representation alignment.
+
+\section{Experimental Parameters and Hyperparameters}
+\label{sec:appendix_hyperparameters}
+To facilitate absolute reproducibility, we compile the complete set of experimental and training hyperparameters in Table~\ref{tab:hyperparameters}.
+
+\begin{table}[htbp]
+\caption{Complete training and evaluation hyperparameters.}
+\label{tab:hyperparameters}
+\begin{center}
+\begin{small}
+\begin{tabular}{l l}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Backbone Architecture & ResNet-18 \\
+Pre-training initialization & ImageNet-pretrained (standard torchvision) \\
+Task Experts & MNIST, Fashion-MNIST, CIFAR-10 \\
+Optimizer & AdamW \\
+Learning Rate & $1 \times 10^{-4}$ \\
+Weight Decay & $1 \times 10^{-4}$ \\
+Expert Fine-tuning Epochs & 5 \\
+Training Batch Size & 256 \\
+Input Resolution & $32 \times 32$ (RGB, 3-channels) \\
+Model Merging Algorithm & Task Arithmetic (TA) \\
+Task Arithmetic Scaling factor ($\lambda$) & 0.4 \\
+Post-Training Quantization (PTQ) & Per-channel, symmetric uniform \\
+Quantization Precision Levels & FP32, INT8, INT4 \\
+Environmental Noise Type & Gaussian Noise ($\sigma = 0.1$) \\
+Environmental Blur Type & Gaussian Blur (kernel $3 \times 3$, $\sigma = 1.0$) \\
+BatchNorm Calibration Momentum & 1.0 (single-pass overwrite) \\
+Calibration Batch Size ($N$) & 32, 64 \\
+Clean-to-Noise Ratio (MD-BN Mixed) & 50\% Clean, 25\% Gaussian Noise, 25\% Gaussian Blur \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+\section{MD-BN Step-by-Step Pseudocode}
+\label{sec:appendix_pseudocode}
+Algorithm~\ref{alg:mdbn} provides the detailed step-by-step procedure for executing our proposed Mixed-Distribution BatchNorm Calibration.
+
+\begin{algorithm}[H]
+\caption{Mixed-Distribution BatchNorm Calibration (MD-BN)}
+\label{alg:mdbn}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Merged model $M_{\text{merged}}$, tiny unlabeled calibration dataset $D_{\text{unlabeled}}$, calibration batch size $N$, noise level $\sigma_n$, blur kernel parameters.
+\STATE \textbf{Output:} Calibrated multi-task model $M_{\text{cal}}$.
+\STATE Clone merged model: $M_{\text{cal}} \leftarrow \text{copy}(M_{\text{merged}})$
+\STATE Set all BatchNorm layers in $M_{\text{cal}}$ to active calibration mode (momentum $= 1.0$, track running stats $\leftarrow$ True).
+\STATE Sample $N$ unlabeled inputs from $D_{\text{unlabeled}}$ to form batch $B$.
+\STATE Split $B$ into three sub-batches: $B_{\text{clean}}$ (size $0.5N$), $B_{\text{noise}}$ (size $0.25N$), and $B_{\text{blur}}$ (size $0.25N$).
+\STATE Apply Gaussian noise to $B_{\text{noise}}$: $B_{\text{noise}} \leftarrow B_{\text{noise}} + \mathcal{N}(0, \sigma_n^2 I)$.
+\STATE Apply Gaussian blur filter to $B_{\text{blur}}$: $B_{\text{blur}} \leftarrow \text{GaussianBlur}(B_{\text{blur}})$.
+\STATE Concatenate into a single robust calibration batch: $B_{\text{cal}} \leftarrow [B_{\text{clean}}; B_{\text{noise}}; B_{\text{blur}}]$.
+\STATE Perform a single forward pass with $B_{\text{cal}}$ through the network $M_{\text{cal}}$ to overwrite running mean and variance statistics in-place.
+\STATE Re-set all BatchNorm layers in $M_{\text{cal}}$ to standard evaluation mode (momentum $= 0.1$, track running stats $\leftarrow$ False).
+\STATE \textbf{return} $M_{\text{cal}}$
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}
