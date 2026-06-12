@@ -27,6 +27,11 @@ Most of these things can be learned from experience, but reading them and keepin
 
 ## Implementation
 
+- **Codebase Evaluation & Reuse:** When starting an implementation, **mandate: Do not write complex training loops from scratch if an existing, working repository can be cloned and modified.** Evaluate existing repositories by asking:
+  - Does it use standard frameworks (PyTorch, Hugging Face)?
+  - Does it have a `requirements.txt` or `environment.yml`?
+  - Is the training script modular and easy to modify?
+- **Dataset Management:** Leverage standard Hugging Face `datasets` or `torchvision` datasets rather than writing custom download/parsing scripts to save valuable time and reduce disk I/O errors.
 - Use uv for managing your environment.  
 - Use git for tracking changes and commit frequently.  
 - Keep a changelog.  

@@ -110,7 +110,7 @@ def parse_slurm_time(spec: str) -> int:
     if len(parts) == 1:
         return days * 86400 + parts[0] * 60
     if len(parts) == 2:
-        if days > 0:
+        if "-" in spec:
             return days * 86400 + parts[0] * 3600 + parts[1] * 60
         return parts[0] * 60 + parts[1]
     if len(parts) == 3:
@@ -147,6 +147,7 @@ def submit_with_wait(
     log_path = workdir / f"{jobname}.sbatch.log"
     export = f"ALL,SKELETON_DIR={SKELETON_DIR},AGENT_STARTUP_OFFSET={startup_offset_sec}"
     cmd = [
+        "stdbuf", "-oL",
         "sbatch", "--wait",
         f"--chdir={workdir}",
         f"--job-name={jobname}",
@@ -155,7 +156,9 @@ def submit_with_wait(
         str(slurm_script),
     ]
     fp = open(log_path, "w")
-    return subprocess.Popen(cmd, stdout=fp, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(cmd, stdout=fp, stderr=subprocess.STDOUT)
+    fp.close()
+    return proc
 
 
 def read_jobid(sbatch_log: Path) -> str | None:
@@ -314,49 +317,53 @@ class ManagedSlot:
             self.thread.join(timeout)
 
     def _lifecycle(self) -> None:
-        while self.remaining_sec >= MIN_RESUBMIT_SEC:
-            idx = len(self.state.attempts)
-            jobname = self.jobname_base if idx == 0 else f"{self.jobname_base}-r{idx}"
-            sbatch_log = self.state.workdir / f"{jobname}.sbatch.log"
-            time_min = max(1, self.remaining_sec // 60)
-            attempt = Attempt(jobname=jobname, sbatch_log=sbatch_log)
-            # Append before submitting so the Monitor can discover the jobid early.
-            self.state.attempts.append(attempt)
-            # Stagger only the first attempt — retries are already de-synchronized
-            # because each happens after a different elapsed time.
-            offset = self.startup_offset_sec if idx == 0 else 0
-            log(f"[{self.state.label}] submitting attempt #{idx+1} "
-                f"({jobname}, --time={time_min}m, startup_offset={offset}s)")
-            proc = submit_with_wait(
-                self.state.workdir, jobname, self.slurm_script, time_min,
-                startup_offset_sec=offset,
-            )
-            attempt.rc = proc.wait()
-            attempt.jobid = read_jobid(sbatch_log)
-            if not attempt.jobid:
-                log(f"[{self.state.label}] could not read jobid from {sbatch_log}; "
-                    "aborting slot")
-                return
-            summary = sacct_summary(attempt.jobid)
-            attempt.final_state = str(summary.get("state", "UNKNOWN"))
-            attempt.elapsed_sec = int(summary.get("elapsed_sec", 0))  # type: ignore[arg-type]
-            attempt.exit_code = str(summary.get("exit_code", ""))
-            log(f"[{self.state.label}] attempt #{idx+1} (job {attempt.jobid}) "
-                f"ended: state={attempt.final_state}, elapsed={attempt.elapsed_sec}s, "
-                f"exit_code={attempt.exit_code}, rc={attempt.rc}")
-            if not self.allow_resubmit:
-                return
-            if not is_preemption(attempt.final_state, attempt.exit_code):
-                return
-            # Preempted. Deduct elapsed and try again on a fresh node.
-            self.remaining_sec -= attempt.elapsed_sec
-            if self.remaining_sec < MIN_RESUBMIT_SEC:
-                log(f"[{self.state.label}] preempted, but only "
-                    f"{self.remaining_sec}s left; not resubmitting")
-                return
-            cancel_orphan_gpu_jobs(attempt.jobid, self.state.label)
-            log(f"[{self.state.label}] preempted; resubmitting with "
-                f"{self.remaining_sec // 60}m remaining")
+        try:
+            while self.remaining_sec >= MIN_RESUBMIT_SEC:
+                idx = len(self.state.attempts)
+                jobname = self.jobname_base if idx == 0 else f"{self.jobname_base}-r{idx}"
+                sbatch_log = self.state.workdir / f"{jobname}.sbatch.log"
+                time_min = max(1, self.remaining_sec // 60)
+                attempt = Attempt(jobname=jobname, sbatch_log=sbatch_log)
+                # Append before submitting so the Monitor can discover the jobid early.
+                self.state.attempts.append(attempt)
+                # Stagger only the first attempt — retries are already de-synchronized
+                # because each happens after a different elapsed time.
+                offset = self.startup_offset_sec if idx == 0 else 0
+                log(f"[{self.state.label}] submitting attempt #{idx+1} "
+                    f"({jobname}, --time={time_min}m, startup_offset={offset}s)")
+                proc = submit_with_wait(
+                    self.state.workdir, jobname, self.slurm_script, time_min,
+                    startup_offset_sec=offset,
+                )
+                attempt.rc = proc.wait()
+                attempt.jobid = read_jobid(sbatch_log)
+                if not attempt.jobid:
+                    log(f"[{self.state.label}] could not read jobid from {sbatch_log}; "
+                        "aborting slot")
+                    return
+                summary = sacct_summary(attempt.jobid)
+                attempt.final_state = str(summary.get("state", "UNKNOWN"))
+                attempt.elapsed_sec = int(summary.get("elapsed_sec", 0))  # type: ignore[arg-type]
+                attempt.exit_code = str(summary.get("exit_code", ""))
+                log(f"[{self.state.label}] attempt #{idx+1} (job {attempt.jobid}) "
+                    f"ended: state={attempt.final_state}, elapsed={attempt.elapsed_sec}s, "
+                    f"exit_code={attempt.exit_code}, rc={attempt.rc}")
+                if not self.allow_resubmit:
+                    return
+                if not is_preemption(attempt.final_state, attempt.exit_code):
+                    return
+                # Preempted. Deduct elapsed and try again on a fresh node.
+                self.remaining_sec -= attempt.elapsed_sec
+                if self.remaining_sec < MIN_RESUBMIT_SEC:
+                    log(f"[{self.state.label}] preempted, but only "
+                        f"{self.remaining_sec}s left; not resubmitting")
+                    return
+                log(f"[{self.state.label}] preempted; resubmitting with "
+                    f"{self.remaining_sec // 60}m remaining")
+        finally:
+            for a in self.state.attempts:
+                if a.jobid:
+                    cancel_orphan_gpu_jobs(a.jobid, self.state.label)
 
 
 # --- monitor thread -------------------------------------------------------
@@ -420,7 +427,7 @@ class Monitor(threading.Thread):
         accepted = s.workdir / "accepted_papers"
         if not s.accepted_dir_seen and accepted.is_dir():
             s.accepted_dir_seen = True
-            pdfs = list(accepted.glob("*.pdf"))
+            pdfs = list(accepted.glob("**/*.pdf"))
             log(f"[{s.label}] accepted_papers/ created with {len(pdfs)} PDF(s)")
 
     def _poll_iterations(self, s: SubmissionState) -> None:
@@ -441,6 +448,10 @@ class Monitor(threading.Thread):
 
     def _poll_gpu_jobs(self) -> None:
         rows = squeue_me()
+        if rows is None:
+            log("[monitor] squeue timed out; skipping GPU job poll this cycle")
+            return
+            
         # Map every known controller jobid (any attempt) back to its slot.
         ctrl_map: dict[str, SubmissionState] = {}
         for s in self.submissions:
@@ -510,7 +521,13 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
             if p.is_file():
                 shutil.copy2(p, papers_dir / p.name)
             elif p.is_dir():
-                shutil.copytree(p, papers_dir / p.name, dirs_exist_ok=True)
+                if "metareview" in p.parts:
+                    idx = p.parts.index("metareview")
+                    trial_name = p.parts[idx-1]
+                    dest_name = f"{trial_name}_{p.name}"
+                else:
+                    dest_name = p.name
+                shutil.copytree(p, papers_dir / dest_name, dirs_exist_ok=True)
     log(f"trial {trial}: seeded {NUM_SUBMISSIONS} submissions with "
         f"{len(input_papers)} input paper(s)")
 
@@ -602,7 +619,7 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     accepted = meta_dir / "accepted_papers"
     if not accepted.is_dir():
         sys.exit(f"trial {trial}: metareview did not produce {accepted}")
-    pdfs = sorted(accepted.glob("*.pdf"))
+    pdfs = sorted(accepted.glob("**/*.pdf"))
     log(f"===== trial {trial} complete: {len(pdfs)} accepted paper(s) =====")
     return accepted
 
@@ -641,12 +658,60 @@ def main() -> None:
         else:
             input_papers = accumulated_papers.copy()
             
-        existing = output_dir / f"trial{trial}" / "metareview" / "accepted_papers"
-        existing_subs = sorted([d for d in existing.iterdir() if d.is_dir()]) if existing.is_dir() else []
-        if len(existing_subs) == 3:
-            log(f"===== trial {trial}: skipping — {existing} already has 3 accepted submissions =====")
+        trial_dir = output_dir / f"trial{trial}"
+        existing = trial_dir / "metareview" / "accepted_papers"
+        
+        # Check completion marker:
+        if (existing / "metareview.md").exists():
+            existing_subs = sorted([d for d in existing.iterdir() if d.is_dir()])
+            log(f"===== trial {trial}: skipping — {existing}/metareview.md exists =====")
             accumulated_papers.extend(existing_subs)
             continue
+            
+        # Trial is not complete. If the directory already exists, we are resuming an
+        # aborted run. We need to cancel any lingering jobs that match this trial
+        # to prevent duplicate execution, then blow away the incomplete directory.
+        if trial_dir.exists():
+            log(f"trial {trial}: cleaning up aborted previous run...")
+            try:
+                out = subprocess.run(
+                    ["squeue", "--me", "-h", "-o", "%i|%j"],
+                    capture_output=True, text=True, timeout=20, check=False,
+                ).stdout
+                to_cancel = []
+                cancelled_agent_ids = []
+                for line in out.splitlines():
+                    parts = line.split("|", 1)
+                    if len(parts) == 2:
+                        jobid, jobname = parts
+                        # Our jobnames are like `research-t1-s1` or `metareview-t1`
+                        if f"-t{trial}-" in jobname or jobname.endswith(f"-t{trial}"):
+                            to_cancel.append(jobid)
+                            cancelled_agent_ids.append(jobid)
+                            
+                # Also cancel any orphaned GPU jobs spawned by these controllers
+                if cancelled_agent_ids:
+                    gpu_out = subprocess.run(
+                        ["squeue", "--me", "-h", "-o", "%i|%k"],
+                        capture_output=True, text=True, timeout=20, check=False,
+                    ).stdout
+                    for line in gpu_out.splitlines():
+                        parts = line.split("|", 1)
+                        if len(parts) == 2:
+                            jid, comment = parts
+                            if comment.startswith("agent-"):
+                                parent_id = comment[len("agent-"):]
+                                if parent_id in cancelled_agent_ids:
+                                    to_cancel.append(jid)
+                                    
+                if to_cancel:
+                    log(f"trial {trial}: cancelling {len(to_cancel)} old jobs: {','.join(to_cancel)}")
+                    subprocess.run(["scancel", *to_cancel], capture_output=True, check=False)
+            except subprocess.TimeoutExpired:
+                log(f"trial {trial}: squeue timeout, continuing cleanup...")
+                
+            shutil.rmtree(trial_dir)
+            
         accepted = run_trial(trial, output_dir, input_papers)
         subs = sorted([d for d in accepted.iterdir() if d.is_dir()])
         if not subs:
