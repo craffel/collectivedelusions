@@ -1,2 +1,0 @@
-# Research Progress Log
-
