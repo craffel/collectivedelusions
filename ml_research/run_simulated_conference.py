@@ -20,7 +20,7 @@ orphaned by the dead controller, and resubmits the agent until either it
 exits cleanly or the budget is exhausted.
 
 A background monitor thread polls every POLL_INTERVAL_SECONDS and logs
-notable events across all attempts: progress.md updates, GPU job launches
+notable events across all attempts: progress.json updates, GPU job launches
 and conclusions, controller iteration markers, and artifact appearance.
 
 Usage:
@@ -399,14 +399,14 @@ class Monitor(threading.Thread):
                     log(f"[{s.label}] attempt #{idx} got slurm jobid = {jid}")
 
     def _poll_progress(self, s: SubmissionState) -> None:
-        p = s.workdir / "progress.md"
+        p = s.workdir / "progress.json"
         try:
             st = p.stat()
         except FileNotFoundError:
             return
         if st.st_mtime > s.progress_mtime + 1.0:
             s.progress_mtime = st.st_mtime
-            log(f"[{s.label}] progress.md updated (size={st.st_size}B)")
+            log(f"[{s.label}] progress.json updated (size={st.st_size}B)")
 
     def _poll_artifacts(self, s: SubmissionState) -> None:
         if not s.submission_pdf_seen and (s.workdir / "submission" / "submission.pdf").exists():
