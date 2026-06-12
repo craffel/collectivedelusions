@@ -409,10 +409,10 @@ class Monitor(threading.Thread):
             log(f"[{s.label}] progress.md updated (size={st.st_size}B)")
 
     def _poll_artifacts(self, s: SubmissionState) -> None:
-        if not s.submission_pdf_seen and (s.workdir / "submission.pdf").exists():
+        if not s.submission_pdf_seen and (s.workdir / "submission" / "submission.pdf").exists():
             s.submission_pdf_seen = True
-            size = (s.workdir / "submission.pdf").stat().st_size
-            log(f"[{s.label}] submission.pdf appeared ({size}B)")
+            size = (s.workdir / "submission" / "submission.pdf").stat().st_size
+            log(f"[{s.label}] submission/submission.pdf appeared ({size}B)")
         if not s.review_md_seen and (s.workdir / "review.md").exists():
             s.review_md_seen = True
             size = (s.workdir / "review.md").stat().st_size
@@ -507,7 +507,10 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
         papers_dir = sub_dir / "papers"
         papers_dir.mkdir(exist_ok=True)
         for p in input_papers:
-            shutil.copy2(p, papers_dir / p.name)
+            if p.is_file():
+                shutil.copy2(p, papers_dir / p.name)
+            elif p.is_dir():
+                shutil.copytree(p, papers_dir / p.name, dirs_exist_ok=True)
     log(f"trial {trial}: seeded {NUM_SUBMISSIONS} submissions with "
         f"{len(input_papers)} input paper(s)")
 
@@ -540,9 +543,9 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
     review_idx = 0
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
-        sub_pdf = sub_dir / "submission.pdf"
-        if not sub_pdf.exists():
-            log(f"[t{trial}/sub{z}] no submission.pdf — skipping review")
+        sub_src_dir = sub_dir / "submission"
+        if not sub_src_dir.is_dir() or not (sub_src_dir / "submission.pdf").exists():
+            log(f"[t{trial}/sub{z}] no submission/submission.pdf — skipping review")
             skipped += 1
             continue
 
@@ -552,7 +555,7 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
 
             persona = random.choice(available_reviewer_personas) if available_reviewer_personas else None
             seed_reference_files(rev_dir, persona=persona)
-            shutil.copy2(sub_pdf, rev_dir / "submission.pdf")
+            shutil.copytree(sub_src_dir, rev_dir / "submission", dirs_exist_ok=True)
 
             state = SubmissionState(label=f"t{trial}/sub{z}-rev{rev_num}", workdir=rev_dir)
             slot = ManagedSlot(
@@ -577,12 +580,13 @@ def run_trial(trial: int, output_dir: Path, input_papers: list[Path]) -> Path:
 
     for z in range(1, NUM_SUBMISSIONS + 1):
         sub_dir = trial_dir / f"submission{z}"
-        if not (sub_dir / "submission.pdf").exists():
+        sub_src_dir = sub_dir / "submission"
+        if not sub_src_dir.is_dir() or not (sub_src_dir / "submission.pdf").exists():
             continue
 
         meta_sub_dir = meta_dir / f"submission{z}"
         meta_sub_dir.mkdir(exist_ok=True)
-        shutil.copy2(sub_dir / "submission.pdf", meta_sub_dir / "submission.pdf")
+        shutil.copytree(sub_src_dir, meta_sub_dir / "submission", dirs_exist_ok=True)
 
         for rev_num in range(1, 4):
             rev_file = sub_dir / f"reviewer{rev_num}" / "review.md"
@@ -628,21 +632,26 @@ def main() -> None:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    input_papers = [p.resolve() for p in args.seed_papers]
+    accumulated_papers = []
 
     log(f"orchestrator starting; output={output_dir}, trials={args.num_trials}")
     for trial in range(1, args.num_trials + 1):
+        if trial == 1:
+            input_papers = [p.resolve() for p in args.seed_papers]
+        else:
+            input_papers = accumulated_papers.copy()
+            
         existing = output_dir / f"trial{trial}" / "metareview" / "accepted_papers"
-        existing_pdfs = sorted(existing.glob("*.pdf")) if existing.is_dir() else []
-        if len(existing_pdfs) == 3:
-            log(f"===== trial {trial}: skipping — {existing} already has 3 accepted PDFs =====")
-            input_papers = existing_pdfs
+        existing_subs = sorted([d for d in existing.iterdir() if d.is_dir()]) if existing.is_dir() else []
+        if len(existing_subs) == 3:
+            log(f"===== trial {trial}: skipping — {existing} already has 3 accepted submissions =====")
+            accumulated_papers.extend(existing_subs)
             continue
         accepted = run_trial(trial, output_dir, input_papers)
-        pdfs = sorted(accepted.glob("*.pdf"))
-        if not pdfs:
-            sys.exit(f"trial {trial}: no PDFs in {accepted}")
-        input_papers = pdfs
+        subs = sorted([d for d in accepted.iterdir() if d.is_dir()])
+        if not subs:
+            sys.exit(f"trial {trial}: no accepted submissions in {accepted}")
+        accumulated_papers.extend(subs)
     log(f"all {args.num_trials} trial(s) complete: {output_dir}")
 
 

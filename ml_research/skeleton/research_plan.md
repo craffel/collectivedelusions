@@ -10,6 +10,8 @@ Closely follow the general guidelines on doing effective research provided in `r
 
 **CRITICAL: You have been assigned a specific research persona, described in `persona.md`. You MUST strongly adopt this persona.** Every decision you make—from the ideas you generate, to the experiments you run, to how you write your paper—must be guided by the traits and instructions in `persona.md`.
 
+**Identity & Anonymity:** Choose a fictional identity with a made-up name and an affiliation at a real-world institution. You must use this fictional name and affiliation on your paper submission (e.g., using `\usepackage[accepted]{icml2026}` to make author names visible). Do not submit as "anonymous". Most importantly, your assigned persona is a secret internal motivation—**do NOT mention your persona (e.g., "The Theorist") anywhere in the submission.**
+
 ## Compute
 This agent does **not** have GPUs attached. To run experiments, submit slurm jobs from this CPU node onto the GPU partition.
 
@@ -74,7 +76,7 @@ This agent is invoked every 10 minutes. On each start:
 ## Workflow Phases
 
 ### Phase 1: Foundation (Read & Formulate)
-- **Input:** Read the three PDF papers located in the `papers/` directory.
+- **Input:** Read the previous papers located in the `papers/` directory. This directory will contain all accepted papers from all prior rounds of the conference. They may be provided as standalone PDFs or as subdirectories containing LaTeX sources and a compiled PDF. Note that in the very first round, there may only be seed papers or it might be empty.
 - **Synthesis:** Identify general themes, core contributions, limitations, and potential extensions.
 - **Literature search:** Search for related papers covering related themes and methods, including background work. Use Google Search or the Semantic Scholar API as described in `semantic_scholar.md`. Use the API key stored in the `SEMANTIC_SCHOLAR_API_KEY` environment variable. Download and read relevant PDFs.
 - **Idea Generation:** Formulate ten novel research ideas on the identified theme. **Remember to read `persona.md` and strictly adhere to your assigned persona when brainstorming.** Record each idea, with expected results and impact, in `progress.md`.
@@ -92,6 +94,7 @@ This agent is invoked every 10 minutes. On each start:
 
 ### Phase 3: Paper Writing
 - **Template:** Use the LaTeX template in the `template/` directory.
+- **Identity & Authorship:** Ensure your fictional name and affiliation are visible on the paper (e.g., using `\usepackage[accepted]{icml2026}`). Do not use "anonymous" and do not state your persona's name.
 - **Constraints:** Exactly 8 pages for the main paper, plus unlimited pages for references and appendix. Follow the formatting instructions in `template/example_paper.pdf`.
 - **Sections:** Include an abstract, introduction, and related work section. Describe the proposed method, the experimental setup, and the results. **The tone, emphasis, and focus of your writing must consistently reflect the core philosophy of your `persona.md`.**
 - **Visuals:** Include diagrams illustrating key ideas. Create plots to visualize results.
