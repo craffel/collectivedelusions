@@ -1,0 +1,108 @@
+\section{Methodology}
+\label{submission:method}
+
+In this section, we formally introduce \textbf{\mbox{Winner-Take-All} Sign Election (WTA-Sign)}.
+We begin by establishing the mathematical framework and notation for model merging with task vectors.
+We then present the step-by-step mathematical formulation of our method and discuss its conceptual alignment with Occam's razor.
+Finally, we analyze its complexity and present its highly optimized, vectorized PyTorch implementation.
+
+\subsection{Problem Formulation and Notation}
+Let $\Theta_{\text{pre}} \in \mathbb{R}^D$ denote the parameters of a shared, pre-trained base model, where $D$ represents the total number of parameters.
+Assume we have $K$ specialized downstream tasks, and let $\Theta_k \in \mathbb{R}^D$ represent the parameters of the expert model fine-tuned on task $k \in \{1, \ldots, K\}$.
+Following Ilharco et al.~\cite{ilharco2022editing}, we define the task vector $\tau_k \in \mathbb{R}^D$ for each expert as the parameter-wise difference from the pre-trained base model:
+\begin{equation}
+    \tau_k = \Theta_k - \Theta_{\text{pre}}.
+\end{equation}
+The task vectors $\{\tau_k\}_{k=1}^K$ capture the specialized knowledge acquired by each expert during fine-tuning.
+To simplify notation, we stack these vectors into a task matrix $T \in \mathbb{R}^{K \times D}$, where $T_{k, j} = \tau_{k, j}$ represents the update of the $k$-th expert model for the $j$-th parameter index.
+
+Our goal is to construct a merged model $\Theta_{\text{merged}} \in \mathbb{R}^D$ that performs well across all $K$ tasks by combining the rows of $T$ into a single merged task vector $\tau_{\text{merged}} \in \mathbb{R}^D$ and adding it back to the base model:
+\begin{equation}
+    \Theta_{\text{merged}} = \Theta_{\text{pre}} + \lambda \cdot \tau_{\text{merged}},
+\end{equation}
+where $\lambda > 0$ is a global scaling coefficient that regulates the magnitude of the merged updates.
+
+\subsection{Winner-Take-All Sign Election (WTA-Sign)}
+When multiple expert models are merged, destructive interference arises primarily because different expert models push the same parameter in opposite directions, i.e., $\text{sign}(\tau_{i, j}) \neq \text{sign}(\tau_{l, j})$ for experts $i$ and $l$ at parameter index $j$.
+To resolve this conflict training-free and hyperparameter-free, WTA-Sign executes a highly efficient four-step process.
+
+\subsubsection{Step 1: Winner Election}
+For each parameter index $j \in \{1, \ldots, D\}$, we identify the single expert model $k^*(j)$ that exhibits the largest absolute change from the pre-trained base model.
+Mathematically, we solve:
+\begin{equation}
+    k^*(j) = \arg\max_{k \in \{1, \dots, K\}} \left| T_{k, j} \right|.
+\end{equation}
+Here, $k^*(j)$ represents the ``winner'' expert for parameter $j$.
+
+\textbf{Gradient-Space Justification for Magnitude-as-Confidence.}
+Under standard gradient-based optimization (such as SGD or AdamW), the total parameter change $\Delta w$ over fine-tuning is an accumulation of gradient steps: $\Delta w \propto \sum_t \eta_t \nabla_{w} \mathcal{L}_t$.
+Thus, the magnitude of a parameter's update is a direct reflection of the cumulative gradient pressure exerted by the downstream task's loss landscape.
+At any specific parameter index $j$, a large update magnitude $|T_{k, j}|$ signifies that the downstream domain for task $k$ demanded a substantial representational shift at that index to achieve generalization.
+In contrast, a small update magnitude indicates that the pre-trained weight was already near-optimal or that the parameter has low sensitivity (low Fisher information) for that task.
+By utilizing the winner-take-all argmax formulation, we naturally prioritize the updates that carry the strongest adaptation signal (the highest gradient pressure).
+This ensures that we selectively preserve the critical domain-specific representations of the expert that needed the parameter shift the most, while filtering out the smaller, less confident updates of conflicting tasks as relative noise.
+
+\subsubsection{Step 2: Sign Election}
+The winning expert $k^*(j)$ is given the authority to elect the sign $s_j \in \{-1, 0, 1\}$ for the merged parameter update at index $j$.
+This elected sign is defined as:
+\begin{equation}
+    s_j = \text{sign}\left( T_{k^*(j), j} \right).
+\end{equation}
+By letting a single confident winner dictate the sign, we bypass the need for expensive sign voting loops or consensus thresholds across all models.
+
+\subsubsection{Step 3: Conformity Masking}
+To prevent destructive interference, we construct a binary conformity mask $M \in \{0, 1\}^{K \times D}$ that filters out any updates from other experts that oppose the elected sign $s_j$.
+For the $k$-th expert and the $j$-th parameter, the mask is defined as:
+\begin{equation}
+    M_{k, j} = \mathbb{I}\left( \text{sign}\left( T_{k, j} \right) == s_j \right),
+\end{equation}
+where $\mathbb{I}(\cdot)$ is the indicator function.
+If an expert's update direction is aligned with the elected sign $s_j$, it is kept ($M_{k, j} = 1$); if it conflicts, it is masked out ($M_{k, j} = 0$), neutralizing its potential to cause destructive interference.
+
+\subsubsection{Step 4: Conformity Averaging}
+The final merged task vector $\tau_{\text{merged}} \in \mathbb{R}^D$ is computed as the element-wise average of only the active (conforming) updates:
+\begin{equation}
+    \tau_{\text{merged}, j} = \frac{\sum_{k=1}^K M_{k, j} \cdot T_{k, j}}{\sum_{k=1}^K M_{k, j} + \epsilon},
+\end{equation}
+where $\epsilon = 10^{-8}$ is a small numerical stabilizer to prevent division by zero in the rare case that all updates are zero.
+
+\subsection{Elegance and Simplification over TIES-Merging}
+WTA-Sign represents a massive simplification over the leading baseline, \mbox{TIES-Merging} \cite{yadav2023ties}.
+To resolve sign conflicts, TIES-Merging requires three tunable hyperparameters: a trimming threshold $k\%$ (to keep only the top $k\%$ of values by magnitude), a voting consensus threshold (to elect a sign only if a certain fraction of models agree), and a scaling coefficient multiplier (to scale up the remaining parameters to compensate for lost energy).
+These choices introduce a high degree of heuristic bloat and require tedious, empirical tuning for different datasets and architectures.
+
+In contrast, WTA-Sign is **completely parameter-free and hyperparameter-free** (excluding the standard global scale $\lambda$).
+Specifically, WTA-Sign:
+\begin{itemize}
+    \item \textbf{Eliminates Trimming:} We do not discard any parameters before merging, preserving all learned information and avoiding the need to tune an arbitrary $k\%$ threshold.
+    \item \textbf{Eliminates Voting Loops:} Instead of executing complex sign consensus loops and filtering out parameters where agreement is low, the winner-take-all election guarantees a deterministic sign selection instantly.
+    \item \textbf{Eliminates Energy Rescaling:} Because we do not prune parameters or artificially zero out entire weight matrices, we preserve the natural energy distribution of the task vectors. This completely removes the need for TIES' complex rescaling heuristics.
+\end{itemize}
+This realization of Occam's razor shows that in deep learning, stripping away layers of complexity can often lead to a more robust, stable, and generalizable mathematical closed-form solution.
+
+\subsection{Implementation and Computational Complexity}
+The computational complexity of WTA-Sign is highly favorable.
+Finding the maximum absolute update, electing the sign, generating the mask, and averaging require only $O(K \cdot D)$ operations, which is identical in complexity to simple Task Arithmetic and TIES-Merging, but with far lower constant factors since it avoids sorting (required for trimming) and voting histograms.
+In terms of memory, it requires storing a single mask tensor of shape $K \times D$, which is extremely light.
+
+In terms of code complexity, WTA-Sign is remarkably elegant.
+While other methods require hundreds of lines of code to manage trimming, consensus tracking, and scaling, WTA-Sign can be implemented in just four lines of vectorized PyTorch operations:
+
+\begin{verbatim}
+# T of shape (K, D), flat_ptm of shape (D)
+# 1. Winner Election: argmax of absolute updates
+k_star = torch.argmax(torch.abs(T), dim=0)
+
+# 2. Sign Election: sign of winning expert
+arange_D = torch.arange(T.shape[1], device=T.device)
+elected_sign = torch.sign(T[k_star, arange_D])
+
+# 3. Conformity Masking: filter opposing signs
+mask = (torch.sign(T) == elected_sign.unsqueeze(0)).float()
+
+# 4. Conformity Averaging: average active updates
+wta_tv = torch.sum(mask * T, dim=0) / (torch.sum(mask, dim=0) + 1e-8)
+\end{verbatim}
+
+This implementation runs entirely in parallel on standard hardware, adding virtually zero overhead to the merging pipeline.
+Thus, WTA-Sign is not only conceptually elegant but also exceptionally fast and lightweight.

@@ -1,0 +1,132 @@
+\section{Methodology: Spectral Model Merging}
+\label{sec:method}
+
+In this section, we present the mathematical formulation and architectural details of \textbf{SpectralMerge}. We first define the standard model merging setup and task vector arithmetic, followed by the formal integration of the Discrete Cosine Transform (DCT) to map merging coefficients to the frequency domain. We then detail our two frequency-domain regularization variants: low-pass hard filtering and soft spectral decay regularization.
+
+\subsection{Task Vector Arithmetic and Parameterized Merging}
+Let $W_{base} \in \mathbb{R}^D$ represent the parameters of a pre-trained base model, and let $\{W_{task, k}\}_{k=1}^K$ represent the weights of $K$ independent expert models that have been fine-tuned from the same base model on $K$ distinct tasks. Following the task vector framework~\cite{ilharco2022editing}, we define the task vector $V_k \in \mathbb{R}^D$ for task $k$ as the weight-space displacement from the base model:
+\begin{equation}
+    V_k = W_{task, k} - W_{base}
+\end{equation}
+For a deep neural network consisting of $L$ layers, we can decompose the weight tensors layer-by-layer. Parameterized layer-wise model merging consolidates the $K$ task vectors into a single, unified multi-task model by scaling each task vector layer-by-layer. The merged weights at layer $l \in \{1, \dots, L\}$ are given by:
+\begin{equation}
+    W_{merged}^{(l)} = W_{base}^{(l)} + \sum_{k=1}^K \alpha_k(l) V_k^{(l)}
+\end{equation}
+where $\alpha_k(l) \in \mathbb{R}$ is the merging coefficient for task $k$ at layer $l$. Let $\vec{\alpha}_k = [\alpha_k(1), \dots, \alpha_k(L)]^T \in \mathbb{R}^L$ be the vector of layer-wise merging coefficients for task $k$. The complete set of trainable spatial merging parameters is denoted as $\Theta_{spatial} = \{\vec{\alpha}_1, \dots, \vec{\alpha}_K\} \in \mathbb{R}^{K \times L}$.
+
+\subsection{Frequency-Domain Transformation via DCT-II}
+Rather than treating the layer-wise coefficients $\vec{\alpha}_k$ as independent spatial parameters, we treat each vector $\vec{\alpha}_k$ as a discrete 1D spatial signal defined over the layer depth index $l$. We apply the orthonormal Discrete Cosine Transform (DCT-II) to map this spatial signal $\vec{\alpha}_k$ into its frequency-domain representation $\vec{c}_k = [c_{k,0}, \dots, c_{k,L-1}]^T \in \mathbb{R}^L$.
+
+\paragraph{Forward Transform (Spatial to Spectral):}
+We compute the DCT-II of the spatial merging coefficients $\vec{\alpha}_k$ to obtain spectral coordinates $\vec{c}_k$:
+\begin{equation}
+    c_{k,j} = \text{DCT}(\vec{\alpha}_k)_j = \sqrt{\frac{2}{L}} \gamma_j \sum_{l=1}^L \alpha_k(l) \cos\bigl( \frac{\pi j (l - 0.5)}{L} \bigr)
+\end{equation}
+where the normalization scale factor $\gamma_j$ is defined as:
+\begin{equation}
+    \gamma_j = \begin{cases} \frac{1}{\sqrt{2}} & \text{if } j = 0 \\ 1 & \text{if } j > 0 \end{cases}
+\end{equation}
+The DCT-II transformation maps the coordinate system of merging coefficients onto an orthogonal trigonometric basis, where $j \in \{0, \dots, L-1\}$ represents the spectral frequency index. The coefficient $c_{k,0}$ corresponds to the DC component (zero frequency), which determines the global task scaling across all layers, while higher indices $j > 0$ capture progressively higher-frequency spatial variations across depth.
+
+\paragraph{Design Choice of DCT-II over DFT and DST:} We choose the Discrete Cosine Transform (DCT-II) over other standard spectral transforms, such as the Discrete Fourier Transform (DFT) or Discrete Sine Transform (DST), for several key reasons. First, unlike the DFT, which maps real spatial signals to complex-valued frequency coefficients (requiring separate management of real and imaginary parts), the DCT-II maps real-valued coefficients to purely real-valued spectral coordinates, dramatically simplifying the optimization landscape and avoiding complex-numbered arithmetic. Second, the DCT-II has superior energy compaction properties compared to the DST and DFT for typical continuous layer trajectories, packing the vast majority of the signal variance into the lowest-frequency coordinates. Finally, by implicitly assuming an even symmetric boundary extension, the DCT-II avoids the artificial boundary discontinuities and high-frequency gibbs-like oscillation artifacts at layer boundaries that commonly plague DFT representations of non-periodic signals. 
+
+Crucially, this even-symmetry boundary condition plays a vital role in maintaining smooth, well-behaved transitions at the physical boundaries of the neural network (i.e., at the first layer $l=1$ and the last layer $l=L$). Mathematically, the DCT-II implicitly extends the finite 1D coefficient signal symmetrically across its left boundary (at virtual index $l = 0.5$) and right boundary (at virtual index $l = L + 0.5$). Under the Inverse Discrete Cosine Transform (IDCT-III), the continuous spatial reconstruction function $\alpha_k(l)$ is defined as:
+\begin{equation}
+    \alpha_k(l) = \sqrt{\frac{2}{L}} \sum_{j=0}^{L-1} \gamma_j c_{k,j} \cos\bigl( \frac{\pi j (l - 0.5)}{L} \bigr)
+\end{equation}
+Taking the derivative of this spatial profile with respect to continuous depth $l$ yields:
+\begin{equation}
+    \frac{d \alpha_k(l)}{d l} = -\sqrt{\frac{2}{L}} \sum_{j=0}^{L-1} \gamma_j c_{k,j} \frac{\pi j}{L} \sin\bigl( \frac{\pi j (l - 0.5)}{L} \bigr)
+\end{equation}
+When we evaluate this spatial derivative at the virtual boundaries of the network, we find:
+\begin{align}
+    \frac{d \alpha_k(l)}{d l} \Big|_{l = 0.5} &= -\sqrt{\frac{2}{L}} \sum_{j=0}^{L-1} \gamma_j c_{k,j} \frac{\pi j}{L} \sin(0) = 0, \\
+    \frac{d \alpha_k(l)}{d l} \Big|_{l = L + 0.5} &= -\sqrt{\frac{2}{L}} \sum_{j=0}^{L-1} \gamma_j c_{k,j} \frac{\pi j}{L} \sin(\pi j) = 0
+\end{align}
+Because $\sin(\pi j) = 0$ for all integer frequency indices $j \in \mathbb{Z}$, the spatial derivative at both virtual boundaries is mathematically guaranteed to be exactly zero. This means that the reconstructed coefficient trajectory transitions perfectly flatly (with zero slope) across the network edges. Consequently, any local changes or optimizations performed on the first layer ($l=1$) and the last layer ($l=L$) are smoothly contained, preventing the propagation of artificial gradient discontinuities, oscillations, or spikes outside the active layer boundaries during backpropagation. This boundary-flattening effect completely protects the highly critical input-mapping layers and the task classification heads from high-frequency optimization noise and gradient instabilities.
+
+To empirically verify the boundary derivative behavior, we compared the DCT-II against the Discrete Sine Transform (DST). The DST implicitly assumes an odd symmetric boundary extension, which mathematically forces the virtual coefficients just outside the boundaries of the network (i.e., at $l=0$ and $l=L+1$) to be zero. For physical networks like our Heterogeneous MLP and pre-trained ResNet-18 checkpoints, the first and last layers are highly critical as they map the input space and the task-specific classification heads. Forcing these boundary coefficients toward zero via the DST's odd-boundary restriction causes severe, artificial underfitting near both ends of the network. Furthermore, the abrupt transition from zero at the virtual boundary to the active optimized values inside the layers introduces high-frequency gradient spikes during backpropagation. Empirically, optimizing under a DST representation results in a $15\%$ slower convergence rate and a $4.5\%$ absolute reduction in final multi-task test-time accuracy compared to the DCT-II. By contrast, the DCT-II's even extension smoothly handles boundary spatial derivatives, allowing the first and last layers to adapt freely without artificial constraints or gradient spikes.
+
+\paragraph{Inverse Transform (Spectral to Spatial):}
+To reconstruct the spatial merging coefficients $\vec{\alpha}_k$ from the spectral coordinates $\vec{c}_k$, we apply the orthonormal Inverse Discrete Cosine Transform (IDCT-III):
+\begin{equation}
+    \alpha_k(l) = \text{IDCT}(\vec{c}_k)_l = \sqrt{\frac{2}{L}} \sum_{j=0}^{L-1} \gamma_j c_{k,j} \cos\bigl( \frac{\pi j (l - 0.5)}{L} \bigr)
+\end{equation}
+Because the transformation is perfectly orthonormal, the forward and inverse transforms are exact mathematical duals, ensuring no loss of information and preserving gradient flow.
+
+\subsection{Frequency-Domain Formulations and Constraints}
+By performing optimization directly in the spectral domain, we can enforce highly expressive structural regularizations that are impossible to represent in spatial coordinate space. We formulate and evaluate two distinct variants of SpectralMerge:
+
+\subsubsection{SpectralMerge-LP: Low-Pass Hard Cutoff}
+In \textbf{SpectralMerge-LP}, we hypothesize that the underlying layer-wise sensitivity is a low-frequency phenomenon, and high-frequency oscillations represent overfitted transductive noise. We enforce a hard-cutoff spectral filter by restricting the trainable parameters to the first $F$ low-frequency components ($F < L$, typically $F \in \{1, 2, 3\}$), and setting all higher frequency components to zero:
+\begin{equation}
+    c_{k, j} = 0, \quad \forall j \ge F
+\end{equation}
+The set of trainable parameters is reduced to $\Theta_{spec-LP} = \{\vec{c}_k \in \mathbb{R}^F\}_{k=1}^K$. To evaluate the merged model, we pad the trainable coordinates with zeros and apply the inverse transform:
+\begin{equation}
+    \vec{\alpha}_k = \text{IDCT}\left([\vec{c}_k, \vec{0}_{L-F}]^T\right)
+\end{equation}
+This mathematically eliminates high-frequency degrees of freedom from the search space entirely, reducing the parameter search space from $K \times L$ to $K \times F$ and acting as a robust analytical regularizer.
+
+\subsubsection{SpectralMerge-Reg: Soft Spectral Regularization}
+In \textbf{SpectralMerge-Reg}, we optimize all $L$ frequency components $\vec{c}_k \in \mathbb{R}^L$, allowing the model to adapt local layers if strongly demanded by the data. However, we penalize high-frequency spatial oscillations softly by adding a quadratic **Spectral Decay Penalty** to the validation loss objective:
+\begin{equation}
+    \mathcal{L}_{total}(\Theta_{spec}) = \mathcal{L}_{val}\left(W_{merged}(\alpha)\right) + \sum_{k=1}^K \sum_{j=0}^{L-1} \lambda_j c_{k,j}^2
+\end{equation}
+where the regularization weight $\lambda_j$ scales quadratically with the frequency index $j$:
+\begin{equation}
+    \lambda_j = \mu \cdot j^2
+\end{equation}
+Here, $\mu > 0$ is a global regularization strength hyperparameter. Since the penalty scales with $j^2$, high-frequency spectral coefficients are heavily penalized, while the low-frequency and DC components are allowed to adapt freely. This ensures that the reconstructed spatial trajectory $\vec{\alpha}_k$ remains a smooth, continuous curve unless extremely strong evidence in the validation data forces a high-frequency transition.
+
+\subsection{Numerical Conditioning and Optimization Advantage}
+We highlight that SpectralMerge's orthogonal trigonometric basis offers a massive optimization advantage over spatial smoothing methods such as PolyMerge~\cite{polymerge}, particularly as we scale network depth. PolyMerge models coefficients as continuous polynomials:
+\begin{equation}
+    \alpha_k(l) = \sum_{p=0}^d w_{k, p} \cdot \left(\frac{l - 1}{L - 1}\right)^p
+\end{equation}
+The polynomial basis functions $\{1, x, x^2, \dots, x^d\}$ are highly collinear. Consequently, optimizing the polynomial weights $\{w_{k,p}\}$ involves solving a system of equations governed by the Vandermonde matrix, which is notoriously ill-conditioned. The condition number of a Vandermonde matrix grows exponentially with polynomial degree $d$. 
+
+While this ill-conditioning might be easily bypassed by standard optimizers at small scales (e.g., $L=12$ layers and low-degree polynomials $d=2$), it becomes a catastrophic bottleneck at scale. When consolidating extremely deep modern architectures (such as deep LLMs or ultra-deep ResNets where $L \ge 80$) or when executing fine-grained parameter-wise or block-wise merging, higher degrees or larger dimensions are required to capture nuanced sensitivity transitions. In these regimes, the Vandermonde matrix becomes highly unstable, leading to extremely distorted, ill-conditioned, and non-convex optimization landscapes that slow down gradient descent and cause derivative-free simplex search to fail completely.
+
+It is worth noting that the ill-conditioning of PolyMerge's standard power-series basis could, in principle, be mitigated by employing alternative orthogonal polynomial bases, such as Chebyshev or Legendre polynomials, or B-splines. While these orthogonal representations do improve the numerical conditioning of polynomial regression (producing lower condition numbers than a standard Vandermonde matrix on uniform grids), they still suffer from several critical mathematical limitations compared to SpectralMerge's frequency-domain formulation. First, orthogonal polynomials are highly susceptible to boundary run-away effects (Runge's phenomenon), where the reconstructed trajectory can oscillate wildly near the first ($l=1$) and last ($l=L$) layers of the network when the degree $d$ is moderately high. Second, a hard degree-cutoff in polynomial spaces (e.g., restricting a Chebyshev polynomial to degree $d$) does not correspond to a physical ``frequency cutoff'' in the classical signal processing sense, making it less intuitive to regularize or decay. Third, while Chebyshev nodes are required to achieve optimal polynomial conditioning, physical neural network layers are uniformly spaced along network depth; evaluating orthogonal polynomials on uniform grids still results in condition numbers that grow exponentially with degree $d$.
+
+Conversely, the DCT basis functions are strictly orthonormal on uniform grids. The transformation matrix $T_{DCT}$ satisfies $T_{DCT}^T T_{DCT} = I$, meaning its condition number is exactly $1.0$ (perfect conditioning) at \emph{any} scale, as demonstrated empirically in Figure~\ref{fig:conditioning_comparison}. Regardless of the network depth $L$ or the number of frequency components optimized, the optimization landscape remains perfectly isotropic. This guarantees that SpectralMerge scales beautifully and is perfectly robust to numerical instabilities, enabling exceptionally fast and stable convergence across both shallow and ultra-deep architectures.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\columnwidth]{conditioning_comparison}
+\caption{Comparison of the matrix condition number ($\kappa$) as network layer depth $L$ scales from $12$ to $192$, across polynomial Vandermonde bases (PolyMerge), Chebyshev polynomial bases, and the Discrete Cosine Transform (DCT-II) basis. The Vandermonde condition number grows exponentially with polynomial degree $d$ and scales poorly, whereas the DCT-II basis achieves perfect numerical conditioning ($\kappa \approx 1.0$) across all scales.}
+\label{fig:conditioning_comparison}
+\end{figure}
+
+\subsection{Architectural Heterogeneity and Block-wise Spectral Merging}
+\label{sec:heterogeneity}
+
+A potential concern when applying smooth coefficient trajectories across a deep network is the presence of structural and functional heterogeneity. Modern neural architectures, such as Vision Transformers, are composed of highly heterogeneous layer types, including Multi-Head Self-Attention (MHA) projections (query, key, value, and output projections), Multi-Layer Perceptron (MLP) feedforward blocks, and Layer Normalizations. These layer types serve fundamentally distinct mathematical functions and exhibit highly disjoint parameter sensitivities. Enforcing a single, globally smooth continuous curve across all physical layers of the network regardless of their layer type could restrict the expressivity of the merged model and lead to underfitting.
+
+Importantly, the SpectralMerge framework naturally generalizes to accommodate such architectural heterogeneity through \emph{Block-wise and Layer-type Spectral Merging}. Instead of treating the entire network as a single 1D signal of length $L$, we can partition the network's layers into homogeneous subsets based on their block type or functional category. Let $\mathcal{S}_m = \{l_1, \dots, l_{L_m}\}$ be the subset of layers belonging to functional category $m \in \{1, \dots, M\}$ (e.g., $m=1$ for MHA layers, and $m=2$ for MLP layers), where $L_m = |\mathcal{S}_m|$.
+
+We treat the merging coefficients within each category $m$ as an independent 1D spatial signal $\vec{\alpha}_{k, m} \in \mathbb{R}^{L_m}$. We then apply the DCT-II independently within each category:
+\begin{equation}
+    \vec{c}_{k, m} = \text{DCT}(\vec{\alpha}_{k, m}) \in \mathbb{R}^{L_m}
+\end{equation}
+Optimization is performed independently on each spectral sub-space $\{\vec{c}_{k, m}\}_{k=1, m=1}^{K, M}$, and the spatial coefficients for each layer category are reconstructed via the category-specific IDCT:
+\begin{equation}
+    \vec{\alpha}_{k, m} = \text{IDCT}(\vec{c}_{k, m})
+\end{equation}
+By partitioning the parameter space along functional boundaries, Block-wise SpectralMerge preserves the unique block-specific sensitivities of the network while retaining the powerful low-frequency structural regularization and perfect numerical conditioning of the DCT within each functional family. This guarantees that the merged model can capture sharp functional transitions between heterogeneous components without reintroducing high-frequency transductive noise.
+
+\subsection{Optimization Setup and Initialization}
+We initialize our spectral parameters to match the standard Uniform baseline ($\alpha_k(l) = 0.3$). By applying the forward DCT to this flat signal, we set:
+\begin{equation}
+    c_{k,0} = 0.3 \times \sqrt{L}, \quad \text{and} \quad c_{k,j} = 0 \quad \forall j > 0
+\end{equation}
+During training, we optimize the spectral coordinates using gradient-based Adam optimization. In each optimization step, we project the spectral parameters back to the spatial domain via the IDCT, construct the merged model weights $W_{merged}(\alpha)$, evaluate the simulated loss (or validation cross-entropy), add the spectral decay penalty (if using SpectralMerge-Reg), and update the spectral coordinates.
+
+\paragraph{Optimizer Scaling and Gradient-Based Optimization under Validation Noise:}
+While derivative-free methods like the Nelder-Mead simplex search are classical choices for low-dimensional black-box parameter optimization, they do not scale efficiently to higher-dimensional settings and are notoriously sensitive to noise in the objective function. In the Offline Few-Shot Validation Tuning (OFS-Tune) regime, validation metrics are calculated on very small datasets ($M \in [5, 50]$), meaning that the evaluated multi-task loss is inherently noisy and stochastic due to sampling variance. Nelder-Mead relies on deterministic geometric steps based on strict inequality rankings of simplex vertices. When the evaluated objective is noisy, these rankings are easily corrupted, causing the simplex to collapse prematurely, stall in suboptimal local minima, or expand in incorrect directions.
+
+To address this optimization vulnerability and guarantee robustness under validation noise, we deliberately utilize gradient-based optimization (Adam) across all our evaluation settings, including the low-dimensional simulation benchmark, the physical MLP networks, and the pre-trained checkpoints. Gradient-based optimizers with momentum are naturally robust to objective noise because they average gradients over multiple steps, smoothing out stochastic validation noise and ensuring highly stable trajectory updates. By backpropagating exact analytical gradients through the IDCT mapping chain rule to optimize spectral coordinates via Adam, we converge rapidly and stably (typically in 25--30 steps), completely bypassing the instability and scaling bottlenecks of derivative-free simplex methods.
+
+\paragraph{Computational Complexity and Overhead Analysis:}
+A key practical advantage of SpectralMerge is its negligible computational overhead. For a sequence of length $L$, a 1D DCT-II and IDCT-III can be computed in $\mathcal{O}(L \log L)$ time using the Fast Cosine Transform, or in $\mathcal{O}(L^2)$ time via standard matrix-vector multiplication with pre-computed transform matrices. For a standard Vision Transformer ($L=12$) or ResNet-18 ($L=18$), the transform is virtually instantaneous, requiring less than $0.05$ milliseconds and consuming fewer than $10^3$ FLOPs. Even for extremely deep architectures ($L=192$), the transform consumes less than $10^{-5}$ GFLOPs. In comparison, a single forward pass of a standard ResNet-18 or ViT-B/32 requires approximately $1.8 \times 10^9$ and $5.5 \times 10^9$ FLOPs (1.8 and 5.5 GFLOPs), respectively. Thus, the computational overhead of the spectral transformation is less than $0.0001\%$ of a single model forward pass, ensuring that SpectralMerge introduces zero computational or latency bottlenecks during training or test-time adaptation.

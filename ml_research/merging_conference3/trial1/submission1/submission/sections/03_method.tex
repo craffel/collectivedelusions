@@ -1,0 +1,100 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the mathematical formulation of the proposed \textbf{QP-Merge} framework. We first define the standard model merging setup and describe how low-bit quantization causes massive degradation. We then details our two primary synergistic techniques: Outlier-Residual Decoupling (ORD) and Quantization-Error Aware Scale Calibration (QE-Calib), followed by practical hardware deployment specifications.
+
+\subsection{Standard Model Merging and the Quantization Bottleneck}
+Let $W_{\text{base}} \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ represent the pre-trained weights of a particular layer in a deep neural network (e.g., a linear projection in a Transformer block). Let $W_1, \dots, W_T \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ represent the fine-tuned weights of $T$ independent models, each specialized on a distinct target task. The task vector for task $t \in \{1, \dots, T\}$ is defined as:
+\begin{equation}
+\Delta W_t = W_t - W_{\text{base}}
+\end{equation}
+In standard floating-point task arithmetic \cite{ilharco2022editing}, these task vectors are scaled by merging coefficients $\lambda_t > 0$ and added to the base weights to construct the unquantized merged weight matrix $W_{\text{FP32}}$:
+\begin{equation}
+W_{\text{FP32}} = W_{\text{base}} + \sum_{t=1}^T \lambda_t \Delta W_t
+\label{eq:standard_merge}
+\end{equation}
+
+For real-world edge deployment, we seek to compress $W_{\text{FP32}}$ into a $b$-bit quantized integer representation (e.g., INT4 or INT8). In symmetric uniform per-channel quantization, the quantization operator $Q_b(\cdot)$ maps a floating-point matrix $W$ to a discrete grid:
+\begin{equation}
+Q_b(W) = \text{clamp}\left( \text{round}\left( \frac{W}{S} \right), -2^{b-1}, 2^{b-1}-1 \right) \cdot S
+\end{equation}
+where $S = [S_1, \dots, S_{d_{\text{out}}}]$ is a vector of per-channel scale factors. For each channel (row) $c \in \{1, \dots, d_{\text{out}}\}$, $S_c$ is calculated as:
+\begin{equation}
+S_c = \frac{\max_{j} |W_{c,j}|}{2^{b-1}-1}
+\label{eq:scale}
+\end{equation}
+
+Because fine-tuning shifts models toward high-magnitude features specific to individual datasets, task vectors $\Delta W_t$ typically exhibit highly skewed, heavy-tailed distributions containing rare, extreme outliers. When these task vectors are linearly combined as in Eq.~\ref{eq:standard_merge}, the outliers persist and stretch the maximum range $\max_j |W_{c,j}|$. According to Eq.~\ref{eq:scale}, this stretches the quantization scale $S_c$, causing the quantization grid bin size to become extremely coarse. Consequently, the dense majority of standard-range weights are squeezed into just a few quantization bins, introducing devastating quantization noise and catastrophic performance drop on downstream tasks.
+
+\subsection{Technique 1: Outlier-Residual Decoupling (ORD)}
+To prevent extreme weight updates from corrupting the quantization grid while maintaining standard hardware acceleration, QP-Merge decouples the extreme outlier weights from the dense weight remainder. 
+
+For each task vector $\Delta W_t$, we define a binary outlier mask $M_t \in \{0, 1\}^{d_{\text{out}} \times d_{\text{in}}}$ based on an absolute value percentile threshold $\gamma \in [0, 1]$:
+\begin{equation}
+(M_t)_{i,j} = \begin{cases} 1 & \text{if } |\Delta W_{t, i, j}| \ge \text{Percentile}(|\Delta W_t|, \gamma) \\ 0 & \text{otherwise} \end{cases}
+\end{equation}
+Typically, we set $\gamma = 0.99$ (retaining the top 1\% largest updates as outliers) or $\gamma = 0.995$ (0.5\% outliers). 
+
+Using the mask $M_t$, we decompose each task vector $\Delta W_t$ into a sparse outlier component $\Delta W_{t, \text{outlier}}$ and a dense, range-bounded residual component $\Delta W_{t, \text{dense}}$:
+\begin{equation}
+\Delta W_{t, \text{outlier}} = M_t \odot \Delta W_t
+\end{equation}
+\begin{equation}
+\Delta W_{t, \text{dense}} = (1 - M_t) \odot \Delta W_t
+\end{equation}
+where $\odot$ denotes the element-wise Hadamard product.
+
+We can then formulate the merged weight matrix as a hybrid representation of a dense quantized base weight and a sparse, unquantized high-precision outlier weight:
+\begin{equation}
+W_{\text{hybrid}} = Q_b(W_{\text{quantized\_base}}) + W_{\text{outlier}}
+\label{eq:hybrid}
+\end{equation}
+where:
+\begin{equation}
+W_{\text{quantized\_base}} = W_{\text{base}} + \sum_{t=1}^T \lambda_t \Delta W_{t, \text{dense}}
+\end{equation}
+\begin{equation}
+W_{\text{outlier}} = \sum_{t=1}^T \lambda_t \Delta W_{t, \text{outlier}}
+\end{equation}
+
+By isolating the extreme outliers in $W_{\text{outlier}}$ (which remains in unquantized FP16 format), the range of $W_{\text{quantized\_base}}$ becomes tightly bounded. This ensures that the scale factor $S_c$ in Eq.~\ref{eq:scale} remains small, drastically reducing the quantization distortion of the dense base weights.
+
+\subsection{Technique 2: Quantization-Error Aware Scale Calibration (QE-Calib)}
+While Outlier-Residual Decoupling prevents weight-range stretching, different tasks still possess distinct activation scale distributions. Linearly summing task vectors with uniform scaling factors does not guarantee that internal layer-wise activation scales will remain aligned once quantized. To correct these scale mismatches, QP-Merge introduces a zero-labeled-data, post-training activation scale and merging coefficient calibration.
+
+Let $f_{\text{FP32}}(X)$ represent the unquantized FP32 merged model's image encoder mapping that generates final semantic embeddings for a batch of input images $X$. Let $f_{\text{hybrid}}(X; D, \lambda)$ represent our quantized hybrid model's mapping, parametrized by layer-wise diagonal weight scaling parameters $D = \{D_l\}_{l=1}^L$ (where $D_l = \text{diag}(d_{l, 1}, \dots, d_{l, d_{\text{in}}})$) and learnable merging weights $\lambda = [\lambda_1, \dots, \lambda_T]$. The goal is to optimize $D$ and $\lambda$ such that the latent representations reconstructed by our quantized hybrid formulation match the high-precision embeddings produced by the unquantized FP32 merged model.
+
+We formulate this calibration objective as an end-to-end Representation-Level Alignment loss:
+\begin{equation}
+\mathcal{L} = \mathbb{E}_{X} \left[ \| f_{\text{FP32}}(X) - f_{\text{hybrid}}(X; D, \lambda) \|_2^2 \right]
+\label{eq:objective}
+\end{equation}
+where the hybrid weights for each linear layer $l$ are defined as:
+\begin{equation}
+W_{l, \text{hybrid}}(D_l, \lambda) = Q_b\left(W_{l, \text{base}} + \left( \sum_{t=1}^T \lambda_t \Delta W_{t, l, \text{dense}} \right) D_l \right) + \sum_{t=1}^T \lambda_t \Delta W_{t, l, \text{outlier}}
+\label{eq:hybrid_param}
+\end{equation}
+
+Note that in Eq.~\ref{eq:hybrid_param}, the diagonal scaling matrix $D_l$ is multiplied on the \emph{right} side of the task vector sum. Since the task vector represents a matrix of shape $d_{\text{out}} \times d_{\text{in}}$ and $D_l$ is of size $d_{\text{in}} \times d_{\text{in}}$, right-multiplication scales each column (representing the input channel scales), which mathematically aligns with PyTorch's element-wise scaling.
+
+Evaluating representation alignment on the final outputs (embeddings) rather than intermediate, isolated layer-wise activation losses offers a major pragmatic advantage for vision encoders. Because compact vision architectures (like ViT-B-32 with 86M parameters) are highly integrated, end-to-end representation alignment directly preserves global semantic similarity in the downstream feature space, yielding superior multi-task performance. For extremely large networks (e.g., LLMs with tens of billions of parameters) where full-backpropagation is memory-prohibitive, this objective can be straightforwardly decomposed into block-wise or layer-wise reconstruction errors to bypass memory limits.
+
+We initialize $D_l$ as the identity matrix $I$ and $\lambda_t = 0.3$. Because Eq.~\ref{eq:objective} is fully differentiable, we can optimize $D_l$ and $\lambda$ jointly using standard gradient-based backpropagation. Crucially, this calibration requires \textbf{zero ground-truth labels}, allowing us to draw $M = 128$ completely unlabeled samples directly from the incoming data stream. Since we are optimizing only a small number of diagonal scaling parameters and task weights over a handful of samples, the calibration converges in just 100 steps of Adam \cite{kingma2014adam}, taking less than 2 minutes on a single standard GPU.
+
+\paragraph{Justification for Non-Equivalence in Weight Scaling.}
+Unlike traditional post-training quantization methods (such as SmoothQuant \cite{xiao2023smoothquant}) that maintain mathematical equivalence by applying inverse scaling factors to activations ($Y = (X D_l^{-1}) (D_l W)$) during inference, QP-Merge permanently applies $D_l$ to the weight updates without scaling activations. This design choice is mathematically and practically necessary. In a multi-task merging scenario, different task models have distinct and conflicting activation ranges. Because there is no single diagonal scaling matrix $D_l$ that can simultaneously scale activations of all tasks equivalently, forcing strict mathematical equivalence would require a complex, dynamic test-time activation scaling mechanism. Permanently scaling the parameter updates is a highly pragmatic approximation that bypasses inference-time complexity, allowing us to align activation scale dynamics directly in the weights. 
+
+While altering the weights permanently without an inverse activation scaling alters the unquantized network mapping and theoretically introduces a risk of representation drift or overfitting to the calibration set, several structural factors mitigate this risk: (a) The scale adjustments $D_l$ are tightly bounded and optimized over multiple target domains simultaneously; (b) Our end-to-end representation alignment loss in Eq.~\ref{eq:objective} enforces a global semantic constraint on final embeddings, ensuring the model's output distribution remains highly aligned with the FP32 merged reference; and (c) by optimizing over a highly restricted, ultra-sparse diagonal scaling parameter set (only $d_{\text{in}}$ parameters per layer, compared to millions of model weights), we drastically restrict the model's capacity to overfit, facilitating strong generalization across downstream test sets. Our empirical results verify that the model generalizes robustly to full downstream test sets without severe representation drift or degradation.
+
+\subsection{Hardware-Friendly Execution and Complexity}
+A key pragmatic advantage of QP-Merge is its direct compatibility with standard deep learning hardware accelerators (such as NVIDIA Tensor Cores) and optimized runtime engines (such as TensorRT or vLLM). 
+
+During inference, for an incoming activation tensor $X$, the layer computation is executed as:
+\begin{equation}
+Y = X \cdot Q_b(W_{\text{quantized\_base}}) + X \cdot W_{\text{outlier}}
+\end{equation}
+where:
+\begin{itemize}
+    \item $X \cdot Q_b(W_{\text{quantized\_base}})$ is computed using standard, highly optimized low-bit integer GEMM kernels (such as INT4 or INT8 tensor cores), which provide massive throughput gains and memory bandwidth savings.
+    \item $X \cdot W_{\text{outlier}}$ is computed using optimized Sparse Matrix-Matrix Multiplication (SpMM) kernels. Since the outlier matrix $W_{\text{outlier}}$ has a sparsity of $\ge 99\%$ (density $\le 1\%$), its storage in coordinate-list (COO) or compressed sparse row (CSR) format is negligible, and its computation introduces near-zero VRAM or latency overhead, maintaining high real-world edge execution speeds.
+\end{itemize}

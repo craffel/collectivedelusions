@@ -1,0 +1,26 @@
+# 1. Summary of FlatQ-Merge
+
+## 1.1 Overview and Motivation
+The paper introduces **FlatQ-Merge** (Flatness-Aware Quantization-Aware Model Merging), an extensive empirical study investigating how the loss landscape flatness of task-specific expert neural networks affects their downstream resilience to weight quantization and test-time coefficient optimization. Model merging is a popular paradigm for combining multiple task-specific models fine-tuned from a shared pre-trained base into a single multi-task model without additional joint training. However, deploying these merged models on resource-constrained edge devices requires compression, such as Post-Training Quantization (PTQ). 
+
+Extreme compression (e.g., 4-bit weight quantization) introduces significant rounding noise that can corrupt task-specific parameter directions and collapse multi-task performance. While test-time adaptation of merging coefficients can mitigate some noise, the authors investigate whether the geometric landscape flatness of the pre-merged experts governs their inherent robustness to quantization.
+
+## 1.2 Proposed Framework and Methodology
+The paper outlines a complete pipeline consisting of the following key stages:
+1. **Sharpness-Aware Expert Fine-Tuning**: Task-specific experts are pre-trained using Sharpness-Aware Minimization (SAM) across 5 different perturbation radii ($\rho \in \{0.0, 0.01, 0.05, 0.1, 0.2\}$) on a Vision Transformer (`vit_tiny_patch16_224`) base. This controls the flatness of their loss landscapes.
+2. **Layer-wise Dynamic Blending**: Task vectors are merged using a layer-wise blending coefficient matrix $\Lambda \in [0, 1]^{L \times K}$, initialized to uniform values (0.3).
+3. **Straight-Through Post-Training Quantization**: The merged weights are quantized to 8-bit or 4-bit precision using per-channel symmetric uniform PTQ. A Straight-Through Estimator (STE) is used to approximate gradients through the non-differentiable rounding and clipping operators.
+4. **Test-Time Adaptation via Joint Entropy Minimization**: On an unlabeled, balanced calibration batch (e.g., 16 images per task), the blending coefficients $\Lambda$ are optimized for 40 steps using Adam to minimize joint prediction entropy.
+5. **Coefficient Perturbation Sensitivity**: To profile the stability of the adapted coefficients, random Gaussian noise $\delta \sim \mathcal{N}(0, \sigma^2 I)$ is added directly to $\Lambda^*$, and the average prediction entropy change is measured.
+
+The paper provides mathematical derivations showing that pre-training task experts with SAM to minimize the spectral norm of the weight Hessian directly bounds the trace and spectral norm of the low-dimensional coefficient-space Hessian.
+
+## 1.3 Key Empirical Findings
+- **Precision-Dependent Synergy**: Under 8-bit quantization (low noise), standard SGD-trained experts are robust, and SAM-induced flatness yields negligible gains. Under extreme 4-bit quantization (high noise), pre-training with an optimal SAM radius ($\rho=0.05$) yields a massive **+7.44%** absolute multi-task accuracy improvement over standard SGD experts.
+- **Flatness Dominates Adaptation**: Merging flat experts naively with static uniform weights ($\rho=0.05$, NaiveUniform) outperforms performing test-time adaptation on sharp experts ($\rho=0.0$, FlatQ-Merge) by a massive **+6.03%** absolute accuracy, proving that pre-merging landscape geometry is more critical than downstream adaptation algorithms.
+- **Over-Perturbation Threshold**: A distinct, non-linear degradation boundary exists at $\rho \ge 0.1$. Large SAM radii force optimization to converge to the same wide local minima, inducing "representation convergence" (evidenced by a dramatic surge in pairwise cosine similarities of task vectors) which washes out task-specific features and collapses multi-task performance.
+- **Peak Memory Advantage**: While optimizing unquantized weights post-hoc slightly outperforms direct quantized optimization under extreme noise, it increases peak RAM during test-time adaptation by up to 8$\times$. Direct quantized optimization (FlatQ-Merge) keeps weights strictly compressed in 4-bit memory.
+- **Independent Clipping vs. Convex Softmax**: Independent clipping of coefficients in $[0, 1]$ significantly outperforms normalized Softmax combinations by **+8.20%** absolute accuracy under 8-bit and **+3.03%** under 4-bit.
+- **DARE Compatibility & TENT Baseline**: FlatQ-Merge is compatible with advanced sign-conflict resolution techniques like DARE (retaining +5.96% absolute gains with flat experts). Furthermore, optimizing in low-dimensional coefficient space protects the model from the catastrophic class/task collapse that plagues high-dimensional TENT-style weight adaptation.
+- **Alternative Flatness Pathways (SWA)**: SWA-trained experts provide moderate noise resilience (8-bit) but fail completely under extreme 4-bit noise. This suggests that the adversarial formulation of SAM is necessary to ensure uniform, worst-case noise resilience.
+- **Direct Empirical Hessian Proxy**: Random weight-space parameter perturbations confirm that SAM ($\rho=0.05$) leads to a significantly lower loss increase, providing direct empirical proof of reduced Hessian curvature.

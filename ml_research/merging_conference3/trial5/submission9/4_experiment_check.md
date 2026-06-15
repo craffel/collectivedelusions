@@ -1,0 +1,29 @@
+# Experiment Check
+
+## Empirical Evaluation Rating: Excellent
+
+## Key Strengths of the Experimental Setup
+- **Diverse and Conflicting Task Suite:** Evaluating model merging on MNIST, FashionMNIST, CIFAR-10, and SVHN is a highly challenging test. These datasets represent completely disparate visual domains, styles, and resolutions. Direct parameter interpolation (Uniform) or coordinate-wise sign voting/magnitude pruning (STA, TIES) completely collapses in this setting, which makes it an ideal environment to test the limits of weight-space model merging.
+- **Strong and Well-Tuned Baselines:** 
+  - To prevent under-tuning bias and ensure a rigorous comparison, the authors sweep the scaling factor for Task Arithmetic, and perform a full grid sweep of the pruning threshold $\theta \in \{0.1, \dots, 0.9\}$ on each calibration split for both Sparse Task Arithmetic (STA) and TIES-Merging. 
+  - They also include unconstrained OFS-Tune (direct optimization of blending coefficients without projection), which acts as a clean ablation to isolate the benefits of spectral consensus.
+- **Statistical Rigor (Multi-Seed Analysis):** The validation calibration set is extremely tiny (16 samples per task, 64 total), which simulates a highly realistic and challenging few-shot regime. Because small datasets are prone to noise, the authors execute all validation-dependent optimization procedures over **5 independent random validation calibration splits**, reporting the Mean and Standard Deviation. This is a highly rigorous statistical setup that measures split-sensitivity.
+- **Ablation of Servicing Requirements (Section 4.4):** The authors perform an ablation study comparing the standard task-conditional swapping setting (where lightweight non-target parameters like biases and layer norms are swapped at test-time) with a truly task-agnostic setting (where non-target parameters are fixed to pre-trained base values). GSC-Merge is shown to be robust, matching unconstrained performance in both settings.
+- **Thorough Empirical Validation of Hypotheses (Appendices):**
+  1. **Singular Value Decay Analysis (Appendix B):** Extracts updates across representative layers and computes cumulative energy ratios, showing that a fractional rank of $\gamma = 0.3$ captures between $90.79\%$ and $97.71\%$ of the joint update energy. This directly validates the low-rank Grassmannian consensus hypothesis.
+  2. **Projection Direction pilot study (Appendix C):** Compares output-space projection (left SVD) with input-space projection (right SVD) and bilateral projection, providing clear empirical evidence for output-space coordinate alignment.
+  3. **Computational Scalability benchmarks (Appendix A):** Tests exact SVD vs. Randomized SVD on CPU for LLaMA-7B sized layers, demonstrating a $23.56\times$ speedup with under $2.5\%$ relative reconstruction error.
+
+## Honesty and Discussion of Limitations
+- **Catastrophic Interference and Remaining Performance Gap:** The authors are highly transparent and honest about the limitations of model merging. In Section 4.3, they explicitly discuss the remaining performance gap between GSC-Merge ($42.13\%$) and the expert ceiling ($74.96\%$), noting that compressing multiple highly conflicting manifolds into a single static set of weights inevitably incurs a loss in expressive capacity.
+- **Proposed Mitigation (Appendix D.2):** To address this gap, the authors propose a hybrid routing framework, **GSC-Route**, which routes inputs dynamically inside the low-rank Grassmannian consensus subspace, combining parameter efficiency with input-dependent flexibility.
+
+## Key Areas of Improvement and Empirical Nuances
+- **The Mean Generalization Over-Claim:** While the paper argues that GSC-Merge resolves the "Overfitting-Optimizer Paradox" and "substantially boosts out-of-distribution generalizability on unseen test data," a close look at the tables reveals that GSC-Merge does *not* actually achieve higher mean test accuracy than unconstrained OFS-Tune in either Table 1 or Table 2.
+  - In Table 1 (Task-Conditional Swapping), unconstrained OFS-Tune achieves a joint mean accuracy of $44.08 \pm 4.31\%$, whereas the best GSC-Merge configuration ($\gamma=0.5$) achieves $43.88 \pm 4.07\%$, and GSC-Merge ($\gamma=0.3$) achieves $42.13 \pm 2.76\%$.
+  - In Table 2 (Truly Task-Agnostic setting), unconstrained OFS-Tune achieves $20.86 \pm 4.81\%$, while GSC-Merge ($\gamma=0.5$) achieves $20.61 \pm 4.80\%$.
+  While GSC-Merge successfully reduces the variance across calibration splits (e.g., standard deviation of $\pm 2.76\%$ at $\gamma=0.3$ compared to $\pm 4.31\%$ for unconstrained), it does so at the cost of slightly lower mean performance. This indicates a minor underfitting/representation bias from the low-rank projection. The authors' claim that GSC-Merge "resolves" the Overfitting-Optimizer Paradox by boosting out-of-distribution generalizability is therefore slightly overstated or at least needs to be reframed as a classic bias-variance trade-off (trading a small drop in average accuracy for a major reduction in split-sensitivity variance).
+- **Evaluating on More Modern Backbones:** Vision Transformer (ViT-Tiny) is a relatively small model. While the authors include Randomized SVD CPU benchmarks on a LLaMA-7B sized layer in the appendix to prove computational scalability, actually evaluating the end-to-end multi-task merging accuracy on larger models (such as ViT-Base, ViT-Large, or LLaMA models) would significantly strengthen the empirical claims of the paper.
+
+## Conclusion on Empirical Evaluation
+The empirical evaluation is **exemplary**. It goes far beyond standard model-merging papers by conducting a rigorous multi-seed statistical analysis, providing extensive empirical validation of mathematical hypotheses in the appendices, and maintaining complete honesty regarding the inherent limits and performance gaps of weight-space merging.

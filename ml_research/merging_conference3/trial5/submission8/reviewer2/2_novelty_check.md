@@ -1,0 +1,21 @@
+# 2. Novelty Check
+
+## Key Novel Aspects
+The paper introduces several creative design aspects:
+1. **The Biological Metaphor (Epigenetic Regulation):** Translating the biological concept of epigenetics (modulating gene expression dynamically without altering the DNA) to deep parameter space. The base model weights act as the static genome, and the row-wise/column-wise gating masks act as epigenetic markers that reversibly scale the "expression" of specialized expert task vectors on-the-fly based on input-specific environmental signals.
+2. **Low-Rank Dual-Masking Coordinate Gating ($G = \sum \mathbf{r} \otimes \mathbf{c}$):** Instead of learning a single scalar routing coefficient per task (like QWS-Merge or Linear Router) or generating a massive full-rank gating mask of shape $[D_{out}, D_{in}]$ (which causes a parameter explosion), the authors propose generating row-wise and column-wise gating masks via highly parameter-efficient Epigenetic Reader Heads (ERHs). Taking their low-rank outer product creates fine-grained, coordinate-wise gating of the expert task vectors.
+3. **True Sample-Wise Parallelization via `torch.einsum`:** Existing dynamic merging methods either average coefficients across the batch (batch-averaged transductive coupling) or serialize inference. EpiMerge executes a true sample-wise dynamic ensembling pass in parallel across a mixed batch using vectorized tensor contractions.
+
+## Delta from Prior Work
+The proposed method is positioned relative to three main paradigms:
+- **Static Merging (Task Arithmetic, TIES, OFS-Tune):** Static methods are zero-overhead but force a single parameter compromise for all test inputs. EpiMerge is fully dynamic, reconstructing custom weights for each individual sample at inference time.
+- **Test-Time Adaptation (AdaMerging):** AdaMerging performs iterative unsupervised gradient updates at test-time to optimize merging coefficients. EpiMerge is training-free and fully feed-forward during inference, which protects it from the distribution-shift collapses and transductive overfitting that plague online TTA methods.
+- **Batch-Ensembled Dynamic Routers (QWS-Merge):** Routers like QWS-Merge calculate sample-wise weights but average them across the batch to execute standard linear layer passes. EpiMerge completely avoids this batch-averaging shortcut and transductive batch coupling, ensuring that the prediction of sample $x_b$ is mathematically independent of other samples in the batch.
+- **Hypernetworks:** Standard Hypernetworks use an external network to directly predict high-dimensional weights, resulting in a massive parameter footprint. EpiMerge achieves high-dimensional coordinate-wise gating of *existing pre-trained experts* using low-rank outer products, requiring very few learnable parameters ($<0.1\%$ of the model size).
+
+## Characterization of Novelty
+The novelty of EpiMerge is **moderate-to-significant**. 
+- **Conceptually:** The biological framing of epigenetics is compelling, and mapping row/column scaling coordinates to molecular markers provides an elegant narrative.
+- **Mathematically:** The low-rank formulation is a creative adaptation of LoRA-like low-rank parameterizations. Instead of learning static additive low-rank updates (like LoRA, DoRA), EpiMerge learns dynamic, input-conditioned low-rank scaling masks that modulate existing, frozen expert task vectors. This is a subtle but technically sound distinction.
+- **Systems-wise:** The formulation of the forward pass using nested `torch.einsum` contractions to maintain GPU concurrency for sample-wise custom weights is technically rigorous.
+- **Critique of Novelty:** While the combination of low-rank decomposition, input-conditioned ensembling, and frozen feature extraction is technically novel, it is constructed entirely from established deep learning primitives (Sigmoids, low-rank outer products, frozen base network, and `torch.einsum`). The core concept of input-dependent model ensembling via routers is well-studied. Thus, while highly creative and carefully executed, the mathematical novelty is somewhat evolutionary rather than revolutionary, representing a specific and elegant low-rank coordinate gating instance of dynamic neural ensembling.

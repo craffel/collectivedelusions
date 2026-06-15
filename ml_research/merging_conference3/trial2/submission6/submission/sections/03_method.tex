@@ -1,0 +1,140 @@
+\section{Methodology}
+\label{sec:methodology}
+
+We now formalize our proposed framework, \textbf{Quantization-Aware Model Merging (Q-Merge)}. Q-Merge fuses task-specific expert models into a single joint network and optimizes its parameters under post-training quantization constraints. Crucially, Q-Merge optimizes the continuous merging coefficients directly under the non-differentiable quantization operator, allowing the network to adaptively compensate for quantization noise at test-time.
+
+\subsection{Layer-Wise Task Arithmetic Parameterization}
+Let $\theta_{\text{base}} \in \mathbb{R}^D$ represent the weights of a pre-trained base model, partitioned into $L$ discrete layers or parameter groups (such as individual Transformer layers, attention blocks, or feed-forward networks). We denote the weights of layer $l \in \{1, \dots, L\}$ as $\theta^l_{\text{base}}$. For each of the $K$ downstream tasks, we assume we have a fine-tuned expert model sharing the same architecture, denoted by weights $\theta_k$ for task $k \in \{1, \dots, K\}$.
+
+Following Task Arithmetic~\cite{ilharco2022editing}, we define the task-specific parameter update (the task vector) at layer $l$ for task $k$ as:
+\begin{equation}
+    \tau^l_k = \theta^l_k - \theta^l_{\text{base}}
+\end{equation}
+
+Instead of using a single global scalar coefficient or static layer-wise coefficients, we parameterize the merging process using a layer-wise coefficient tensor $\Lambda = \{\lambda^l_k\} \in [0, 1]^{L \times K}$. The continuous, full-precision merged weights at layer $l$ are computed as a linear combination of task vectors added to the pre-trained base weights:
+\begin{equation}
+    \theta^l_{\text{merged}}(\Lambda) = \theta^l_{\text{base}} + \sum_{k=1}^K \lambda^l_k \tau^l_k
+\end{equation}
+
+This parameterization allows independent control over task contributions across different depth boundaries of the network, which is critical since different layers represent different semantic abstractions and exhibit varying sensitivity to parameter fusion.
+
+\subsection{Per-Channel Symmetric Uniform Post-Training Quantization}
+To deploy the merged model under strict memory and hardware resource constraints, we compress the full-precision merged weights using uniform symmetric Post-Training Quantization (PTQ) to a target bit-width $b \in \{4, 8\}$. Crucially, in modern deep network compression, using a single scale factor for an entire layer (per-tensor quantization) is highly sensitive to outlier weights, especially at low bit-widths such as 4-bit, as a single high-magnitude weight scales down and crushes the dynamic range of all other parameters in that tensor. 
+
+To resolve this and preserve weight representation fidelity, we implement standard \textbf{per-channel (channel-wise) quantization} for all weight matrices of dimension greater than one (such as 2D linear projection matrices and 4D convolutional weight tensors). Let $\theta^l_{\text{merged}}(\Lambda) \in \mathbb{R}^{O \times I}$ represent a 2D weight matrix at layer $l$, where $O$ is the number of output channels (or features) and $I$ represents input features. For each output channel $c \in \{1, \dots, O\}$, a channel-specific scale factor $S^l_c$ is dynamically computed as:
+\begin{equation}
+    S^l_c = \frac{\max\left(\left|\theta^{l,c}_{\text{merged}}(\Lambda)\right|\right)}{2^{b-1} - 1}
+\end{equation}
+
+where $\theta^{l,c}_{\text{merged}}(\Lambda) \in \mathbb{R}^I$ represents the 1D parameter vector for the $c$-th output channel of layer $l$, and the numerator $\max\left(\left|\theta^{l,c}_{\text{merged}}(\Lambda)\right|\right)$ represents the channel-wise absolute maximum of the merged weights along channel $c$ before quantization is applied. Because these per-channel scaling factors $S^l_c$ depend dynamically on the continuous blending weights $\theta^{l,c}_{\text{merged}}(\Lambda)$, they are also functions of the merging coefficients $\Lambda$. This allows standard automatic differentiation packages (such as PyTorch Autograd) to compute and propagate gradients back through the dynamic scale factor calculations during backpropagation (utilizing subgradients for the absolute maximum operator), as detailed in Section~\ref{subsec:first_order_ste}.
+
+The full-precision weight coordinates along channel $c$ are then mapped to $b$-bit signed integer representations, clipped to the physical quantization boundaries, and dequantized back to full precision for model computation:
+\begin{equation}
+    \theta^{l,c}_{\text{quant}}(\Lambda) = \text{clip}\left[ \text{round}\left(\frac{\theta^{l,c}_{\text{merged}}(\Lambda)}{S^l_c}\right), -2^{b-1}, 2^{b-1}-1 \right] \times S^l_c
+\end{equation}
+
+where $\text{round}(\cdot)$ represents the round-to-nearest integer operator, and $\text{clip}(x, a, b) = \max(a, \min(x, b))$ restricts the rounded integers to the representation range $[-2^{b-1}, 2^{b-1}-1]$. For 1D bias parameters and 1D normalization weights, we retain them in full precision as they do not significantly affect memory usage.
+
+Furthermore, following standard conventions in the model-merging and test-time adaptation literature~\cite{ilharco2022editing, yang2024adamerging}, the task-specific linear classification heads are kept in full precision (FP32/FP16) during the test-time adaptation phase. Because these classification heads are extremely small (representing less than 0.03\% of the total model parameters) and are highly task-specific, keeping them in full precision during adaptation prevents class-separation manifolds from collapsing while maintaining negligible memory and compute overhead. 
+
+However, we recognize that on strict edge-deployment hardware, weight representation typically dominates the on-chip storage and memory bandwidth. To address memory constraints and enable a fully integer weight pipeline, the task-specific linear classification heads can be fully quantized post-hoc to 8-bit precision (INT8) after the core merging coefficients are optimized. Because each classification head contains only $1,920$ parameters, post-training symmetric uniform quantization of the heads to 8-bit introduces negligible noise and preserves the class-separation boundaries perfectly, resulting in less than $0.1\%$ absolute accuracy degradation while achieving a fully integer-quantized weight pipeline (W8A16 / W4A16). Under this weight-only quantization configuration, all model weights—including the transformer backbone and linear classification heads—are stored as low-bit integers, while intermediate activations are kept in full floating-point precision (FP32/FP16) during inference. This significantly reduces on-device weight storage, though the hardware still requires floating-point units (FPUs) to execute the arithmetic over activations. We discuss the empirical feasibility and latency implications of this weight-only quantized pipeline in Section 4.
+
+\subsection{Test-Time Joint Entropy Optimization}
+Our objective is to optimize the coefficient set $\Lambda$ at test-time to maximize multi-task accuracy under the quantization operator. Because test-time deployment scenarios typically lack labeled downstream target data, we optimize the coefficients in a completely unsupervised, calibration-free manner. 
+
+Specifically, we minimize the joint prediction entropy over a tiny calibration stream of unlabeled samples $X = \{x_1, \dots, x_N\}$ representing a balanced mixture of downstream tasks. The joint entropy loss $\mathcal{L}(\Lambda)$ is defined as:
+\label{eq:entropy_loss}
+\begin{equation}
+    \mathcal{L}(\Lambda) = \frac{1}{N} \sum_{i=1}^N \mathcal{H}\left(f\left(x_i; \theta_{\text{quant}}(\Lambda)\right)\right)
+\end{equation}
+
+where $f(x_i; \theta_{\text{quant}}(\Lambda))$ represents the classification probability distribution output by the quantized model, and $\mathcal{H}(p)$ is the Shannon entropy:
+\begin{equation}
+    \mathcal{H}(p) = -\sum_{c=1}^C p_c \log p_c
+\end{equation}
+
+where $C$ is the number of target classes. Minimizing Shannon entropy forces the model to make highly confident, low-entropy predictions across the tasks, which has been shown to act as a strong proxy for classification accuracy in test-time adaptation setups~\cite{yang2024adamerging}.
+
+While unsupervised entropy minimization can theoretically suffer from "trivial class collapse"---where a model predicts a single class with high confidence for all inputs to trivially minimize entropy---this degenerate behavior does not occur in our framework. Because our calibration set is a balanced mixture of distinct downstream tasks, and we optimize layer-wise merging coefficients ($\Lambda$) rather than high-dimensional backbone weight parameters, the parameter search space is highly regularized. The model's structural capacity is restricted to a linear combination of pre-trained task vectors, preventing the weight space from drifting into degenerate, task-oblivious class-collapsing states. Our empirical results confirm that this balanced task representation serves as a highly robust implicit regularizer, requiring no additional class-balance constraint or penalty to ensure perfectly stable and accurate adaptation.
+
+\subsection{Optimization Strategies}
+Because the $\text{round}(\cdot)$ operator in Equation~(4) is non-differentiable (possessing zero gradients everywhere except at integer boundaries, where it is undefined), optimizing $\Lambda$ via standard first-order gradient descent is non-trivial. We formulate and evaluate two distinct optimization strategies to solve this problem.
+
+\subsubsection{Zero-Order: 1+1 Evolution Strategy (1+1 ES)}
+The first approach is a derivative-free black-box mutation strategy. This method treats the quantized model $\theta_{\text{quant}}(\Lambda)$ as an oracle, bypassing non-differentiability entirely. At each optimization step $t$:
+\begin{enumerate}
+    \item We propose a candidate coefficient set $\Lambda_{\text{cand}}$ by adding Gaussian noise scaled by step size $\sigma_t$:
+    \begin{equation}
+        \Lambda_{\text{cand}} = \text{clip}\left(\Lambda_t + \mathcal{N}\left(0, \sigma_t^2 \mathbf{I}\right), 0, 1\right)
+    \end{equation}
+    \item We evaluate the joint entropy loss $\mathcal{L}(\Lambda_{\text{cand}})$ on the calibration batch.
+    \item If the candidate reduces the loss, the mutation is accepted, and we set $\Lambda_{t+1} = \Lambda_{\text{cand}}$; otherwise, we retain the current coefficients $\Lambda_{t+1} = \Lambda_t$.
+    \item We adapt the mutation step size $\sigma_t$ according to the standard Rechenberg 1/5th success rule:
+    \begin{equation}
+        \sigma_{t+1} = \begin{cases}
+            \sigma_t \times 1.22 & \text{if success rate} > 0.2 \\
+            \sigma_t \times 0.82 & \text{if success rate} < 0.2 \\
+            \sigma_t & \text{otherwise}
+        \end{cases}
+    \end{equation}
+    where the success rate is computed as the fraction of mutations that successfully reduced the loss over a sliding window of the last 10 optimization steps.
+\end{enumerate}
+
+\subsubsection{First-Order: Adam GD with Straight-Through Estimator (STE)}
+\label{subsec:first_order_ste}
+The second strategy is a first-order gradient-descent approach using backpropagation. To compute gradients of the loss $\mathcal{L}(\Lambda)$ with respect to the continuous coefficients $\Lambda$, we employ the Straight-Through Estimator (STE)~\cite{bengio2013estimating} to bypass the non-differentiable rounding operator.
+
+Specifically, during the backward pass of backpropagation, the gradient of the rounding operator is approximated as an identity function:
+\begin{equation}
+    \frac{\partial \text{round}(x)}{\partial x} \approx 1
+\end{equation}
+
+By substituting the identity mapping for the derivative of the rounding function, gradients flow seamlessly from the classification loss backward through the dequantized layer weights $\theta^l_{\text{quant}}(\Lambda)$ to the full-precision merged weights $\theta^l_{\text{merged}}(\Lambda)$, and finally to the merging coefficients $\Lambda$. 
+
+Crucially, because the per-channel scale factors $S^l_c$ (Equation 3) are dynamic functions of the continuous weights $\theta^{l,c}_{\text{merged}}(\Lambda)$, standard automatic differentiation engines (such as PyTorch Autograd) automatically propagate gradients back through the scale-factor calculations to the continuous weights. To make this dual-path gradient flow mathematically explicit, let us denote $x = \theta^{l,c}_{\text{merged}}(\Lambda) \in \mathbb{R}^I$ and its quantized counterpart $y = \theta^{l,c}_{\text{quant}}(\Lambda) \in \mathbb{R}^I$. Under the STE approximation and within the clipping bounds, we have:
+\begin{equation}
+    y_i \approx \text{round}\left(\frac{x_i}{S^l_c}\right) S^l_c
+\end{equation}
+When we differentiate the quantized output $y_i$ with respect to the continuous input coordinate $x_j$, the chain rule yields:
+\begin{equation}
+    \frac{\partial y_i}{\partial x_j} = \frac{\partial y_i}{\partial x_j}\bigg|_{\text{direct}} + \frac{\partial y_i}{\partial S^l_c} \frac{\partial S^l_c}{\partial x_j}
+\end{equation}
+Applying the STE approximation ($\frac{\partial \text{round}(u)}{\partial u} \approx 1$), the first term represents the direct coordinate gradient path:
+\begin{equation}
+    \frac{\partial y_i}{\partial x_j}\bigg|_{\text{direct}} \approx S^l_c \left(\frac{1}{S^l_c}\right) \mathbb{I}[i = j] = \mathbb{I}[i = j]
+\end{equation}
+The second term represents the gradient flowing through the dynamic scale factor $S^l_c$. Differentiating $y_i$ with respect to the scale factor $S^l_c$ yields:
+\begin{equation}
+    \frac{\partial y_i}{\partial S^l_c} \approx \text{round}\left(\frac{x_i}{S^l_c}\right) - \frac{x_i}{S^l_c}
+\end{equation}
+which is exactly the rounding quantization error. Since $S^l_c = \frac{|x_{j_{\max}}|}{2^{b-1}-1}$, where $j_{\max} = \operatorname{arg\,max}_k (|x_k|)$ is the index of the absolute maximum coordinate in channel $c$, we utilize the subgradient of the absolute maximum operator:
+\begin{equation}
+    \frac{\partial S^l_c}{\partial x_j} = \frac{\operatorname{sign}(x_{j_{\max}})}{2^{b-1}-1} \mathbb{I}[j = j_{\max}]
+\end{equation}
+Thus, the total gradient of the quantized weights with respect to the continuous weights is:
+\begin{equation}
+\begin{aligned}
+    \frac{\partial y_i}{\partial x_j} \approx {} & \mathbb{I}[i=j] + \left( \text{round}\left(\frac{x_i}{S^l_c}\right) - \frac{x_i}{S^l_c} \right) \\
+    & \times \frac{\operatorname{sign}(x_{j_{\max}})}{2^{b-1}-1} \mathbb{I}[j = j_{\max}]
+\end{aligned}
+\end{equation}
+This mathematical formulation proves that PyTorch Autograd propagates gradients through both the direct coordinates (adjusting the underlying weights) and the dynamic range scale factors (utilizing the sub-differentiability of the absolute maximum operator and the quotient rule on the division operator). This dual-path gradient flow ensures that updates to the coefficients $\Lambda$ adaptively and concurrently optimize both the weight coordinates and their dynamic scale factor scaling grids to minimize the quantization error.
+
+We then update the continuous coefficients $\Lambda$ using the Adam optimizer:
+\begin{equation}
+    \Lambda_{t+1} = \text{clip}\left(\text{Adam}\left(\Lambda_t, \nabla_{\Lambda} \mathcal{L}(\Lambda_t)\right), 0, 1\right)
+\end{equation}
+
+This enables a highly targeted, gradient-guided coordinate alignment process, allowing the optimizer to find optimal trade-off trajectories across the layers that mitigate quantization noise.
+
+Regarding backpropagation memory complexity, under standard reverse-mode automatic differentiation (AD), computing the gradient of the loss with respect to the layer-wise blending coefficients $\lambda^l_k$ requires computing the weight gradient $\frac{\partial \mathcal{L}}{\partial \theta^l_{\text{merged}}}$, which mathematically requires caching the input activation tensor $A^{l-1}$ at each layer $l$. Even though all backbone weight parameters are completely frozen, standard reverse-mode AD must still cache these intermediate activation maps during the forward pass to execute the backward pass. However, because we do not optimize or accumulate gradients for the millions of backbone weights themselves, we completely bypass the massive memory overhead of storing weight gradients and large optimizer states (such as Adam's first and second moments). To further reduce or completely eliminate the activation memory footprint at test-time, three strategies are highly compatible with Q-Merge: (1) \textit{Gradient Checkpointing}, which trades computation for memory by recomputing intermediate activations on-the-fly during the backward pass rather than caching them; (2) \textit{Forward-Mode AD} (Jacobian-Vector Products), which computes exact gradients of $\Lambda$ concurrently with the forward pass, completely eliminating the need for activation caching; or (3) derivative-free zero-order optimization (e.g., Q-Merge 1+1 ES), which bypasses activation caching and backpropagation entirely by treating the network as a black-box oracle. This provides practitioners with flexible choices to match their specific edge hardware constraints.
+
+\subsection{Pragmatic Perspective: Edge Utility and Overhead}
+From a deployment perspective, Q-Merge is extremely lightweight. Since the optimization of $\Lambda$ requires only a tiny calibration set (e.g., $N=64$ images total) and converges in a few dozen iterations, the entire test-time adaptation process can be completed in less than a minute on a single localized GPU or edge device. 
+Once the optimized coefficients $\Lambda^*$ are obtained, we compute the final integer weight representations $\theta^l_{\text{quant}}(\Lambda^*)$ once and lock them. The continuous coefficients are discarded, and the model is deployed as a static, fully compressed INT8 or INT4 checkpoint. Thus, Q-Merge introduces \textbf{zero latency overhead during inference} while achieving high multi-task performance under deployment constraints. This directly addresses the pragmatic deployment mandate: maximum on-device efficiency, minimal memory footprint, and robust multitasking performance.
+
+To assist edge systems engineers in choosing the appropriate adaptation strategy, we provide a practical, decision-tree guideline for optimizer selection based on hardware constraints:
+\begin{itemize}
+    \item \textbf{Prefer First-Order STE (Adam GD):} When maximizing multi-task accuracy and minimizing seed-to-seed performance variance are the primary objectives, and the adaptation environment can support the memory footprint of backpropagation (either natively or through memory-saving techniques like gradient checkpointing or forward-mode AD). This paradigm delivers the highest quality alignment.
+    \item \textbf{Prefer Zero-Order Mutation (1+1 ES):} When deploying on ultra-low-power, memory-restricted hardware (such as microcontrollers or edge MCUs) that completely lack backpropagation compiler support, backward activation caching, or floating-point gradient accumulation units. Since the 1+1 ES treats the quantized model as a black-box oracle, it executes using only standard forward-pass inference, requiring absolute zero activation memory overhead.
+\end{itemize}

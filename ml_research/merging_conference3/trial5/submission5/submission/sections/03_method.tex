@@ -1,0 +1,122 @@
+\section{Methodology}
+\label{sec:method}
+
+We detail the multi-task model-merging paradigm, mathematically deconstruct QWS-Merge, present our proposed Layer-wise Low-dimensional Classical Router (L3-Router), and prove the layer-averaging collapse phenomenon.
+
+\subsection{Multi-Task Model Merging Formulation}
+Let $W_{base}^{(l)}$ represent the pre-trained parameters of a base network at layer $l \in \{1, \dots, L\}$. Suppose we have independently fine-tuned this network on $K$ distinct tasks, yielding experts with weights $W_k^{(l)}$ for $k \in \{1, \dots, K\}$. The task vectors are:
+\begin{equation}
+    V_k^{(l)} = W_k^{(l)} - W_{base}^{(l)}
+\end{equation}
+During dynamic merging, the weights of the multi-task model are dynamically assembled as a linear combination of task vectors added back to the base weights. For an input batch $x$, the merged weight matrix at layer $l$ is:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k(l) V_k^{(l)}
+\end{equation}
+where $\bar{\alpha}_k(l) \in \mathbb{R}$ is the dynamic merging coefficient for task $k$ at layer $l$, computed as the average of sample-wise coefficients across a batch of size $B$:
+\begin{equation}
+    \bar{\alpha}_k(l) = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}(l)
+\end{equation}
+
+\subsection{Input State Projection and Initialization}
+To avoid overfitting under severe data scarcity, the input feature representation is first compressed. Let $z(x)_b \in \mathbb{R}^D$ be the globally pooled representation from the first block of the backbone for sample $b$. We project $z(x)_b$ into a $d$-dimensional space (where $d = K = 4$) via a frozen, unsupervised PCA projection matrix $P \in \mathbb{R}^{D \times d}$ and normalize onto the unit sphere to form the input state $\psi(x)_b$:
+\begin{equation}
+    \psi(x)_b = \frac{z(x)_b P}{\|z(x)_b P\|_2 + \epsilon} \in \mathbb{R}^d
+\end{equation}
+where $\epsilon = 10^{-8}$ is a stability constant. While PCA over a small unlabeled split is highly robust, $P$ is extremely flexible and can be initialized in zero-shot or unsupervised ways:
+\begin{enumerate}
+    \item \textbf{Random Projection (JL):} Initializing $P$ as a frozen random Gaussian matrix, preserving pairwise distances mathematically without requiring data.
+    \item \textbf{Cluster Centroids:} Setting $P$ using cluster centroids of frozen self-supervised models (e.g., DINOv2) trained on web-scale datasets.
+    \item \textbf{Zero-Shot Text Prompt Projections:} Constructing $P$ from the text embeddings of natural language task descriptions, as detailed in Appendix~\ref{sec:roadmap_app}.
+    \item \textbf{Dynamic Online Covariance Updates:} Under non-stationary stream shifts, $P$ can be updated dynamically online via online incremental PCA, or a frozen random projection can bypass representation drift entirely.
+\end{enumerate}
+
+To handle non-stationary task streams where the test distribution shifts over time (e.g., tasks appearing sequentially), a static projection matrix $P$ may suffer from coordinate misalignment due to representation drift. To mitigate this, we propose two elegant methodologies:
+\begin{itemize}
+    \item \textbf{Online Incremental PCA:} As each test batch $X_t = [z(x)_{1}, \dots, z(x)_{B}]^T \in \mathbb{R}^{B \times D}$ arrives at time step $t$, we update the running feature mean $\mu_t \in \mathbb{R}^D$ and covariance matrix $\Sigma_t \in \mathbb{R}^{D \times D}$ recursively using a temporal discount factor $\eta \in (0, 1)$:
+    \begin{align}
+        \mu_t &= (1 - \eta) \mu_{t-1} + \eta \bar{X}_t, \\
+        \Sigma_t &= (1 - \eta) \Sigma_{t-1} + \eta (X_t - \mu_t)^T (X_t - \mu_t)
+    \end{align}
+    where $\bar{X}_t \in \mathbb{R}^D$ is the batch-wise mean. We then perform a fast power iteration update on the top $d$ eigenvectors of $\Sigma_t$, yielding a slowly-adapting projection matrix $P_t$ that traces the drift of representation coordinates.
+    \item \textbf{Johnson-Lindenstrauss Bypassing:} Alternatively, a frozen random Gaussian projection matrix $P \in \mathbb{R}^{D \times d}$ (where elements $P_{i,j} \sim \mathcal{N}(0, 1/d)$) completely bypasses representation drift. Since the Johnson-Lindenstrauss lemma guarantees that pairwise distances of input features are preserved within a distortion factor of $(1\pm\epsilon)$ regardless of task distribution stationarity, the relative geometric positions of task clusters remain stable on the unit sphere. This allows classical linear routers to generalize seamlessly across temporal task-clustering shifts with zero online adaptation overhead.
+\end{itemize}
+
+To qualitatively analyze how these two mitigations behave under sequential task arrival (where tasks appear one-by-one in the inference stream): Online Incremental PCA actively updates the projection matrix $P_t$ to slowly track representation coordinate drift. Under sequential task shifts, the active coordinates dynamically rotate to align with the active task's feature subspace, maintaining high-contrast routing coefficients. However, this active update introduces a latency lag during sudden domain transitions (causing temporary routing errors as the power iteration converges) and carries a risk of catastrophic subspace collapse if the stream remains highly homogeneous for extended periods (since the top eigenvectors will compress to represent only the active task subspace, losing orthogonal tracking of other tasks). In contrast, Johnson-Lindenstrauss (JL) Bypassing avoids this online adaptation overhead and representation collapse entirely. By utilizing a frozen, randomized projection matrix, the geometric boundaries of all task subspaces are permanently preserved in a low-dimensional space. Under sequential task shifts, the classical router immediately maps the features to correct task-specific coefficients without any lag, providing instantaneous generalization across non-stationary stream shifts at the cost of a slight, static distortion in the input representations.
+
+\subsection{Deconstructing QWS-Merge via Classical Alternatives}
+In QWS-Merge~\cite{qwsmerge}, the merging coefficients are formulated as a quantum superposition that collapses based on a wave cosine activation:
+\begin{equation}
+    \alpha_{k, b}^{QWS}(l) = R_{l, k} \cos\left( \pi \langle \psi(x)_b, \hat{\Phi}_{l, k} \rangle + \phi_{l, k} \right)
+\end{equation}
+where $\Phi_l \in \mathbb{R}^{K \times d}$ is a trainable state projection matrix with unit-norm basis vector $\hat{\Phi}_{l, k}$, $R_{l, k} \in \mathbb{R}$ is a trainable amplitude scale, and $\phi_{l, k} \in \mathbb{R}$ is a trainable phase alignment. We observe that this cosine function primarily acts as a non-monotonic activation function that bounds coefficients in $[-R_{l, k}, R_{l, k}]$. The entire wavefunction metaphor is, in fact, an over-parameterized way of performing bounded dynamic routing.
+
+To isolate whether this quantum formulation provides any genuine modeling advantage, we propose the Layer-wise Low-dimensional Classical Router (L3-Router). Operating on the exact same unit-projected low-dimensional input state $\psi(x)_b$, the L3-Router projects representations linearly to task-merging coefficients. Let $W_{l, k} \in \mathbb{R}^d$ and $B_{l, k} \in \mathbb{R}$ be the trainable weight and bias. We formulate three classical alternative routing channels:
+\begin{enumerate}
+    \item \textbf{L3-Linear Routing:} A purely linear projection:
+    \begin{equation}
+        \alpha_{k, b}^{Linear}(l) = \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k}
+    \end{equation}
+    \item \textbf{L3-Tanh Routing (Bounded Classical):} Bounding coefficients within $[-1, 1]$ smoothly and monotonically:
+    \begin{equation}
+        \alpha_{k, b}^{Tanh}(l) = \tanh\left( \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k} \right)
+    \end{equation}
+    \item \textbf{L3-Softmax Routing (Normalized Classical):} Treating coefficients as a probability distribution on the simplex:
+    \begin{equation}
+        \boldsymbol{\alpha}_{:, b}^{Softmax}(l) = \text{Softmax}\left( \mathbf{W}^{(l)} \psi(x)_b + \mathbf{B}^{(l)} \right)
+    \end{equation}
+\end{enumerate}
+
+To ensure complete structural symmetry in our deconstruction, we also explicitly formalize the global, single-layer classical \textbf{Linear Router} baseline. This model bypasses both the low-dimensional projection $\psi(x)_b$ and layer-wise specialization, mapping the high-dimensional global representation $z(x)_b \in \mathbb{R}^D$ directly to a $K$-dimensional score space via a single linear layer:
+\begin{equation}
+    \boldsymbol{\alpha}_{:, b}^{Global}(l) = \text{Softmax}\left( \mathbf{W}^{Global} z(x)_b + \mathbf{B}^{Global} \right) \in \mathbb{R}^K \quad \forall l \in \{1, \dots, L\}
+\end{equation}
+Specifically, for task $k \in \{1, \dots, K\}$ and sample $b$, the global classical Linear Router coefficient at any layer $l \in \{1, \dots, L\}$ is computed as:
+\begin{equation}
+    \alpha_{k, b}^{Global}(l) = \frac{\exp\left( \langle z(x)_b, \mathbf{W}^{Global}_{k, :} \rangle + \mathbf{B}^{Global}_k \right)}{\sum_{j=1}^K \exp\left( \langle z(x)_b, \mathbf{W}^{Global}_{j, :} \rangle + \mathbf{B}^{Global}_j \right)}
+\end{equation}
+where $\mathbf{W}^{Global} \in \mathbb{R}^{K \times D}$ and $\mathbf{B}^{Global} \in \mathbb{R}^K$ are the trainable global weight matrix and bias vector, and $\mathbf{W}^{Global}_{k, :}$ represents the $k$-th row of the weight matrix. This baseline represents the simplest possible dynamic routing model, mapping inputs directly to a single unified classification coefficient vector repeated identically across all $L$ layers. By explicitly providing both the vector and element-wise forms, we ensure perfect structural and algebraic symmetry with our proposed L3-Router formulations.
+
+\begin{table}[h]
+\centering
+\caption{Parameter footprint comparison between dynamic routing architectures for $L=14$ layers, $K=4$ tasks, and $d=4$.}
+\label{tab:param_count}
+\begin{tabular}{lllc}
+\toprule
+\textbf{Router Model} & \textbf{Trainable Parameters} & \textbf{Parameter Shape} & \textbf{Total Params} \\
+\midrule
+QWS-Merge & Basis ($\Phi_l$), Amp ($R$), Phase ($\phi$) & $(L \times K \times d) + 2(L \times K)$ & 336 \\
+L3-Router (Ours) & Weight vectors ($W$), Biases ($B$) & $(L \times K \times d) + (L \times K)$ & \textbf{280} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Complexity and Regularization}
+As shown in Table~\ref{tab:param_count}, the L3-Router reduces the dynamic parameter footprint by \textbf{16.7\%} (saving exactly 56 parameters, from 336 down to 280) compared to QWS-Merge. While this absolute saving is practically negligible relative to the backbone model's parameter scale (meaning it does not offer hardware-level memory savings), this relative reduction is of high theoretical and structural significance. It proves that classical linear routing achieves superior dynamic capacity without requiring any auxiliary amplitude or phase variables, which are functionally redundant. 
+
+The primary failure mode of unconstrained classical routing in data-scarce splits (64 samples) is overfitting. We train the router parameters ($W$ and $B$) by minimizing the cross-entropy loss augmented with classical $L_2$ weight decay (regularization):
+\begin{equation}
+    \mathcal{L}_{total} = \mathcal{L}_{CE} + \lambda_{wd} \sum_{l=1}^L \sum_{k=1}^K \left( \|W_{l, k}\|_2^2 + B_{l, k}^2 \right)
+\end{equation}
+We hypothesize that introducing this simple classical regularization is the actual driver of out-of-distribution robustness, completely negating any claimed benefit of quantum wave phase-interference.
+
+\subsection{The Mathematics of Layer-Averaging Collapse}
+\label{subsec:layer_avg_collapse}
+In dynamic model merging designed for single-head classifiers, the final classification head is merged using the average coefficient across layers:
+\begin{equation}
+    \bar{\alpha}_k = \frac{1}{L} \sum_{l=1}^L \alpha_{l, k}
+\end{equation}
+We mathematically expose a major structural flaw in this design. In linear routing, layer-wise coefficients are:
+\begin{equation}
+    \alpha_{l, k} = \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k}
+\end{equation}
+Substituting this into the averaging formula yields:
+\begin{equation}
+    \bar{\alpha}_k = \frac{1}{L} \sum_{l=1}^L \left( \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k} \right) = \langle \psi(x)_b, W_{eff, k} \rangle + B_{eff, k}
+\end{equation}
+where:
+\begin{equation}
+    W_{eff, k} = \frac{1}{L} \sum_{l=1}^L W_{l, k}, \quad B_{eff, k} = \frac{1}{L} \sum_{l=1}^L B_{l, k}
+\end{equation}
+This proof demonstrates that averaging $L$ layer-wise coefficients together is mathematically identical to a single-layer router with effective weights $W_{eff, k}$ and biases $B_{eff, k}$. Consequently, the multi-layer routing parameter space collapses to a single-layer routing space, making the $L$ layer-wise parameters completely redundant and introducing massive optimization noise. 
+
+This collapse occurs when coefficients are averaged to merge a single, unified global head. This is distinct from true layer-by-layer weight merging (e.g., merging LLM self-attentions), where weights are merged layer-wise via unique layer-specific coefficients without averaging. However, when evaluating on classification heads, layer-averaging collapse renders multi-layer routing redundant. This explains why a simple, global single-layer Linear Router baseline systematically outperforms all unregularized multi-layer routers, a critical methodological confounder that we empirically expose in Section~\ref{sec:experiments}.

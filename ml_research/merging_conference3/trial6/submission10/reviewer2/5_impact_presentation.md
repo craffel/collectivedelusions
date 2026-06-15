@@ -1,0 +1,21 @@
+# 5. Impact and Presentation
+
+## Major Strengths
+1. **Simplicity and Elegance (A Champion of Minimalism):** The proposal of the **BSigmoid-Router** is a beautifully simple, elegant, and highly effective solution. It completely removes the complex, zero-sum competitive constraint of Softmax and replaces it with decoupled, independent sigmoid functions. This simple change yields a massive performance increase (from 19.10% to 25.50%), outperforming complex wave-interference models like QWS-Merge (21.80%). This is a brilliant example of a simple method solving a complex problem.
+2. **Exhaustive and Strong Baseline Comparison:** The paper compares against a robust set of seven baselines, including static (Task Arithmetic), dynamic (Linear Router, BL-Router), regularized, and complex state-of-the-art physics-inspired paradigms (QWS-Merge).
+3. **Rigorous, Honest, and Self-Critical Empirical Inquest:** Sections 4.4 and 4.5 exhibit an extraordinary level of scientific integrity. Rather than hiding or glossing over the fact that their proposed TCPR regularizer does not work, the authors provide a rigorous deconstruction of why it fails (scale mismatch, alignment-interference paradox, static-dynamic conflict). This honest deconstruction is highly valuable to the community.
+4. **Realistic Low-Data Evaluation:** The 16 samples per task calibration regime is highly realistic and challenging, accurately simulating edge-AI constraints.
+
+## Areas for Improvement
+1. **Severe Narrative Inconsistency / Contradiction (Critical Issue):** The paper's framing (Title, Abstract, Introduction, Contributions) is in direct conflict with its actual experimental findings and conclusion. The abstract and intro claim that TCPR is a highly effective, robust, and scale-invariant regularizer that consistently prevents collapse. But the results and the authors' own analysis show that TCPR is either mathematically dead or actively harmful, and that the unregularized BSigmoid-Router is the best-performing model. The paper **must be completely reframed** to center on the simplicity and success of the BSigmoid-Router, and the deconstruction of unnecessary complexity (such as QWS-Merge and static prior regularizations like TCPR).
+2. **Lack of Multi-Seed Statistics:** The results in Table 1 are reported for only a single seed (`seed=42`). In low-data regimes with tiny calibration datasets and under-trained experts, results are highly volatile. Multiple seeds (e.g., 5 or 10) with mean and standard deviation are absolutely necessary to confirm the statistical significance of the results.
+3. **Limitation to Under-trained Experts:** The experts used are extremely sub-optimal (e.g., 23.20% on SVHN, 73.20% on MNIST). Evaluating only sub-optimal experts is a major limitation, as it is highly possible that the "Alignment-Interference Paradox" and the failure of TCPR are artifacts of this extreme parameter noise in under-trained models, rather than an intrinsic flaw of prior regularization in well-trained regimes. The paper needs to evaluate fully-converged experts as well.
+4. **Sensitivity of Scale Ceiling:** No ablation study is provided for the scale ceiling parameter ($\lambda_{\text{max}} = 0.3$).
+
+## Overall Presentation Quality
+- **Writing Style and Structure:** The paper is exceptionally well-written, with high mathematical rigor and beautiful formatting. The tables and equations are presented beautifully. The clarity of the descriptions in Section 3 is outstanding.
+- **Narrative Flow:** The narrative flow is logical, but as noted, it is severely compromised by the contradiction between the successful framing of TCPR in the front matter and its empirical deconstruction in the back matter.
+
+## Potential Impact and Significance
+- **Demystifying Complex Paradigms:** The paper has the potential to make a substantial impact on the model-merging community. By demonstrating that a very simple, decoupled sigmoidal router can outperform highly complex, physics-inspired wave-interference models (like QWS-Merge), it demystifies the field and champions elegant, simple solutions.
+- **Scientific Warning:** The deconstruction of why static prior regularizations fail provides a critical scientific warning that can steer future research away from ineffective complexity and toward more dynamic, sample-level regularizations.

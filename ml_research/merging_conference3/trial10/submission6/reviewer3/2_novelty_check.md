@@ -1,0 +1,19 @@
+# Intermediate Review Step 2: Novelty Check
+
+## Assessment of Key Novel Aspects
+The paper introduces several highly novel elements at the intersection of process control theory and machine learning systems:
+1. **Applying Discrete-Time Closed-Loop PID Control to Network Depth:** While prior work (e.g., ChemMerge, PAC-Kinetics, Momentum-Merge) attempted stateful ensembling, they operated in an open-loop fashion, treating depth as a continuous time dimension to solve continuous-time differential equations. PID-Merge is the first to model depth-wise weight propagation as a discrete-time closed-loop tracking problem, treating raw similarity weights as the setpoint and previous layer weights as the feedback loop.
+2. **Derivative-Anticipated Boundary Transition:** The use of the Derivative (D) term to measure tracking error acceleration at the network boundary ($L_{\text{frozen}}$) is conceptually brilliant. Because controller states are reset per query for multi-tenant security, the D term acts as an anticipatory booster, driving the ensembling weights to the correct target task within 2 to 3 layers, thereby bypassing the step-to-step lag of EMA/ODE methods.
+3. **Systems-Control Safeguards in Deep Networks:**
+   - **Scaled Logit Mean-Centering:** Leverages the mathematical properties of multi-temperature Softmax to design a translation-invariant numerical safeguard that eliminates floating-point overflow without distorting probabilities.
+   - **Conditional Integration Clamping:** Translates classical anti-windup clamping into a $K$-scaled threshold policy, preventing logit inflation over deep networks.
+   - **Prefill-Locked Decoding:** Addresses the fundamental ML systems bottleneck of **KV Cache coherence** by locking weights during prefill, guaranteeing consistent representation manifolds and zero decoding overhead.
+
+## The 'Delta' from Prior Work
+The "delta" between PID-Merge and existing techniques is substantial and highly practical:
+- **Stateless Routers (SABLE, SPS-ZCA):** These compute expert weights independently sample-by-sample and layer-by-layer. They transition instantly, but suffer from high-frequency layer-to-layer oscillations due to representation noise (depth-wise jitter of $0.724$ on physical GPT-2). **Delta:** PID-Merge acts as a depth-wise filter, slashing this jitter by **73%** (down to $0.193$) while preserving the tracking accuracy.
+- **Open-Loop Stateful Routers (ChemMerge, Momentum-Merge):** These filter noise but carry states temporally from query to query, causing **inertial drag** (collapsing accuracy under rapidly switching streams to $88.42\%$ and $86.17\%$). They also violate tenant privacy by leaking historical query traces across users. **Delta:** PID-Merge resets states per query for privacy, and uses closed-loop feedback and derivative control to completely eliminate inertial drag, matching the stateless accuracy ceiling ($94.82\%$).
+- **Complexity and Latency:** ChemMerge requires expensive, high-order ODE solvers, introducing a prohibitive $0.482$ ms overhead per forward pass. **Delta:** PID-Merge runs in $O(1)$ time with an incremental velocity algorithm, adding just **0.012 ms** of latency ($40\times$ speedup).
+
+## Characterization of Novelty
+The novelty of this work is **significant**. It represents a major paradigm shift away from loose, continuous-time chemical analogies (like ChemMerge) toward rigorous, discrete-time process control. Rather than being a purely theoretical exercise, the authors have meticulously mapped classical control principles (P, I, D, anti-windup, Jury's stability) onto the physical constraints of deep-learning serving platforms (quantized states, multi-temperature Softmax, KV Cache coherence, Triton kernel fusion, and multi-tenant security). This tight, bi-directional integration of systems-level thinking and control theory makes the novelty highly outstanding and instantly applicable to modern enterprise-scale serving workloads.

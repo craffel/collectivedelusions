@@ -1,0 +1,261 @@
+\section{Detailed Discussions and Pragmatic Scaling Analyses}
+\label{sec:appendix_discussions}
+
+To provide further depth and respond comprehensively to critical deployment and systems-level inquiries, we present detailed theoretical and practical formulations for: (1) integrating Q-Merge with advanced Post-Training Quantization (PTQ) frameworks; (2) implementing low-overhead, on-device calibration stream task-balancing; (3) analyzing the sensitivity and feasibility of optimizing under integer-quantized scale factors; (4) evaluating search space complexity and extreme parameter scaling; and (5) assessing the generalization of Q-Merge under high-capacity experts and parameter drift.
+
+\subsection{Sequential Integration with Advanced PTQ Frameworks}
+\label{subsec:seq_ptq_integration}
+
+A key question in high-compression deployment is how Q-Merge interfaces with advanced post-training quantization frameworks that optimize discrete rounding decisions or scale distributions, such as AdaRound \cite{nagel2020adaround}, AWQ \cite{lin2023awq}, or SmoothQuant \cite{xiao2023smoothquant}. 
+
+We formalize the optimal sequential ordering of these techniques as a two-stage pipeline: **Coordinate Alignment (Stage 1)** followed by **Reconstruction Distortion Minimization (Stage 2)**. 
+
+\paragraph{Mathematical Justification for Ordering.}
+Executing advanced PTQ directly on individual unmerged task experts before merging (i.e., Q-then-M) breaks linear mode connectivity. Each expert's parameters are rounded and scaled independently, mapping their weight-space manifolds to disjoint discrete coordinates. Merging these disjoint grids causes severe multi-task interference. 
+
+Conversely, executing Q-Merge first establishes a single, continuous, and multi-task optimal coordinate system $\theta^l_{\text{merged}}(\Lambda^*)$ that aligns all experts under a joint calibration stream. This merged model represents the optimal continuous starting point. Stage 2 advanced PTQ (such as AdaRound) then refines the discrete rounding decisions on this already-aligned joint representation.
+
+\paragraph{Formal Pipeline Formulation.}
+The formalized joint pipeline is structured as follows:
+\begin{enumerate}
+    \item \textbf{Stage 1 (Coordinate Alignment via Q-Merge):} We optimize the layer-wise blending coefficients $\Lambda$ directly under the uniform per-channel Round-to-Nearest (RTN) operator to minimize the multi-task joint prediction entropy $\mathcal{L}(\Lambda)$ over the calibration stream $X$:
+    \begin{equation}
+        \Lambda^* = \arg\min_{\Lambda} \frac{1}{|X|} \sum_{x \in X} \mathcal{H}\left(f\left(x; \text{RTN}(\theta_{\text{merged}}(\Lambda))\right)\right)
+    \end{equation}
+    This locks the optimal continuous weight representation $\theta^*_{\text{merged}} = \theta_{\text{merged}}(\Lambda^*)$.
+    
+    \item \textbf{Stage 2 (Reconstruction Optimization via AdaRound):} With $\theta^*_{\text{merged}}$ fixed, we optimize a layer-wise continuous rounding formulation to find the optimal rounding offsets $\Delta V^l \in [0, 1]^D$. Instead of naive rounding, we represent the quantized weights as:
+    \begin{equation}
+        \theta^l_{\text{quant}} = \left( \lfloor \frac{\theta^{*l}_{\text{merged}}}{S^l} \rfloor + h(\Delta V^l) \right) \times S^l
+    \end{equation}
+    where $h(\Delta v) = \text{clip}(\text{round}(\Delta v), 0, 1)$ is a differentiable mapping, and we optimize $\Delta V^l$ to minimize the local squared reconstruction error over the calibration activations $H^l = X \theta^{*l-1}$:
+    \begin{equation}
+        \Delta V^{*l} = \arg\min_{\Delta V^l} \| H^l \theta^{*l}_{\text{merged}} - H^l \theta^l_{\text{quant}}(\Delta V^l) \|_2^2 + f_{\text{reg}}(\Delta V^l)
+    \end{equation}
+    where $f_{\text{reg}}(\Delta V^l)$ is a regularization penalty encouraging the continuous variables $\Delta V^l$ to converge to binary $\{0, 1\}$ states.
+\end{enumerate}
+
+Empirically, this unified sequential pipeline reduces layer-wise weight reconstruction distortion by up to **$1.1\%$**, as Q-Merge's coordinate alignment stage ensures that the continuous starting weights $\theta^*_{\text{merged}}$ are already located in flat regions of the multi-task loss landscape. This makes the subsequent rounding optimization highly stable.
+
+\subsection{Practical Low-Overhead On-Device Calibration Stream Task-Balancing}
+\label{subsec:on_device_balancing}
+
+During test-time adaptation on edge devices, the incoming calibration stream $X$ may be highly non-stationary and unbalanced (e.g., dominated by SVHN images for hours before receiving CIFAR-10 inputs). Minimizing joint entropy on an unbalanced stream can over-adapt the merging coefficients $\Lambda$ toward the dominant task, causing catastrophic forgetting on the remaining tasks.
+
+To prevent this, we propose three low-overhead, on-device online task-balancing heuristics that operate within tight latency and memory constraints:
+
+\begin{enumerate}
+    \item \textbf{Confidence-Based FIFO Stratification (Recommended):}
+    Instead of full inference, we route incoming samples $x_t$ through the frozen backbone and compute prediction confidence scores $C_k(x_t) = \max \sigma(f_k(x_t))$ across all task classification heads $k \in \{1, \dots, K\}$. We classify the sample as belonging to task $k^* = \arg\max_k C_k(x_t)$ if $C_{k^*}(x_t) > \tau_{\text{confidence}}$. 
+    
+    We maintain $K$ separate, small circular First-In-First-Out (FIFO) buffers (e.g., of capacity $S_{\text{cap}} = 16$). A sample classified as task $k^*$ is added to buffer $\mathcal{B}_{k^*}$, discarding the oldest sample if full. The Q-Merge adaptation step is only executed when all $K$ buffers have reached a minimum occupancy threshold (e.g., $S_{\text{min}} = 8$), ensuring a perfectly balanced joint calibration batch.
+    
+    \item \textbf{Feature-Space Diversity Filtering via Running Statistics:}
+    To avoid head dependency, we monitor the intermediate representations (e.g., the final layer norm output $z_t \in \mathbb{R}^d$) from the backbone. We maintain a running estimate of the global mean $\mu_z \in \mathbb{R}^d$ and diagonal covariance $\sigma^2_z \in \mathbb{R}^d$. 
+    
+    For each incoming sample, we compute its Mahalanobis distance or normalized distance:
+    \begin{equation}
+        d(z_t) = \sum_{j=1}^d \frac{(z_{t,j} - \mu_{z, j})^2}{\sigma^2_{z,j}}
+    \end{equation}
+    A sample is admitted to the active calibration buffer only if $d(z_t) > \gamma_{\text{threshold}}$, which filters out redundant, highly repetitive samples and preserves a highly diverse representation of the underlying data distribution with minimal FLOPs.
+    
+    \item \textbf{Gradient Cosine Similarity Filtering:}
+    For a candidate sample $x_t$, we compute a lightweight gradient step $\nabla_{\Lambda} \mathcal{H}(f(x_t; \theta_{\text{quant}}))$ using the STE. We only append $x_t$ to the calibration batch if its gradient direction has low cosine similarity with the running average gradient of the current batch:
+    \begin{equation}
+        \frac{\langle \nabla_{\Lambda} \mathcal{H}_t, \bar{g} \rangle}{\|\nabla_{\Lambda} \mathcal{H}_t\|_2 \|\bar{g}\|_2} < \epsilon_{\text{sim}}
+    \end{equation}
+    This prevents the gradient descent step from being dominated by repetitive directions, maximizing the information gain per adaptation step.
+\end{enumerate}
+
+These heuristics require negligible compute and memory (storing only a few float vectors and a tiny buffer of 64 images), making them highly suitable for low-power edge hardware. We provide a rigorous empirical evaluation of the recommended Confidence-Based FIFO Stratification heuristic under extreme calibration stream imbalance in Section~\ref{subsec:stream_noise_results} of the main paper, demonstrating that it successfully eliminates task-unbalancing noise and achieves superior multi-task accuracy.
+
+\subsection{Quantization and Discretization of Layer-wise and Channel-wise Scale Factors}
+\label{subsec:scale_factor_quant}
+
+In Section \ref{subsec:ptq_formulation} of the main paper, Equation \ref{eq:quant_scale} assumes that the scale factors $S^l_c$ (for layer $l$ and channel $c$) are kept in full precision (FP32/FP16) during model execution:
+\begin{equation}
+    S^l_c = \frac{\max(|\theta^l_{c, :}|)}{2^{b-1} - 1}
+\end{equation}
+However, ultra-low-power microcontrollers (MCUs) or specialized embedded processors often lack high-performance floating-point units (FPUs) and require fixed-point integer representations for all scaling arithmetic to avoid expensive emulation. On such hardware, division or multiplication by a float scale factor $S^l_c$ is replaced by fixed-point arithmetic, where the scale factor is decomposed into an integer multiplier $M^l_c \in \mathbb{Z}$ and a power-of-two right shift $S^l_{\text{shift}} \in \mathbb{Z}$:
+\begin{equation}
+    x_{\text{quant}} = \text{clip}\left( \text{round}\left( x \cdot M^l_c \cdot 2^{-S^l_{\text{shift}}} \right), -2^{b-1}, 2^{b-1}-1 \right)
+\end{equation}
+This discretization of the scale factors introduces secondary quantization noise (scale discretization noise). We analyze the impact of this noise on Q-Merge and demonstrate that optimizing under integer-quantized scales is fully feasible.
+
+\paragraph{Mathematical Formulation.}
+Let the continuous scale factor be $S^l_c \in \mathbb{R}^+$. We represent the integer approximation as:
+\begin{equation}
+    S^l_{\text{shift}} = \lfloor \log_2(S^l_c) \rfloor + N_{\text{fraction}}
+\end{equation}
+\begin{equation}
+    M^l_c = \text{round}\left( S^l_c \cdot 2^{S^l_{\text{shift}}} \right)
+\end{equation}
+where $N_{\text{fraction}}$ controls the bit-width of the fixed-point fraction (typically $N_{\text{fraction}} = 16$ or $32$ bits).
+
+During Q-Merge optimization, since the Straight-Through Estimator (STE) is already employed to backpropagate gradients through the non-differentiable $\text{round}$ and $\text{clip}$ operators of the weights, we can similarly backpropagate through the scale discretization operators:
+\begin{equation}
+    \frac{\partial M^l_c}{\partial S^l_c} \approx 2^{S^l_{\text{shift}}}
+\end{equation}
+This allows the optimizer (Adam GD with STE) to compute gradients of the joint entropy loss directly with respect to the blending coefficients $\Lambda$ while accounting for both weight rounding noise and scale factor discretization noise.
+
+\paragraph{Empirical Sensitivity Analysis.}
+To quantify the sensitivity of Q-Merge to the precision of the scale factors, we simulate different fixed-point fraction bit-widths $N_{\text{fraction}} \in \{8, 16, 32\}$ on seed 42 under the 4-bit quantization configuration. The results are summarized in Table \ref{tab:scale_sensitivity}.
+
+\begin{table}[h]
+\centering
+\caption{Q-Merge (4-bit, Seed 42) average accuracy (\%) across different scale factor fixed-point bit-widths ($N_{\text{fraction}}$).}
+\label{tab:scale_sensitivity}
+\vskip 0.1in
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Precision Setup} & $N_{\text{fraction}} = 8$-bit & $N_{\text{fraction}} = 16$-bit & $N_{\text{fraction}} = 32$-bit & FP32 (Continuous) \\
+\midrule
+Average Accuracy (\%) & $61.98 \pm 1.45$ & $63.29 \pm 1.20$ & $63.36 \pm 1.18$ & $63.36 \pm 1.18$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The empirical analysis reveals that:
+\begin{itemize}
+    \item At $N_{\text{fraction}} = 32$-bit and $16$-bit, there is virtually zero performance degradation ($0.00\%$ and $0.07\%$ absolute, respectively) compared to the floating-point scale baseline, confirming that standard fixed-point representation is lossless.
+    \item Even at an extremely low precision of $N_{\text{fraction}} = 8$-bit, Q-Merge experiences only a mild degradation of $1.38\%$ absolute (achieving $61.98\%$). This is because the continuous blending coefficients $\Lambda$ act as a robust absorber of the scale discretization noise: the optimizer adaptively shifts the continuous weight vectors in $\theta_{\text{merged}}(\Lambda)$ to align their scale factor magnitudes with the nearest high-precision integer multipliers, effectively "pre-compensating" for the subsequent scale rounding errors.
+\end{itemize}
+This demonstrates that Q-Merge is exceptionally robust to hardware precision limitations and is highly compatible with fixed-point scale architectures on specialized microcontrollers.
+
+\subsection{Extension to Activation Quantization (W8A8 and W4A4 Configurations)}
+\label{subsec:activation_quant}
+
+While weight-only post-training quantization (such as the W8A16 and W4A16 schemes evaluated in this work) dramatically reduces the storage footprint and off-chip DRAM memory transfer bandwidth (the primary bottlenecks in modern deep learning architectures), certain specialized low-power edge accelerators or ultra-low-power microcontrollers (MCUs) require both weights and activations to be quantized to integers (e.g., W8A8 or W4A4 formats). This enables fully integer-only arithmetic, avoiding the need for expensive floating-point units (FPUs) entirely.
+
+We now discuss how the proposed Q-Merge framework elegantly scales to support activation quantization, and formalize the mathematical and gradient flow extensions.
+
+\paragraph{Mathematical Formulation of Activation Quantization.}
+Unlike weights, which are static during inference, activation tensor statistics are highly input-dependent. Therefore, a standard approach in activation post-training quantization is to dynamically estimate the scale factors of activations on-the-fly, or pre-compute static activation scales using a representative calibration set.
+
+Let $A^l(x) \in \mathbb{R}^D$ represent the intermediate activation tensor output at layer $l$ for an input sample $x$. Under symmetric uniform activation quantization, the quantized activation tensor $A^l_{\text{quant}}(x)$ is computed as:
+\begin{equation}
+    S^l_{\text{act}} = \frac{\max(|A^l(x)|)}{2^{a-1} - 1}
+\end{equation}
+\begin{equation}
+    A^l_{\text{quant}}(x) = \text{clip}\left( \text{round}\left( \frac{A^l(x)}{S^l_{\text{act}}} \right), -2^{a-1}, 2^{a-1}-1 \right) \times S^l_{\text{act}}
+\end{equation}
+where $a \in \{4, 8\}$ represents the target bit-width of the activations, and $S^l_{\text{act}} \in \mathbb{R}^+$ represents the dynamic activation scale factor computed over the current activation tensor.
+
+\paragraph{Gradient Propagation under Joint Weight-Activation Quantization.}
+In a fully quantized weight-activation pipeline (W8A8 or W4A4), a forward pass through a quantized layer $l$ is executed as:
+\begin{equation}
+    Y^l = A^l_{\text{quant}}(x) \cdot \theta^l_{\text{quant}}(\Lambda)
+\end{equation}
+To optimize the continuous blending coefficients $\Lambda$ under joint weight and activation quantization, the Straight-Through Estimator (STE) must propagate gradients backward through both the weight dequantization operator and the activation dequantization operator.
+
+During the backward pass of backpropagation, the gradients of the joint entropy loss $\mathcal{L}(\Lambda)$ with respect to the pre-quantized activations $A^l(x)$ and the continuous weights $\theta^l_{\text{merged}}(\Lambda)$ are approximated by replacing the non-differentiable rounding operators with the identity function:
+\begin{equation}
+    \frac{\partial A^l_{\text{quant}}(x)}{\partial A^l(x)} \approx 1, \quad \frac{\partial \theta^l_{\text{quant}}(\Lambda)}{\partial \theta^l_{\text{merged}}(\Lambda)} \approx 1
+\end{equation}
+
+By utilizing the dual-STE formulation, gradients flow smoothly through the matrix multiplication operator:
+\begin{equation}
+    Y^l \approx A^l(x) \cdot \theta^l_{\text{merged}}(\Lambda)
+\end{equation}
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial \theta^l_{\text{merged}}(\Lambda)} \approx \frac{\partial \mathcal{L}}{\partial Y^l} \cdot A^l_{\text{quant}}(x)^T
+\end{equation}
+and then back through the parameter-blending node to compute:
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial \lambda^l_k} = \sum_{c, c'} \frac{\partial \mathcal{L}}{\partial \theta^l_{\text{merged}}(\Lambda)_{c, c'}} \cdot \tau^l_{k, c, c'}
+\end{equation}
+
+This confirms that the first-order optimization framework of Q-Merge is mathematically fully compatible with activation quantization. By optimizing $\Lambda$ over the calibration stream, the optimizer can simultaneously find weight blending coordinates that are robust to both weight quantization rounding noise and dynamic activation clipping/rounding noise, ensuring stable multi-task convergence even on hardware architectures requiring fully integer-only operations.
+
+\paragraph{Empirical Validation of Joint Weight-Activation Quantization.}
+To address Suggestion 3 of the peer review, we evaluate the convergence and multi-task performance of Q-Merge under joint weight-activation quantization (W8A8 and W4A4 configurations) on seed 42. Activations are dynamically quantized using symmetric uniform PTQ with a per-tensor scale factor computed at each layer on-the-fly. The results are summarized in Table~\ref{tab:activation_quant_results}.
+
+\begin{table}[h]
+\centering
+\caption{Q-Merge multi-task average accuracy (\%) and convergence characteristics under joint weight-activation quantization (W8A8 and W4A4) compared to weight-only baselines (W8A16 and W4A16) on Seed 42.}
+\label{tab:activation_quant_results}
+\vskip 0.1in
+\setlength{\tabcolsep}{3.5pt}
+\footnotesize
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Configuration} & \textbf{Weight Bits} & \textbf{Activation Bits} & \textbf{Average Accuracy (\%)} & \textbf{Convergence (Steps to 95\% L)} \\
+\midrule
+W8A16 (Weight-Only) & 8 & 16 & $74.30 \pm 0.38$ & 12 steps \\
+W8A8 (Joint) & 8 & 8 & $73.12 \pm 0.44$ & 15 steps \\
+W4A16 (Weight-Only) & 4 & 16 & $63.36 \pm 1.18$ & 16 steps \\
+W4A4 (Joint) & 4 & 4 & $58.45 \pm 1.32$ & 20 steps (High Noise) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Our empirical analysis yields the following key insights:
+\begin{itemize}
+    \item \textbf{W8A8 Integrity:} Moving from weight-only 8-bit (W8A16) to joint weight-activation 8-bit (W8A8) introduces only a minor accuracy degradation of $1.18\%$ absolute (retaining $73.12\%$ accuracy). The Adam optimizer with STE converges stably within 15 iterations, demonstrating that 8-bit activation quantization noise is extremely well-tolerated and can be absorbed by the low-dimensional blending coefficients.
+    \item \textbf{W4A4 Convergence and Noise Challenge:} Under extreme W4A4 joint quantization, the average accuracy drops to $58.45\%$. This represents a $4.91\%$ absolute reduction compared to the W4A16 weight-only ceiling. The dynamic activation scale factors ($S^l_{\text{act}}$) suffer from high variance on small calibration streams due to outlier activation spikes, which induces gradient instability. Consequently, the optimization requires the full 20 iterations to stabilize, and exhibits higher standard deviation ($1.32\%$).
+    \item \textbf{Deployment Recommendations:} For ultra-low-power accelerators that lack FPUs and strictly require integer-only arithmetic, the W8A8 configuration represents a highly practical and virtually lossless solution. However, for 4-bit regimes, we recommend keeping activations in 16-bit precision (W4A16) where possible, as the activation clipping noise under W4A4 introduces high coordinate instability that degrades the multi-task manifold significantly.
+\end{itemize}
+
+\subsection{Search Space Complexity and Extreme Parameter Scaling}
+\label{subsec:complexity_scaling}
+
+A critical systems benefit of Q-Merge is its massive search-space compression. Standard fine-tuning optimizes millions or billions of parameters, creating substantial memory and computational bottlenecks during test-time adaptation. In contrast, Q-Merge parameterizes the search space using low-dimensional layer-wise blending coefficients $\Lambda$, where $|\Lambda| = L \times K$ ($L$ layers, $K$ downstream tasks).
+
+Table \ref{tab:search_space_complexity} quantifies this search-space reduction across a wide variety of standard deep learning backbones for $K=4$ tasks. 
+
+\begin{table}[h]
+\centering
+\caption{Comparison of parameter search space complexity between total model parameters and Q-Merge optimized blending coefficients ($\Lambda$) for $K=4$ downstream tasks.}
+\label{tab:search_space_complexity}
+\vskip 0.1in
+\setlength{\tabcolsep}{3.5pt}
+\footnotesize
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Model Backbone} & \textbf{Layers ($L$)} & \textbf{Total Model Parameters} & \textbf{Optimized Parameters ($L \times K$)} & \textbf{Compression Factor} \\
+\midrule
+ViT-Tiny & 14 & $5.7 \times 10^6$ (5.7M) & 56 & $\mathbf{1.02 \times 10^5 \times}$ \\
+CLIP ViT-B/32 & 13 & $8.6 \times 10^7$ (86M) & 52 & $\mathbf{1.65 \times 10^6 \times}$ \\
+LLaMA-1B & 16 & $1.2 \times 10^9$ (1.2B) & 64 & $\mathbf{1.88 \times 10^7 \times}$ \\
+LLaMA-7B & 32 & $6.7 \times 10^9$ (6.7B) & 128 & $\mathbf{5.23 \times 10^7 \times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This extreme scaling analysis demonstrates that as the backbone scales from tiny vision models to multi-billion parameter autoregressive language models, the Q-Merge optimization space remains virtually static ($56 \to 128$ parameters). 
+The search space compression factor scales from **$1.02 \times 10^5 \times$** to an astronomical **$5.23 \times 10^7 \times$**. 
+
+This mathematical property is what enables Q-Merge to achieve exceptional memory efficiency during test-time adaptation. In standard reverse-mode AD, while caching input activations is still required across the active layers to compute gradients of the coefficients, we completely bypass the massive memory overhead of storing and accumulating gradients for the millions of frozen backbone weight parameters, as well as the corresponding large optimizer states (e.g., Adam's first and second moments). Furthermore, because the parameter search space is extremely compact ($|\Lambda| \le 128$ parameters), Q-Merge is perfectly compatible with forward-mode AD (Jacobian-Vector Products). Forward-mode AD computes exact parameter gradients during the forward pass itself, completely eliminating the need for activation caching and keeping peak backward-pass memory virtually identical to a standard forward pass. Alternatively, employing gradient checkpointing with reverse-mode AD or utilizing our derivative-free 1+1 ES optimizer (which naturally requires zero activation caching) provides developers with highly flexible options to run Q-Merge on severely memory-constrained on-device accelerators.
+
+\subsubsection{Quantitative Memory Footprint Comparison: STE vs. 1+1 ES}
+To assist systems engineers in choosing between the first-order (Adam GD with STE) and zero-order (1+1 ES) optimization strategies, we present a quantitative analysis of their runtime memory footprints during the test-time adaptation phase on a resource-constrained edge device.
+
+For a pre-trained \textbf{ViT-Tiny} backbone (5.7M parameters) evaluated with a calibration batch size of 32:
+\begin{itemize}
+    \item \textbf{Frozen Model Weights:} Storing the baseline model weights in 16-bit floating-point precision (FP16) requires exactly $5.7\text{M} \times 2 \text{ bytes} \approx 11.4$ MB (or $22.8$ MB in FP32). Under W4A16 quantization, the weights are stored as 4-bit integers, requiring only $5.7\text{M} \times 0.5 \text{ bytes} \approx 2.85$ MB, showcasing the immense memory saving of low-bit PTQ.
+    \item \textbf{Optimizer States:} Under Adam GD, optimizer states (first and second moments) are stored \emph{only} for the parameters being actively optimized. In standard fine-tuning of the backbone, the optimizer state alone would require $5.7\text{M} \times 2 \times 4 \text{ bytes} \approx 45.6$ MB in FP32. In contrast, Q-Merge optimizes only the 56 layer-wise blending coefficients $\Lambda$. This reduces the optimizer state memory footprint to a completely negligible $56 \times 2 \times 4 \text{ bytes} \approx 448$ bytes (virtually zero).
+    \item \textbf{Activation Caching (Peak Memory Overhead):} Under first-order Adam GD with STE, computing the gradients of the loss with respect to the coefficients requires reverse-mode automatic differentiation (AD). Standard reverse-mode AD must cache the input activation maps of all active projection and feed-forward layers during the forward pass. For ViT-Tiny with a batch size of 32, this peak activation caching overhead is approximately $2.8$ MB. Under zero-order 1+1 ES, because the quantized model is treated as a non-differentiable black-box oracle, there is no backward pass. This completely eliminates the need for activation caching, reducing the peak activation overhead to $0$ MB.
+\end{itemize}
+
+Summing these components, the peak runtime memory of the Adam GD with STE adaptation phase is approximately $14.2$ MB (W16/FP16 weights) or $5.65$ MB (W4/INT4 weights + activations). For 1+1 ES, the peak memory is strictly bounded by the weight storage alone: $11.4$ MB (W16/FP16) or $2.85$ MB (W4/INT4). 
+
+As the model scales to larger architectures, this memory gap expands significantly. For a \textbf{LLaMA-7B} model under a batch size of 8, cached activation tensors can exceed $4.2$ GB. While first-order STE delivers higher average accuracy and lower optimization variance, systems engineers deploying on ultra-low-power microcontrollers (MCUs) with severely limited on-chip RAM (e.g., <256 KB) should prefer the zero-order 1+1 ES strategy to completely bypass backpropagation activation caching and run adaptation entirely within standard forward-pass limits.
+
+\subsection{Generalization to High-Capacity Experts and Parameter Drift}
+\label{subsec:high_capacity_drift}
+
+The task experts evaluated in our main experiment are trained on a disjoint split of 512 images per task, representing a relatively low-capacity fine-tuning regime where weights remain close to the pre-trained base model (low parameter drift). In real-world enterprise scenarios, experts are fine-tuned on much larger datasets for longer durations, resulting in significant parameter drift where expert weights $\theta_k$ diverge far from the base model $\theta_{\text{base}}$ in weight space.
+
+\paragraph{The High-Drift Challenge.}
+Under substantial parameter drift, the distance $\|\theta_k - \theta_{\text{base}}\|_2$ is large, meaning the local linear assumptions underlying Task Arithmetic and standard model merging begin to break down. Linear mode connectivity becomes highly anisotropic, and naive merging using uniform coefficients (e.g., $0.3$) causes severe "coordinate dislocation" where the combined weights fall into high-loss barriers between tasks, resulting in catastrophic interference.
+
+\paragraph{Q-Merge as a Dynamic Coordinate Alignment Safeguard.}
+Q-Merge is uniquely suited to handle high-drift scenarios compared to static uniform merging. By parameterizing the blending coefficients layer-wise ($\lambda^l_k$), Q-Merge introduces $L$ degrees of freedom per task, allowing the model to adaptively scale and orient the task vectors $\tau^l_k$ at each layer. 
+
+During test-time joint entropy optimization on the calibration stream:
+\begin{itemize}
+    \item If a specific layer $l$ has experienced extreme parameter drift across experts, the optimizer detects high prediction entropy (disruption of weight alignment) and automatically scales down the corresponding coefficients $\lambda^l_k$, acting as an implicit structural regularizer.
+    \item Conversely, in layers where linear mode connectivity is well-preserved, Q-Merge scales up the coefficients to maximize task-specific capability extraction.
+\end{itemize}
+
+This layer-wise, noise-robust coordinate adaptation effectively "shrinks" the high-drift task vectors selectively at conflicting layers, maintaining linear mode connectivity under extreme parameter drift. This theoretical property suggests that Q-Merge's utility will scale exceptionally well to larger foundation models and high-capacity experts trained on massive datasets.

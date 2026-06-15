@@ -1,0 +1,203 @@
+\section{Methodology}
+\label{sec:method}
+
+We present \textbf{ZipMerge}, a training-free framework designed to produce a sparse multi-task merged model ready for low-memory edge deployment. First, we outline the mathematical formulation of on-the-fly model merging and magnitude pruning. Next, we define the unsupervised minimum entropy test-time adaptation objective. Finally, we describe our two proposed optimization paradigms to navigate the non-differentiable pruning boundary: first-order gradient descent via a Straight-Through Estimator (STE) and zero-order search via a 1+1 Evolution Strategy (ES).
+
+\subsection{Mathematical Formulation}
+
+Let $K$ represent the number of independent downstream tasks, $L$ represent the number of layers in our neural network backbone, and $N$ be the total number of parameters. We are given:
+\begin{itemize}[leftmargin=*]
+    \item A pre-trained base model with parameters $\theta_0 \in \mathbb{R}^N$.
+    \item $K$ specialized expert models fine-tuned on individual tasks, denoted as $\theta_k \in \mathbb{R}^N$ for $k \in \{1, \dots, K\}$.
+\end{itemize}
+
+For each expert model, we define its task-specific parameter vector $v_k \in \mathbb{R}^N$ by subtracting the pre-trained base parameters:
+\begin{equation}
+    v_k = \theta_k - \theta_0
+\end{equation}
+
+Consistent with adaptive merging protocols \cite{yang2024adamerging}, we define layer-wise merging coefficients $\Lambda = \{ \lambda^l_k \}$ where $\lambda^l_k \in \mathbb{R}$ represent the scaling factor of task $k$ in layer $l \in \{1, \dots, L\}$. For any weight element $w$ belonging to layer $l$, the full-precision dense merged parameter $w_{\text{merged}}(\Lambda)$ is computed as:
+\begin{equation}
+    w_{\text{merged}}(\Lambda) = w_0 + \sum_{k=1}^K \lambda^l_k v_{k, w}
+\end{equation}
+where $w_0$ is the pre-trained base parameter and $v_{k, w}$ is the corresponding task vector element.
+
+\subsection{On-the-Fly Dynamic Magnitude Pruning}
+
+To compress the model under a physical storage constraint on-device, we define a target global sparsity ratio $p \in [0, 1)$ (e.g., $p=0.5$ for 50\% pruning or $p=0.8$ for 80\% pruning). At each step of optimization, we sort the absolute values of the newly merged parameters $\theta_{\text{merged}}(\Lambda)$ to compute the $p$-th percentile threshold $\tau_p(\Lambda)$ over the set of all model parameters $\mathcal{W}$:
+\begin{equation}
+    \tau_p(\Lambda) = \text{percentile}\left( \{ |w_{\text{merged}}(\Lambda)| : w \in \mathcal{W} \}, 100 \cdot p \right)
+\end{equation}
+
+A binary pruning mask $M(\Lambda) \in \{0, 1\}^N$ is dynamically generated based on this threshold:
+\begin{equation}
+    M_w(\Lambda) = \mathbb{I}(|w_{\text{merged}}(\Lambda)| \ge \tau_p(\Lambda))
+\end{equation}
+where $\mathbb{I}(\cdot)$ is the indicator function. The resulting sparse parameters $\theta_{\text{sparse}}(\Lambda)$ are then constructed using the element-wise Hadamard product:
+\begin{equation}
+    \theta_{\text{sparse}}(\Lambda) = M(\Lambda) \odot \theta_{\text{merged}}(\Lambda)
+\end{equation}
+
+This dynamic formulation ensures that the pruning boundary is co-optimized with the merging coefficients, allowing the network to redistribute weight magnitudes flexibly to maintain multi-task capabilities under physical resource limits.
+
+\subsection{Unsupervised Test-Time Objective}
+
+To co-optimize the coefficients $\Lambda$ and the pruning boundaries, we utilize an unsupervised test-time objective on a tiny calibration dataset containing $B$ unlabeled images per task ($B=16$ in our experiments). Following \cite{wang2020tent,yang2024adamerging}, we minimize the Shannon entropy of predicted probability distributions across all tasks. Let $p_{k, i, c}(\Lambda)$ represent the predicted probability of the $c$-th class for the $i$-th calibration image of task $k$ using the sparse merged model $\theta_{\text{sparse}}(\Lambda)$. The multi-task entropy loss is:
+\begin{equation}
+    \label{eq:entropy_loss}
+    \mathcal{L}_{\text{entropy}}(\Lambda) = -\frac{1}{K \cdot B} \sum_{k=1}^K \sum_{i=1}^B \sum_{c=1}^C p_{k,i,c}(\Lambda) \log p_{k,i,c}(\Lambda)
+\end{equation}
+
+Crucially, this objective does not require any ground-truth labels, which is highly pragmatic because labels are rarely available on-device in real-world deployment scenarios. For batch composition during test-time adaptation, the $B$ unlabeled calibration images per task are grouped by task and evaluated sequentially within each step to compute task-specific prediction distributions before averaging their individual Shannon entropies in \eqref{eq:entropy_loss}. This sequential grouping preserves task boundaries during the forward pass, ensuring that the model handles task-specific classification spaces cleanly without requiring shuffled joint batching. Furthermore, to prevent task-entropy gradient imbalances where highly complex tasks (e.g., CIFAR-10) dominate the joint updates over simple, near-zero entropy tasks (e.g., MNIST), we normalize the individual task-wise gradients before backpropagation, scale task-specific losses by their rolling baseline entropies, or apply temperature-scaling to the softmax predictions to ensure balanced optimization signals across all tasks.
+
+While Shannon entropy minimization is a highly effective and standard objective for test-time adaptation (TTA) \cite{wang2020tent}, it is susceptible to degenerate solutions where the model predicts a single class with high confidence for all inputs to minimize entropy. We note that the main experiments in this work leverage standard Shannon entropy to map baseline optimization limits. To resist such degenerate collapse in more extensive settings, we present four purely theoretical proposals below as promising regularized objectives reserved for future empirical validation:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Maximizing Mutual Information (MMI):} This objective complements Shannon entropy minimization with an explicit class-balance regularization term that maximizes the marginal entropy of predicted distributions:
+    \begin{equation}
+        \mathcal{L}_{\text{MMI}}(\Lambda) = \mathcal{L}_{\text{entropy}}(\Lambda) + \eta \sum_{c=1}^C \bar{p}_c(\Lambda) \log \bar{p}_c(\Lambda)
+    \end{equation}
+    where $\bar{p}_c(\Lambda) = \frac{1}{K \cdot B} \sum_{k=1}^K \sum_{i=1}^B p_{k,i,c}(\Lambda)$ represents the mean predicted probability of class $c$ over the calibration batch, and $\eta > 0$ balances the two terms. Maximizing the marginal entropy forces the model to distribute its predictions across different classes, preventing the optimizer from collapsing into single-class predictions.
+    \item \textbf{Temperature-Scaled Soft Pseudo-Labeling:} This paradigm filters out noisy low-confidence predictions and optimizes against a soft pseudo-label distribution target generated by scaling the pre-adapted network's logits. By temperature-scaling and applying a soft cross-entropy penalty, the optimization remains stable and prevents transductive gradient divergence.
+    \item \textbf{Likelihood Ratio (LRA) Constraint:} This objective prevents the updated coefficients from destroying the generalizable feature pathways of the starting model by maximizing the likelihood ratio of the current prediction relative to the unadapted dense model. Let $c^* = \arg\max_c p_{k,i,c}(\Lambda^{(0)})$ be the class predicted with the highest confidence by the initial unadapted dense model. The LRA objective is formulated as:
+    \begin{equation}
+        \mathcal{L}_{\text{LRA}}(\Lambda) = -\frac{1}{K \cdot B} \sum_{k=1}^K \sum_{i=1}^B \log \frac{p_{k, i, c^*}(\Lambda)}{p_{k, i, c^*}(\Lambda^{(0)})}
+    \end{equation}
+    which acts as a structural anchor to prevent transductive overfitting by penalizing any massive deviations from the original high-confidence class predictions.
+    \item \textbf{Class-Balanced Contrastive (CBC) Loss:} To safeguard the backbone representations, a self-supervised CBC loss can be defined on the intermediate features of the network. It enforces that representations of different calibration images predicted to belong to the same class are pulled together in the latent space, while representations from different classes are pushed apart:
+    \begin{equation}
+        \mathcal{L}_{\text{CBC}}(\Lambda) = -\sum_{i \neq j} \text{sim}(f_i(\Lambda), f_j(\Lambda)) \cdot \mathbb{I}(\hat{y}_i = \hat{y}_j) + \rho \sum_{i \neq j} \text{sim}(f_i(\Lambda), f_j(\Lambda)) \cdot \mathbb{I}(\hat{y}_i \neq \hat{y}_j)
+    \end{equation}
+    where $f_i(\Lambda)$ is the normalized spatial pooling feature of the $i$-th calibration sample, $\text{sim}(\cdot)$ is cosine similarity, $\hat{y}_i = \arg\max_c p_{k,i,c}(\Lambda)$ is the pseudo-label, and $\rho > 0$ is a scaling hyperparameter to balance pushing and pulling forces. This encourages ZipMerge to maintain distinct, structured class clusters in the latent space rather than collapsing them into an uninformative single point.
+\end{itemize}
+
+\subsection{Optimization Paradigm 1: Straight-Through Estimators (STE)}
+
+Optimizing $\Lambda$ using standard first-order gradient descent (e.g., via the Adam optimizer) is prevented by the non-differentiable indicator function $\mathbb{I}(\cdot)$ used in generating $M(\Lambda)$. The derivative of the indicator function is zero almost everywhere, which blocks the backpropagation of gradients from the entropy loss to the continuous merging coefficients $\Lambda$.
+
+To circumvent this, we utilize a Straight-Through Estimator (STE) \cite{bengio2013estimating} during the backward pass. In the context of model compression and network binarization/quantization, two distinct mathematical variants of STE are commonly implemented:
+
+\textbf{1. Identity-pass STE (Global Gradient Flow):}
+This variant bypasses the entire masking operator during the backward pass, treating the derivative of the sparse parameters with respect to the dense merged parameters as the identity matrix:
+\begin{equation}
+    \frac{\partial w_{\text{sparse}}}{\partial w_{\text{merged}}} \approx 1
+\end{equation}
+Under this approximation, the gradient flows back to the coefficients through all connections, including those that are currently pruned ($M_w(\Lambda)=0$). The forward pass is written as:
+\begin{equation}
+    w_{\text{sparse}} = w_{\text{merged}} + \text{detach}\left(M_w(\Lambda) w_{\text{merged}} - w_{\text{merged}}\right)
+\end{equation}
+This formulation is highly popular because it allows the continuous coefficients to receive global optimization signals from all pathways, preventing the parameters from becoming permanently stuck in a sub-optimal sparse configuration.
+
+\textbf{2. Mask-pass STE (Restricted Gradient Flow):}
+This variant routes gradients exclusively through the active, unpruned pathways, zeroing out gradients corresponding to pruned weights:
+\begin{equation}
+    \frac{\partial w_{\text{sparse}}}{\partial w_{\text{merged}}} \approx M_w(\Lambda)
+\end{equation}
+Under this approximation, the forward pass is implemented as:
+\begin{equation}
+    w_{\text{sparse}} = w_{\text{merged}} \cdot \text{detach}\left(M_w(\Lambda)\right)
+\end{equation}
+This restricts coefficient optimization to the active parameters, protecting the continuous coefficients $\Lambda$ from being influenced by inactive, noisy channels. 
+
+Our core implementation evaluates the highly expressive \textbf{Identity-pass STE}, which allows the continuous merging coefficients to receive smooth, continuous optimization feedback from the entire parameter domain during on-device calibration.
+
+As a powerful theoretical extension, this Identity-pass STE forward pass can be directly co-designed with post-training quantization (PTQ) to enable joint low-bit precision and sparsity. Specifically, under an $b$-bit uniform quantization scheme (e.g., $b=4$ or $b=8$), we define a dynamic scaling factor $q_{\text{step}} = \frac{2 \max(|w_{\text{merged}}(\Lambda)|)}{2^b - 1}$. The joint binarized pruning and integer-quantized parameter $w_{\text{quant\_sparse}}$ can then be integrated into the Identity-pass STE forward pass as:
+\begin{equation}
+\begin{aligned}
+    w_{\text{quant\_sparse}} &= w_{\text{merged}} + \text{detach}\Big(\text{clip}\Big( \\
+    &\text{round}\Big(\frac{M_w w_{\text{merged}}}{q_{\text{step}}}\Big), -2^{b-1}, 2^{b-1}-1\Big) \\
+    &\cdot q_{\text{step}} - w_{\text{merged}}\Big)
+\end{aligned}
+\end{equation}
+By keeping the outer gradient pathway as the identity (1), first-order optimizers can smoothly update the continuous merging coefficients $\Lambda$ through both the non-differentiable rounding and binarized pruning operators, bypassing the zero-gradient binarization problem entirely.
+
+\subsection{Optimization Paradigm 2: 1+1 Evolution Strategy (1+1 ES)}
+
+As a robust derivative-free alternative, we also investigate a 1+1 Evolution Strategy (1+1 ES) \cite{salimans2017evolution} to explore the parameter space. Since ES is a zero-order optimizer, it does not rely on gradient computations and is unaffected by the non-differentiability of the pruning threshold.
+
+The 1+1 ES algorithm proceeds as follows:
+\begin{enumerate}[leftmargin=*]
+    \item We initialize the parent coefficients $\Lambda^{(0)}$ to a dense-optimized starting point or a uniform configuration, with an initial search step size $\sigma^{(0)}$.
+    \item At each step $t$, we generate a mutant proposal $\Lambda_{\text{prop}}$ by adding Gaussian noise:
+    \begin{equation}
+        \Lambda_{\text{prop}} = \Lambda^{(t)} + \sigma^{(t)} \cdot \epsilon
+    \end{equation}
+    where $\epsilon \sim \mathcal{N}(0, I)$ is a random noise vector.
+    \item We evaluate the multi-task entropy loss on the calibration set for both $\Lambda^{(t)}$ and $\Lambda_{\text{prop}}$.
+    \item If the proposal achieves a lower loss ($\mathcal{L}_{\text{entropy}}(\Lambda_{\text{prop}}) < \mathcal{L}_{\text{entropy}}(\Lambda^{(t)})$), the mutation is successful. We accept the proposal and adjust the step size upwards to encourage exploration:
+    \begin{equation}
+        \Lambda^{(t+1)} = \Lambda_{\text{prop}}, \quad \sigma^{(t+1)} = \sigma^{(t)} \cdot \alpha_{\text{up}}
+    \end{equation}
+    \item Otherwise, the mutation fails. We reject the proposal and shrink the search space:
+    \begin{equation}
+        \Lambda^{(t+1)} = \Lambda^{(t)}, \quad \sigma^{(t+1)} = \sigma^{(t)} \cdot \beta_{\text{down}}
+    \end{equation}
+\end{enumerate}
+
+In our experiments, we set $\alpha_{\text{up}} = 1.22$ and $\beta_{\text{down}} = 0.82$ following the standard 1/5th success rule, with an initial step size of $\sigma^{(0)} = 0.1$. This derivative-free formulation provides a robust optimization alternative that directly evaluates the sparse network's performance.
+
+\subsection{Preventing Overfitting: Regularized ZipMerge (Reg-ZipMerge)}
+
+To mitigate the Overfitting-Optimizer Paradox identified during test-time adaptation, we propose a regularized variant called \textbf{Reg-ZipMerge}. In standard ZipMerge, unconstrained entropy minimization can lead to transductive overfitting on the tiny calibration dataset, damaging generalizable representations. To prevent this, Reg-ZipMerge incorporates a structural distance penalty that regularizes the optimized merging coefficients $\Lambda$ toward their dense-optimized or uniform initialization $\Lambda^{(0)}$:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_{\text{Reg-ZipMerge}}(\Lambda) &= \mathcal{L}_{\text{entropy}}(\Lambda) \\
+    &+ \gamma \sum_{l=1}^L \sum_{k=1}^K \left( \lambda^l_k - \lambda^{(0), l}_k \right)^2
+\end{aligned}
+\end{equation}
+where $\gamma > 0$ is a regularization hyperparameter.
+
+Alternatively, we can define a functional regularization term using the Kullback-Leibler (KL) divergence between the sparse merged model's output and a frozen, unpruned dense merged model $\theta_{\text{merged}}(\Lambda^{(0)})$ on the calibration images, acting as a test-time distillation constraint:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_{\text{KL}}(\Lambda) &= \frac{1}{K \cdot B} \sum_{k=1}^K \sum_{i=1}^B D_{\text{KL}}\Big( P_{\text{dense}}\left(x_{k,i}; \Lambda^{(0)}\right) \\
+    &||\, P_{\text{sparse}}\left(x_{k,i}; \Lambda\right) \Big)
+\end{aligned}
+\end{equation}
+The joint objective then becomes:
+\begin{equation}
+    \mathcal{L}_{\text{Reg-ZipMerge}}(\Lambda) = \mathcal{L}_{\text{entropy}}(\Lambda) + \beta \mathcal{L}_{\text{KL}}(\Lambda)
+\end{equation}
+where $\beta$ scales the distillation penalty. By penalizing large functional deviations from the unpruned, collaborative starting checkpoint, Reg-ZipMerge mathematically restricts the optimization search space to flat, generalizable regions in weight space, resolving the transductive overfitting boundary.
+
+\subsection{Algorithmic Implementation of ZipMerge}
+To provide a complete, systems-level overview of our joint co-optimization framework, we outline the step-wise execution of ZipMerge in Algorithm~\ref{alg:zipmerge}. This algorithmic tracing clarifies how the layer-wise merging coefficients $\Lambda$ are dynamically combined with task vectors $v_k$, dynamically pruned via on-the-fly magnitude thresholding, evaluated on unlabeled calibration batches, and optimized using either our first-order Straight-Through Estimator (STE) or zero-order 1+1 Evolution Strategy (ES).
+
+\begin{algorithm}[tb]
+   \caption{ZipMerge Joint Co-Optimization}
+   \label{alg:zipmerge}
+\begin{algorithmic}[1]
+   \STATE {\bfseries Input:} Pre-trained base model $\theta_0$, $K$ specialized expert models $\{\theta_k\}_{k=1}^K$, calibration dataset $\mathcal{D}_{\text{cal}}$, global sparsity ratio $p$, total optimization steps $T$, optimization engine $E \in \{\text{STE}, \text{ES}\}$
+   \STATE {\bfseries Output:} Optimized sparse multi-task merged model $\theta_{\text{sparse}}$
+   \STATE Compute specialized task-specific vectors: $v_k \leftarrow \theta_k - \theta_0$ for $k \in \{1, \dots, K\}$
+   \STATE Initialize layer-wise merging coefficients: $\Lambda^{(0)} \leftarrow \{\lambda^{l,(0)}_k\}$ (e.g., Uniform $\lambda^{(0)} = 0.3$)
+   \IF{$E = \text{ES}$}
+     \STATE Initialize parent step size: $\sigma^{(0)} \leftarrow 0.1$
+   \ELSIF{$E = \text{STE}$}
+     \STATE Initialize optimizer (e.g., Adam with learning rate $\eta_{\text{lr}}$)
+   \ENDIF
+   \FOR{$t = 0$ {\bfseries to} $T-1$}
+     \STATE Sample calibration batch $\mathcal{B} = \{x_{k, i}\} \sim \mathcal{D}_{\text{cal}}$ with $B$ images per task
+     \IF{$E = \text{STE}$}
+       \STATE Compute dense merged weights: $\theta_{\text{merged}}(\Lambda^{(t)}) \leftarrow \theta_0 + \sum_{k=1}^K \Lambda^{(t)} \odot v_k$
+       \STATE Compute dynamic pruning threshold: $\tau_p(\Lambda^{(t)}) \leftarrow \text{percentile}(|\theta_{\text{merged}}(\Lambda^{(t)})|, 100 \cdot p)$
+       \STATE Generate binarized pruning mask: $M_w(\Lambda^{(t)}) \leftarrow \mathbb{I}(|w_{\text{merged}}(\Lambda^{(t)})| \ge \tau_p(\Lambda^{(t)}))$
+       \STATE Construct sparse weights: $\theta_{\text{sparse}}(\Lambda^{(t)}) \leftarrow M(\Lambda^{(t)}) \odot \theta_{\text{merged}}(\Lambda^{(t)})$
+       \STATE Compute multi-task entropy loss $\mathcal{L}_{\text{entropy}}(\Lambda^{(t)})$
+       \STATE Backpropagate gradients using Identity-pass STE: $\frac{\partial w_{\text{sparse}}}{\partial w_{\text{merged}}} \approx 1$
+       \STATE Update continuous coefficients: $\Lambda^{(t+1)} \leftarrow \text{AdamStep}(\Lambda^{(t)}, \nabla_{\Lambda} \mathcal{L}_{\text{entropy}})$
+     \ELSIF{$E = \text{ES}$}
+       \STATE Generate mutant proposal: $\Lambda_{\text{prop}} \leftarrow \Lambda^{(t)} + \sigma^{(t)} \cdot \epsilon$ where $\epsilon \sim \mathcal{N}(0, I)$
+       \STATE Construct sparse weights for parent $\Lambda^{(t)}$ and proposal $\Lambda_{\text{prop}}$ via dynamic magnitude pruning at sparsity $p$
+       \STATE Evaluate multi-task entropy losses: $\mathcal{L}^{(t)} \leftarrow \mathcal{L}(\theta_{\text{sparse}}(\Lambda^{(t)}))$, $\mathcal{L}_{\text{prop}} \leftarrow \mathcal{L}(\theta_{\text{sparse}}(\Lambda_{\text{prop}}))$
+       \IF{$\mathcal{L}_{\text{prop}} < \mathcal{L}^{(t)}$}
+         \STATE Accept mutation: $\Lambda^{(t+1)} \leftarrow \Lambda_{\text{prop}}$
+         \STATE Increase search step size: $\sigma^{(t+1)} \leftarrow \sigma^{(t)} \cdot 1.22$
+       \ELSE
+         \STATE Reject mutation: $\Lambda^{(t+1)} \leftarrow \Lambda^{(t)}$
+         \STATE Decrease search step size: $\sigma^{(t+1)} \leftarrow \sigma^{(t)} \cdot 0.82$
+       \ENDIF
+     \ENDIF
+   \ENDFOR
+   \STATE {\bfseries Return} $\theta_{\text{sparse}}(\Lambda^{(T)})$
+\end{algorithmic}
+\end{algorithm}

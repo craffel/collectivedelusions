@@ -1,0 +1,123 @@
+\section{Methodology}
+\label{sec:method}
+
+We present the formal mathematical framework for \textbf{FlatQ-Merge}, illustrating how sharpness-aware pre-training, dynamic model merging, post-training quantization, and test-time coefficient optimization are integrated into a single, cohesive pipeline.
+
+\subsection{Sharpness-Aware Expert Fine-Tuning}
+Let $\theta_{\text{base}} \in \mathbb{R}^D$ represent the parameters of a pre-trained base model. In our setup, this backbone is a Vision Transformer (\texttt{vit\_tiny\_patch16\_224}) partitioned into $L$ discrete parameter blocks (e.g., embedding, encoder layers, and normalization blocks). Given a set of $K$ distinct classification tasks, we construct task-specific experts by fine-tuning the base model on their respective training sets.
+
+To control the geometry and flatness of the task-specific loss landscapes, we optimize the experts using Sharpness-Aware Minimization (SAM) \cite{Foret2020SAM} with a specified perturbation radius $\rho \ge 0$. For task $k \in \{1, \dots, K\}$, the expert parameters $\theta_k(\rho)$ are obtained by solving:
+\begin{equation}
+\label{eq:sam}
+\theta_k(\rho) = \arg\min_{\theta_k} \max_{\|\epsilon\|_2 \le \rho} \mathcal{L}_k(\theta_k + \epsilon)
+\end{equation}
+where $\mathcal{L}_k$ is the standard task-specific classification loss (cross-entropy), and $\epsilon \in \mathbb{R}^D$ is the adversarial parameter perturbation. The parameter $\rho$ serves as a knob to control the radius of the perturbation neighborhood. Setting $\rho = 0.0$ recovers standard SGD/Adam optimization, while larger values of $\rho$ force the optimizer to converge to flatter valleys of the loss landscape.
+
+Following pre-training, we extract the task vectors for each layer group $l \in \{1, \dots, L\}$ and task $k$:
+\begin{equation}
+\label{eq:task_vector}
+\tau^l_k(\rho) = \theta^l_k(\rho) - \theta^l_{\text{base}}
+\end{equation}
+The task vectors $\tau^l_k(\rho)$ represent the fine-tuning parameter trajectory of the $k$-th task under a flatness constraint of scale $\rho$.
+
+\textbf{Theoretical Foundation:}
+To motivate why convergence to flatter minima improves resilience to post-training quantization noise, we consider a second-order Taylor expansion of the loss $\mathcal{L}_k$ around expert parameters $\theta_k^*$. Under quantization noise $\Delta \theta$, the loss change is:
+\begin{equation}
+\label{eq:taylor_loss}
+\mathcal{L}_k(\theta_k^* + \Delta \theta) - \mathcal{L}_k(\theta_k^*) \approx \frac{1}{2} \Delta \theta^T H_k \Delta \theta
+\end{equation}
+where $H_k = \nabla^2 \mathcal{L}_k(\theta_k^*)$ is the Hessian. SAM pre-training directly minimizes the eigenvalues of $H_k$, resulting in flatter loss basins with smaller curvature. For any noise vector $\Delta \theta$, the quadratic term $\frac{1}{2} \Delta \theta^T H_k \Delta \theta$ is minimized, explaining why flat experts exhibit superior intrinsic resilience to discretization compared to sharp experts.
+
+\textbf{Bridging Weight-Space and Coefficient-Space Flatness:}
+An unaddressed question is how pre-training in weight space via SAM translates to a flatter landscape in the low-dimensional coefficient space $\Lambda$ during test-time adaptation. We can establish an exact mathematical relationship. Let $\theta^l(\Lambda) = \theta^l_{\text{base}} + \sum_{k=1}^K \lambda^l_k \tau^l_k$ represent the linear parameter combination for layer group $l$. By the multi-variable chain rule, the gradient of the loss function $\mathcal{L}$ with respect to the blending coefficient $\lambda^l_k$ is:
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial \lambda^l_k} = \left(\nabla_{\theta^l} \mathcal{L}\right)^T \tau^l_k
+\end{equation}
+Taking the second derivative with respect to $\lambda^l_k$ and $\lambda^l_j$ (since different layer groups $l$ affect disjoint parameter subsets, the Hessian is block-diagonal with respect to layer indices):
+\begin{equation}
+(H^l_{\Lambda})_{k, j} = \frac{\partial^2 \mathcal{L}}{\partial \lambda^l_k \partial \lambda^l_j} = (\tau^l_k)^T H^l_{\theta} \tau^l_j
+\end{equation}
+where $H^l_{\theta} = \nabla^2_{\theta^l} \mathcal{L} \in \mathbb{R}^{d_l \times d_l}$ is the weight-space Hessian of layer group $l$. If we define $T^l \in \mathbb{R}^{d_l \times K}$ as the matrix whose columns are the task vectors $\{\tau^l_k\}_{k=1}^K$, we can write this in matrix projection form:
+\begin{equation}
+H^l_{\Lambda} = (T^l)^T H^l_{\theta} T^l
+\end{equation}
+Thus, the coefficient-space Hessian $H^l_{\Lambda}$ is exactly the projection of the weight-space Hessian $H^l_{\theta}$ onto the subspace spanned by the task vectors. By the properties of symmetric matrix projections, the maximum eigenvalue and the trace of the coefficient-space Hessian are bounded by:
+\begin{equation}
+\lambda_{\max}(H^l_{\Lambda}) \le \lambda_{\max}(H^l_{\theta}) \cdot \|T^l\|_2^2
+\end{equation}
+\begin{equation}
+\text{Tr}(H^l_{\Lambda}) = \sum_{k=1}^K (\tau^l_k)^T H^l_{\theta} \tau^l_k \le \lambda_{\max}(H^l_{\theta}) \sum_{k=1}^K \|\tau^l_k\|_2^2
+\end{equation}
+This derivation proves that pre-training task-specific experts via SAM to minimize the spectral norm $\lambda_{\max}(H^l_{\theta})$ directly bounds and flattens both the trace and spectral norm of the coefficient-space Hessian $H^l_{\Lambda}$! This rigorous mathematical connection explains why pre-merging expert-level flatness directly guarantees a smooth, noise-robust coefficient-space landscape during test-time adaptation.
+
+\subsection{Layer-wise Dynamic Blending}
+To merge the $K$ task-specific experts, we parameterize blending via a continuous coefficient matrix $\Lambda = \{\lambda^l_k\} \in [0, 1]^{L \times K}$, where $\lambda^l_k$ is the weight of task $k$'s vector at layer $l$. The unquantized merged weights at layer $l$ are:
+\begin{equation}
+\label{eq:unquant_merge}
+\theta^l_{\text{merged}}(\Lambda, \rho) = \theta^l_{\text{base}} + \sum_{k=1}^K \lambda^l_k \tau^l_k(\rho)
+\end{equation}
+Initially, we set $\lambda^l_k = 0.3$ uniformly across all layers, matching uniform initialization.
+
+It is critical to note that the linear combination in Equation \ref{eq:unquant_merge} is strictly applied only to the shared backbone parameters ($\theta^l_{\text{base}}$), which are structurally identical across all task-specific models. The task-specific classification heads (which reside at the final layer of the network) remain in full FP32 precision and are kept separate and mapped individually for each task. Because these classification heads are never merged or averaged together, our framework completely avoids any structural shape incongruence issues that would arise if task-specific heads were of different shapes or dimensions.
+
+\textbf{Independent Coefficient Bounds:}
+Instead of a sum-to-one constraint (e.g., Softmax combination), we prefer independent parameter clipping in $[0, 1]$. A rigid convex combination restricts capacity by forcing a zero-sum game between tasks, whereas different layers require different absolute contribution levels. Independent bounds allow test-time adaptation to scale each task vector independently, balancing tasks of different magnitudes. While allowing coefficients to sum up to $K$ could theoretically cause scale explosion, our per-channel dynamic quantization scales $S^l_c$ (Equation \ref{eq:scale}) naturally absorb any joint scaling factors, and subsequent Layer Normalization blocks prevent activation overflow or distribution shifts in the forward pass. We provide a rigorous empirical comparison with a Softmax combination baseline in Section \ref{sec:exp_softmax}, demonstrating that our independent clipping scheme dramatically outperforms normalized combinations under both 8-bit and 4-bit precision.
+
+\subsection{Straight-Through Post-Training Quantization}
+We compress the merged parameters using per-channel symmetric uniform PTQ to $b \in \{4, 8\}$ bits. For any weight tensor at layer $l$, scale factors are computed dynamically along each output channel $c$. In our Vision Transformer backbone, projection layers (such as the patch embedding block) utilize 4D convolutional weight tensors of shape $[C_{\text{out}}, C_{\text{in}}, H_{\text{kernel}}, W_{\text{kernel}}]$. To perform per-channel quantization on these multi-dimensional tensors, we directly compute scale factors along the output channel axis ($C_{\text{out}}$) without flattening, ensuring that each 3D kernel slice $[c, :, :, :]$ is scaled independently. For standard 2D weight matrices, scale factors are computed along the out-features dimension directly. The scale factor $S^l_c(\Lambda, \rho)$ is defined as:
+\begin{equation}
+\label{eq:scale}
+S^l_c(\Lambda, \rho) = \frac{\max\left(\left|\theta^{l,c}_{\text{merged}}(\Lambda, \rho)\right|\right)}{2^{b-1} - 1}
+\end{equation}
+The quantized and reconstructed weights for channel $c$ are computed by rounding and clipping:
+\begin{equation}
+\label{eq:quant_round}
+q^{l,c}(\Lambda, \rho) = \text{round}\left(\frac{\theta^{l,c}_{\text{merged}}(\Lambda, \rho)}{S^l_c(\Lambda, \rho)}\right)
+\end{equation}
+\begin{equation}
+\label{eq:quant}
+\theta^{l,c}_{\text{quant}}(\Lambda, \rho) = \text{clip}\left[ q^{l,c}(\Lambda, \rho), -2^{b-1}, 2^{b-1}-1 \right] S^l_c(\Lambda, \rho)
+\end{equation}
+During the forward pass, $\theta^{l,c}_{\text{quant}}(\Lambda, \rho)$ is used for model execution. Because the `round` and `clip` operators have zero derivative almost everywhere, standard backpropagation through Equation \ref{eq:quant} is impossible. We resolve this by employing the Straight-Through Estimator (STE) \cite{Hubara2017Quantized}, which approximates the gradient of the rounding operation as an identity mapping:
+\begin{equation}
+\label{eq:ste}
+\frac{\partial \text{round}(x)}{\partial x} \approx 1
+\end{equation}
+This allows us to propagate gradients directly back to the continuous coefficient parameters $\Lambda$ through the quantization operator during test-time optimization.
+
+\subsection{Test-Time Adaption via Joint Entropy Minimization}
+Deploying the model in an unsupervised setting requires adapting the merging coefficients without access to task labels. We feed the model an unlabeled, balanced calibration dataset $X = \{x_1, \dots, x_N\}$ consisting of $N$ input images from all target tasks. The merging coefficients $\Lambda$ are optimized by minimizing the joint prediction entropy:
+\begin{equation}
+\label{eq:entropy_loss}
+\mathcal{L}_{\text{entropy}}(\Lambda) = \frac{1}{N} \sum_{i=1}^N \mathcal{H}\left(f\left(x_i; \theta_{\text{quant}}(\Lambda, \rho)\right)\right)
+\end{equation}
+where $\mathcal{H}(p) = -\sum_j p_j \log p_j$ is the standard Shannon entropy of the model's output distribution, and $f(x_i; \theta_{\text{quant}})$ is the forward pass of the quantized network. Under the STE framework, we optimize $\Lambda$ using the Adam optimizer for a fixed number of steps (40 steps in our experiments) to yield the optimal adapted coefficients $\Lambda^*$.
+
+\textbf{Optimization Dynamics and Gradient Stability under STE:}
+Because the quantized loss landscape is piecewise constant and non-differentiable, utilizing the Straight-Through Estimator (STE) introduces a known gradient mismatch error, where the true gradient is zero almost everywhere but the surrogate gradient computed via STE is non-zero. This gradient mismatch can potentially lead to gradient instability, vanishing gradients, or local oscillations during optimization. In our empirical validation, we found that optimizing the tiny 56-parameter coefficient matrix $\Lambda$ is remarkably stable and robust against these issues. We attribute this high stability to two key factors: (1) \emph{The Low-Dimensional Parameter Bottleneck}: Since we only update 56 coefficients rather than millions of weights, the optimization is highly over-determined, and individual gradient approximation errors are averaged out across the large weight tensors; and (2) \emph{Adam Learning Rate Tuning}: We systematically tuned the Adam learning rate and found that a moderate learning rate of $\eta = 1 \times 10^{-3}$ acts as an important stabilizer. Smaller learning rates (e.g., $1 \times 10^{-4}$) suffer from vanishing gradient updates because the small surrogate steps fail to cross the rounding thresholds, whereas larger learning rates (e.g., $1 \times 10^{-2}$) trigger severe, chaotic local oscillations across step boundaries. A learning rate of $10^{-3}$ provides the optimal balance, allowing high-precision, sub-pixel adjustments without destabilizing the optimization dynamics.
+
+\textbf{Avoiding Degenerate Class Collapse via Implicit Regularization:} 
+A known vulnerability of unsupervised prediction entropy minimization (conditional entropy minimization) is its tendency to converge to a degenerate global minimum, where the model predicts a single class with $100\%$ confidence for all inputs. Traditional test-time adaptation methods (e.g., TENT \cite{Wang2021Tent} or SHOT \cite{Liang2020SHOT}) mitigate this risk by incorporating an explicit diversity regularizer that maximizes the marginal entropy of the average predictions across a batch.
+
+In our framework, we minimize prediction entropy without any explicit diversity regularization. Yet, our empirical evaluation (Section \ref{sec:experiments}) confirms that FlatQ-Merge is exceptionally resilient to class and task collapse. We hypothesize that this resilience is due to a powerful \emph{implicit structural regularization} imposed by our tight coefficient parameterization. In FlatQ-Merge, the core model parameters are not updated freely; instead, optimization is strictly confined to the layer-wise coefficient tensor $$\Lambda \in [0, 1]^{L \times K}$$, which consists of only $$L \times K = 56$$ parameters. Because these coefficients are bounded and initialized at $0.3$, the model is physically constrained to interpolate within the linear combinations of pre-trained, high-quality task vectors. This low-dimensional search space acts as a strong structural bottleneck that prevents the parameters from drifting into degenerate regimes, ensuring that the model's predictions remain grounded within realistic, task-relevant manifolds without requiring explicit diversity penalties. We empirically validate this hypothesis in Section \ref{sec:exp_collapse} by comparing our low-dimensional optimization against standard high-dimensional TENT-style adaptation of all model parameters, demonstrating that the latter indeed suffers from catastrophic class and task collapse.
+
+\subsection{The FlatQ-Merge Algorithm}
+To clarify the complete execution flow of our proposed framework, we present the step-by-step procedure for \textbf{FlatQ-Merge} in Algorithm \ref{alg:flatq_merge} in Appendix \ref{sec:appendix_algorithm}. This procedural flow maps out how pre-training expert flatness translates directly into test-time adaptation robustness, using the Straight-Through Estimator to propagate gradients through the discrete rounding and clipping operators of the post-training quantization step.
+
+\subsection{Coefficient Stability and Perturbation Sensitivity Analysis}
+To empirically investigate the stability and noise-resilience of the test-time coefficient adaptation trajectory under quantization, we perform a systematic perturbation sensitivity analysis. Rather than assuming full asymptotic convergence to a continuous local minimum (which is computationally impractical under strict edge-deployment latency constraints), we analyze the landscape around the adapted coefficients $\Lambda^*$ after a low number of optimization steps (e.g., $40$ steps).
+
+We apply random Gaussian perturbations directly to these adapted coefficients:
+\begin{equation}
+\label{eq:perturb}
+\Lambda' = \Lambda^* + \delta, \quad \delta \sim \mathcal{N}(0, \sigma^2 I)
+\end{equation}
+We sweep the noise scale $\sigma \in [0.0, 0.1]$ and measure the expected change in joint prediction entropy:
+\begin{equation}
+\label{eq:entropy_diff}
+\Delta \mathcal{L}(\sigma) = \mathbb{E}_{\delta}\left[ \mathcal{L}_{\text{entropy}}(\Lambda^* + \delta) - \mathcal{L}_{\text{entropy}}(\Lambda^*) \right]
+\end{equation}
+
+Importantly, we must characterize the mathematical nature of the loss landscape $\mathcal{L}_{\text{entropy}}(\Lambda)$ with respect to the merging coefficients $\Lambda$ under post-training quantization. Since $\mathcal{L}_{\text{entropy}}(\Lambda)$ is evaluated over the quantized weights $\theta_{\text{quant}}(\Lambda)$, the discrete rounding operator (Equation \ref{eq:quant_round} and Equation \ref{eq:quant}) renders the weights---and consequently the loss function---piecewise constant with respect to $\Lambda$. The loss landscape consists of flat multi-dimensional plateaus separated by step-like jump discontinuities. Consequently, a smooth, continuous Taylor expansion of the loss function $\mathcal{L}$ around $\Lambda^*$ is not strictly mathematically valid, and the gradient of the loss is zero almost everywhere.
+
+Instead, we interpret the expected change $\Delta \mathcal{L}(\sigma)$ as a measure of the \emph{discretization noise tolerance} and the local stability of the optimized state. For extremely small noise scales $\sigma$, the perturbed coefficients $\Lambda^* + \delta$ are highly likely to remain on the same local flat plateau, resulting in identical quantized weights $\theta_{\text{quant}}(\Lambda^* + \delta) = \theta_{\text{quant}}(\Lambda^*)$ and zero change in loss ($\Delta \mathcal{L}(\sigma) = 0$). As the perturbation scale $\sigma$ increases, the vector $\Lambda^* + \delta$ eventually crosses some of the discrete rounding thresholds of the quantization operator, causing small, step-like changes in the reconstructed weights. Measuring the magnitude and variance of $\Delta \mathcal{L}(\sigma)$ under varying $\sigma$ and SAM pre-training radii $\rho$ allows us to empirically profile the width and stability of the plateau where the adapted parameters reside, offering crucial insights into how pre-merging flatness shapes the downstream discrete parameter landscape.

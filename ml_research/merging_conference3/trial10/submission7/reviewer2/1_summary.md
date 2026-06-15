@@ -1,0 +1,24 @@
+# Evaluation: Paper Summary
+
+## Main Topic and Approach
+The paper addresses a critical deployment limitation of test-time dynamic model merging and expert ensembling routers in multi-tenant environments. While stateful (recurrent or kinetic) routers like ChemMerge and PAC-Kinetics have successfully smoothed ensembling trajectories and reduced high-frequency routing jitter (sample-level noise) in single-user sequential query streams, they suffer from a severe **state contamination (cross-talk) bottleneck** when deployed in realistic, multi-tenant interleaved workloads. In these real-world environments, queries from independent users with different tasks arrive in interleaved succession. Standard stateful routers bleed memory states across unrelated tenants, causing catastrophic representational bleeding and accuracy degradation.
+
+To resolve this issue, the authors introduce **Tenant-Decoupled Stateful Routing (TDSR)**, powered by a state decoupling mechanism called **Slot-Kinetics**. Instead of keeping a single global routing state, TDSR maintains a highly compact pool of virtual routing state slots. The framework proposes two key modes:
+1. **Explicit Session Tagging (Metadata-Tagged):** The router maps requests to corresponding state slots directly via session metadata provided by the serving infrastructure (e.g., S-LoRA or Punica), introducing zero computational overhead.
+2. **Implicit Tagless Clustering (Dynamic Inference):** When metadata is unavailable, the router dynamically infers session context on-the-fly. This is achieved by initializing and keeping slot centroids fixed as orthogonal coordinate detector vectors, which mathematically simplifies cosine similarity to a simple coordinate-argmax assignment (selecting the slot corresponding to the task with maximum activation coordinate), bypassing clustering collapse and centroid drift.
+
+Furthermore, the authors propose a **Tenant-Specific Session-Step Decay** (local decay) coupled with a **Dual-Clock Decay** policy, allowing inactive slots to hold their states constant during active serving blocks to prevent state washout, while running a secondary physical timer to evict obsolete slots to prevent memory leaks.
+
+## Key Findings and Claims
+1. **Exposure of State Contamination:** Standard stateful routing (Global PAC-Kinetics) under interleaved multi-tenant workloads suffers from cross-tenant state contamination, resulting in up to a 5.00% drop in absolute classification accuracy compared to clean sequential streams.
+2. **TDSR Accuracy Improvement:** TDSR Explicit resolves this contamination, achieving up to **70.60%** classification accuracy on Orthogonal Manifolds (outperforming contaminated Global PAC-Kinetics by **+1.90%**) and **70.85%** on Overlapping Manifolds (outperforming contaminated Global PAC-Kinetics by **+1.75%**), and performing within 0.50% of the isolated clean-stream baseline ceiling.
+3. **Robustness of TDSR Implicit:** TDSR Implicit achieves **70.15%** classification accuracy on Overlapping Manifolds, outperforming contaminated Global PAC-Kinetics (+1.05%) even without session metadata, although trailing TDSR Explicit by a minor 0.70% due to coordinate projection contamination.
+4. **Jitter Reduction:** By introducing an **intra-session jitter** metric, the authors demonstrate that TDSR Explicit slashes high-frequency noise and stabilizes ensembling trajectories, achieving a **2.4x stability improvement** over stateless SABLE.
+5. **Microscopic Systems Overhead:** The state pool is extremely lightweight (e.g., $M \times K$ float tensor), enabling in-register CPU/GPU or L1 cache operations that execute in **less than 1.5 microseconds**, introducing zero database lookups or network overhead.
+
+## Explicitly Claimed Contributions (with Evidence)
+1. **Characterization of the State Contamination Bottleneck:** The authors identify and mathematically formalize the representation-bleeding issue that occurs when global stateful routers process interleaved multi-tenant streams.
+2. **The TDSR / Slot-Kinetics Framework:** They propose a lightweight virtual state slot system with two modes (Explicit and Implicit) that successfully decouple temporal smoothing across user sessions.
+3. **Tenant-Specific Session-Step and Dual-Clock Decay Policies:** They formulate a decay strategy that preserves user context during sparse serving blocks while preventing memory leaks during idle periods.
+4. **Intra-Session vs. Inter-Session Jitter Disentanglement:** They correct previous statistical interpretations of routing jitter by separating necessary inter-session context switches from unnecessary intra-session noise.
+5. **Extensive Quantitative Validation:** They validate TDSR on the high-fidelity Analytical Coordinate Sandbox (ICS) across 5 independent random seeds, demonstrating significant accuracy improvements, concurrency scaling sweeps, and physical timeout sweeps.

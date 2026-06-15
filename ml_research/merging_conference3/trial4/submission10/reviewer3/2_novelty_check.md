@@ -1,0 +1,15 @@
+# 2. Novelty Check
+
+## Originality and Ambition
+The core conceptual leap of this paper is highly original and ambitious. Traditional model merging is dominated by algebraic linear operations (adding, scaling, sign-resolving) performed in a static fashion before deployment. Rather than pursuing minor incremental variations of static parameter combining, this paper introduces a bold physical metaphor—modeling specialized expert weights as eigenstates in a parameter Hilbert space and representing model merging as a dynamic, input-dependent quantum-like wavefunction superposition and measurement collapse.
+
+This quantum-inspired framing represents a genuine conceptual leap that shifts the conversation from static parameter blending to dynamic parameter-wave routing. The use of physical wave properties—specifically wave-like phase-interference, constructive/destructive interference, and measurement-induced collapse—to coordinate multiple specialized experts inside a single compact backbone is an elegant and refreshing perspective.
+
+## Characterization of the 'Delta'
+While dynamic input-dependent weight adaptation has been explored in test-time adaptation (e.g., AdaMerging) and Mixture-of-Experts (MoE) architectures, the "delta" of QWS-Merge from prior work is substantial:
+1. **Wave-Inspired Subspace Confinement:** Unlike classical gating networks (like the Linear Router baseline) which employ unconstrained, high-dimensional linear projections prone to extreme overfitting in data-scarce regimes, QWS-Merge forces the parameters to lie in a highly regularized, spherical wave-phase manifold. The mathematical formulation utilizes the non-monotonic, bounded nature of cosine projections to filter out optimization noise.
+2. **Layer-Wise Phase Specialization:** Unlike AdaMerging or standard static few-shot methods, QWS-Merge implements layer-specific phase bases, allowing the model to dynamically form localized, fine-grained activation pathways.
+3. **Scientific Investigation of Heterogeneity:** The paper’s investigation of task heterogeneity and batch-size effects is a highly novel scientific contribution. Standard model merging papers almost exclusively evaluate on homogeneous, single-task streams, concealing how batch-level task mixing impacts dynamic routing. By introducing and formally documenting **"heterogeneity collapse,"** the authors provide a transparent, scientifically honest, and non-incremental contribution to the field.
+
+## Evaluation of Novelty: Significant
+The novelty of this work is **significant**. It is not an incremental refinement of existing merging algorithms. Instead, the authors have successfully ported physical wave-interference principles into parameter space to solve a concrete problem (representational collapse in compact models under high task conflict). The physical metaphor is not merely cosmetic; it directly guides the mathematical design (the spherical normalization and the non-monotonic cosine-wave activation), acting as a highly functional, low-dimensional regularizer that prevents the unconstrained parameter-space collapse afflicting classical linear routing.

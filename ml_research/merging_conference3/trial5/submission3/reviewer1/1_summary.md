@@ -1,0 +1,17 @@
+# 1. Summary of the Paper
+
+## Main Topic and Approach
+This paper focuses on the paradigm of **dynamic model merging** (parameter fusion) for combining task-specific expert models without expensive re-training. It specifically investigates the trend of escalating architectural and structural complexity in dynamic merging methods—such as the recently proposed Quantum Wavefunction Superposition Merging (QWS-Merge)—which introduce complex, multi-stage, quantum-inspired frameworks under the assumption that classical linear routing suffers from structural limitations leading to catastrophic collapse on challenging out-of-distribution (OOD) tasks like SVHN. 
+
+To challenge this assumption, the authors propose a highly elegant and parsimonious alternative: **Robust Linear Routing (RLR)**. RLR retains a simple, classical linear gating layer (requiring only 768 parameters) but stabilizes its optimization using two timeless and standard regularization techniques: $L_2$ weight decay and Softmax Temperature scaling.
+
+## Key Findings
+1. **Deconstruction of the SVHN Collapse:** The paper demonstrates that the previously reported catastrophic SVHN collapse of classical linear routing is not an inherent structural limitation. With proper configuration (parsimonious training, moderate learning rate, and early representation routing), a standard unregularized Linear Router is highly robust, achieving a mean joint accuracy of $91.53\% \pm 0.41\%$ across five random seeds.
+2. **Specialized Stabilization via RLR:** Rather than acting as a mandatory fix for in-distribution performance, RLR acts as a specialized stabilizer. Under out-of-distribution shifts and heterogeneous mixed-task test streams, RLR's $L_2$ regularization and temperature scaling prevent overconfident gating and softmax saturation, mitigating "heterogeneity collapse" at larger batch sizes.
+3. **Efficiency and Simplicity:** RLR achieves high performance with extreme efficiency, requiring only 768 parameters, optimizing in under a second on 64 calibration samples, and introducing zero runtime latency.
+
+## Explicitly Claimed Contributions and Supporting Evidence
+* **Scientific Deconstruction of Over-Engineering:** The authors locally re-implement and evaluate QWS-Merge under identical conditions, showing that classical unregularized linear routing ($95.46\%$ Joint Mean) and RLR ($94.68\%$ Joint Mean) significantly outperform QWS-Merge ($90.03\%$ Joint Mean), debunking the need for complex wave phase-interference projection. Supporting evidence is provided in Table 1 (homogeneous accuracy comparison) and Table 2 (diagnostic configuration comparison).
+* **Robust Linear Routing (RLR) Framework:** The authors introduce RLR, which regularizes classical linear routing with weight decay and temperature scaling. Supporting evidence is provided in Section 3 and Table 1.
+* **Resilience to Heterogeneous Test Streams:** The authors evaluate dynamic merging under mixed-task streams across varying evaluation batch sizes ($B \in \{1, 16, 256\}$). They show that RLR consistently maintains an accuracy buffer over unregularized routing ($+1.88\%$ at $B=256$), validating its stabilizing effect. Supporting evidence is provided in Table 3 and Figure 2.
+* **Methodological Rigor and Analysis:** The paper includes a 5-seed statistical validation (Section 4.3), representation source layer ablation (Table 4), and a 2D hyperparameter sensitivity analysis (Figure 3), demonstrating that the performance of classical routing is highly robust and insensitive to hyperparameter choices.

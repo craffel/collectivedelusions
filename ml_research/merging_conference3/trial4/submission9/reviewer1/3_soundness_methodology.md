@@ -1,0 +1,24 @@
+# Intermediate Evaluation: 3. Soundness and Methodology
+
+## Clarity of the Description
+The description of the methodology is mathematically clear, structured, and easy to follow. The authors define their variables explicitly, provide formulas for task vector extraction (Eq. 1), global and layer-wise standardization (Eq. 2–5), coordinate-wise routing (Eq. 6–7), global thresholding (Eq. 10–11), and the TLC-Tune objective and optimization process. The transition between dense and sparse settings is well-articulated.
+
+---
+
+## Appropriateness of Methods
+From a theoretical perspective, several aspects of the methodology are heuristic and lack formal mathematical justification:
+1. **The Choice of Coherence Retention Factor $\gamma$:** The default value $\gamma = 0.2$ is selected empirically. There is no principled mathematical analysis or theoretical framework to derive why $\gamma=0.2$ is optimal or under what conditions it guarantees representation coherence.
+2. **Dynamic Coherence Scheduling (DCS) Derivation:** The quadratic schedule $\gamma(p) = \gamma_0 + (1 - \gamma_0) \cdot p^2$ is justified by asserting that the probability of coordinate-level collisions under independent random pruning masks decreases quadratically, proportional to $(1-p)^2$. However, this assumption of independent, uniformly distributed pruning masks is highly questionable. Fine-tuned models share a common pre-trained base initialization and are therefore highly correlated in their weight trajectories. Their update masks are not independent in practice. Furthermore, the quadratic relationship is only exact for $K=2$ tasks under independent uniform masks. For $K > 2$ tasks, the probability of at least two active coordinate collisions is more complex. Thus, the quadratic scheduling rule is mathematically loose and lacks rigorous derivation.
+3. **Decoupled Standardization Scale:** The authors highlight a deliberate design choice: they evaluate routing decisions in a standardized space (divided by $\sigma_k$) to prevent dominant tasks from monopolizing the network, but apply the physical weight updates in the original, unstandardized weight space. While the intuitive justification is sound (preventing distortion of pre-trained knowledge scales), this decoupled formulation is mathematically inconsistent. It routes parameters based on one metric (standardized magnitude) but integrates them based on another (unstandardized magnitude), creating a disconnect that is not theoretically modeled or analyzed.
+4. **Heuristic Minimax Objective in TLC-Tune:** The objective function $\mathcal{S}_{\text{val}} = \min_{k} \text{Acc}_k(\theta_{\text{merged}}) + 0.1 \cdot \text{Mean}(\text{Acc}(\theta_{\text{merged}}))$ is a heuristic combination. The choice of the weighting coefficient $0.1$ is highly arbitrary and lacks theoretical justification. There is no principled theory to balance the minimax objective (raising the floor) with the global mean performance.
+
+---
+
+## Potential Technical Flaws
+1. **Lack of Convergence Guarantees for TLC-Tune:** TLC-Tune utilizes a simple greedy zero-order (1+1) Evolution Strategy on a small validation split. While the search space is low-dimensional ($K=4$), the paper provides no theoretical analysis of the convergence rate, local minima avoidance, or generalization bounds for this optimization procedure. It is presented as a "stable" alternative, but there are no formal proofs or mathematical guarantees that (1+1)-ES will converge to the global optimum, especially given the non-convex, non-differentiable nature of validation accuracy.
+2. **Generalization of the Optimized Scale Vectors:** The scaling factors $\Lambda$ are optimized on a very small validation split of 128 samples per task (512 samples total). The authors claim this avoids the "Overfitting-Optimizer Paradox," but from a statistical learning theory perspective, optimizing parameters on a tiny validation split without formal regularization typically leads to transductive overfitting (high variance). The paper lacks any theoretical generalization bounds (e.g., VC-dimension or Rademacher complexity analysis) to prove why a 4-dimensional parameter space is mathematically guaranteed to generalize well from 512 samples to the full test set.
+
+---
+
+## Reproducibility
+The reproducibility of the core method appears high. The authors provide explicit, detailed formulas, list the initialization parameters for TLC-Tune ($\Lambda = \mathbf{1.0}$, $\sigma = 0.1$, $\alpha_{\text{up}} = 1.22$, and $\beta_{\text{down}} = 0.82$), specify the number of optimization steps (40 steps), and outline the dataset preparation. The core routing implementation is claimed to require fewer than 10 lines of PyTorch. However, the exact splits of the 128 validation samples per task and the specific random seeds are necessary to reproduce the exact numerical values, which can exhibit minor statistical variance as reported.

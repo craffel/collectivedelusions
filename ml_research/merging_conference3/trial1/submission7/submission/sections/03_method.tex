@@ -1,0 +1,91 @@
+\section{Methodology}
+\label{sec:methodology}
+
+We present our formal framework for model merging and define the rigorous diagnostic treatments designed to stress-test and analyze learned merging parameters.
+
+\subsection{Layer-wise Model Merging Formulation and Optimizers}
+Let $\theta_{\text{pre}} \in \mathbb{R}^D$ be the parameter weights of a pre-trained base network (such as CLIP ViT-B/32) containing $L$ discrete layers (or parameter groups). Suppose we have a set of $K$ distinct downstream tasks $\{1, \dots, K\}$. For each task $k$, the base network is independently fine-tuned to obtain task-specific weights $\theta_k \in \mathbb{R}^D$. Following the task arithmetic framework \cite{ilharco2022editing}, we extract the layer-wise task vector $\tau^l_k$ for layer $l \in \{1, \dots, L\}$ and task $k$ as:
+\begin{equation}
+    \tau^l_k = \theta^l_k - \theta^l_{\text{pre}}
+\end{equation}
+The standard layer-wise model merging paradigm constructs the merged weights $\theta^l_{\text{merged}}$ for layer $l$ using a set of layer-wise, task-wise coefficients $\Lambda = \{\lambda^l_k\}$ where $\lambda^l_k \in [0, 1]$:
+\begin{equation}
+    \theta^l_{\text{merged}}(\Lambda) = \theta^l_{\text{pre}} + \sum_{k=1}^K \lambda^l_k \tau^l_k
+\end{equation}
+The full parameter set $\Lambda$ contains $L \times K$ individual scalars. In standard Test-Time Adaptation settings like AdaMerging \cite{yang2024adamerging}, these parameters are optimized to minimize the prediction entropy $\mathcal{H}$ over an unlabeled validation mixture $D_{\text{val}} = \bigcup_{k=1}^K D^k_{\text{val}}$:
+\begin{equation}
+    \label{eq:opt_obj}
+    \min_{\Lambda} \mathcal{L}(\Lambda) = \min_{\Lambda} \sum_{k=1}^K \mathbb{E}_{X \in D^k_{\text{val}}} [ \mathcal{H}( P( y \mid X; \theta_{\text{merged}}(\Lambda) ) ) ]
+\end{equation}
+
+We evaluate and compare two distinct optimization paradigms to solve this objective:
+
+\textbf{1. Zero-Order Adaptive 1+1 Evolution Strategy (1+1 ES):} Our 1+1 ES is a derivative-free black-box optimizer. It proposes candidate parameters $\Lambda_{cand}$ by adding Gaussian noise: $\Lambda_{cand} = \text{clip}(\Lambda + \mathcal{N}(0, \sigma^2 I), 0, 1)$. If the joint prediction entropy loss is reduced, the update is accepted ($\Lambda \leftarrow \Lambda_{cand}$) and the mutation step-size is increased ($\sigma \leftarrow \min(\sigma \times 1.1, 0.5)$); otherwise, the update is rejected and the step-size is decreased ($\sigma \leftarrow \max(\sigma \times 0.9, 10^{-4})$). This mimics test-time scenarios where gradients are unavailable or backpropagation is too costly.
+
+\textbf{2. First-Order Gradient Descent (Adam GD):} To isolate optimizer confounding, we also implement standard first-order backpropagation using PyTorch's functional autograd. We treat the coefficients $\Lambda$ as continuous leaf parameters with $\Lambda \in [0, 1]^{K \times L}$, construct the merged state dict differentiably, and compute exact gradients:
+\begin{equation}
+    g = \nabla_{\Lambda} \mathcal{L}(\Lambda)
+\end{equation}
+We update $\Lambda$ using the Adam optimizer with a learning rate of $10^{-2}$ for 200 steps, projecting the updated parameters back into $[0, 1]$ after each step via clamping.
+
+\subsection{The Joint Entropy Minimization Task-Bias}
+While prediction entropy minimization is widely used in test-time adaptation, we expose a critical, unformulated methodological flaw in SOTA joint objectives. Let $\mathcal{H}_k(\Lambda) = \mathbb{E}_{X \in D^k_{\text{val}}} [\mathcal{H}(P(y | X; \theta_{\text{merged}}(\Lambda)))]$ be the average prediction entropy on task $k$. The total objective is $\mathcal{L}(\Lambda) = \sum_{k=1}^K \mathcal{H}_k(\Lambda)$. 
+
+When tasks are imbalanced in difficulty, their entropy ranges are naturally very different. Simple, saturated classification tasks (e.g., MNIST) exhibit extremely low entropy (near 0) and low variance. Conversely, complex, noisy, or non-linear tasks (e.g., SVHN) reside in a high-entropy regime:
+\begin{equation}
+    \mathcal{H}_{\text{MNIST}}(\Lambda) \ll \mathcal{H}_{\text{SVHN}}(\Lambda)
+\end{equation}
+To minimize the sum $\mathcal{L}(\Lambda)$, the optimizer has a strong incentive to sacrifice performance on the high-entropy task $\mathcal{H}_{\text{SVHN}}$ by trading off its coefficient alignment in order to eke out marginal entropy reductions on the simpler tasks, as simple tasks have cleaner gradients and highly stable prediction patterns. This introduces a fundamental multi-task optimization bias that degrades joint capabilities on complex domains, which we empirically analyze in Section \ref{sec:experiments}.
+
+\subsection{Diagnostic Treatments}
+To evaluate whether the optimized layer-wise coefficients $\Lambda$ capture physical, localized task importances across layers, we introduce three rigorous control treatments.
+
+\subsubsection{Diagnostic Treatment 1: Intra-Task Layer Shuffling}
+If the exact layer-wise assignment of coefficients is functionally critical (e.g., if layer $l$ truly requires a higher coefficient for task $k$ than layer $l'$), then shuffling these coefficients across the layer dimension should catastrophically disrupt the merged model's performance. 
+
+For each task $k$, let $\pi_k: \{1, \dots, L\} \to \{1, \dots, L\}$ be a randomly sampled permutation of the layer indices. The shuffled merging weights are defined as:
+\begin{equation}
+    \theta^l_{\text{shuffle}} = \theta^l_{\text{pre}} + \sum_{k=1}^K \lambda^{\pi_k(l)}_k \tau^l_k
+\end{equation}
+Under the null hypothesis that layer-specificity is a methodological illusion, we expect the shuffled model to perform comparably to the original optimized model.
+
+\subsubsection{Diagnostic Treatment 2: Task-Wise Spatial Averaging}
+If the high-parameter layer-wise formulation is redundant, we should be able to collapse the layer dimension entirely without significant loss in performance. 
+
+For each task $k$, we compute the average coefficient across all layers:
+\begin{equation}
+    \bar{\lambda}_k = \frac{1}{L} \sum_{l=1}^L \lambda^l_k
+\end{equation}
+We then construct the spatially averaged merging weights as:
+\begin{equation}
+    \theta^l_{\text{mean}} = \theta^l_{\text{pre}} + \sum_{k=1}^K \bar{\lambda}_k \tau^l_k
+\end{equation}
+This treatment effectively reduces the tuned parameter search space from $L \times K$ to just $K$ parameters (a 92.3\% reduction for a 13-group model). If the performance of $\theta^l_{\text{mean}}$ is close to that of $\theta^l_{\text{merged}}$, it proves that the complexity of layer-wise optimization is unnecessary.
+
+\subsubsection{Diagnostic Treatment 3: Norm-Bounded Perturbation}
+To evaluate the sensitivity and flatness of the model merging optimization landscape, we inject norm-bounded Gaussian noise directly into the optimized parameters. If the landscape is flat, the model should show high tolerance to noise.
+
+Let $\epsilon^l_k \sim \mathcal{N}(0, \sigma^2)$ be relative Gaussian noise scaled by the parameter magnitude and a noise level hyperparameter $\gamma > 0$:
+\begin{equation}
+    \hat{\lambda}^l_k = \text{clip}\left(\lambda^l_k + \epsilon^l_k, 0, 1\right) \quad \text{where } \epsilon^l_k \sim \mathcal{N}\left(0, \left(\gamma \lambda^l_k\right)^2\right)
+\end{equation}
+The perturbed weight is:
+\begin{equation}
+    \theta^l_{\text{noise}} = \theta^l_{\text{pre}} + \sum_{k=1}^K \hat{\lambda}^l_k \tau^l_k
+\end{equation}
+We evaluate the average merged accuracy across a broad sweep of noise levels $\gamma \in [0.05, 0.50]$.
+
+\subsection{Representational Similarity (CKA) Analysis}
+To investigate the representational behavior of the merged networks in activation space, we compute the linear Centered Kernel Alignment (CKA) similarity between the hidden activations of task experts and the merged models.
+
+Let $X^l_k \in \mathbb{R}^{N \times D}$ be the hidden activations (features) of task $k$'s independent expert backbone at layer $l$ for a batch of $N$ inputs. Let $X^l_{\text{merged}} \in \mathbb{R}^{N \times D}$ be the corresponding activations of the merged model. We define the Gram matrices $K_1 = X^l_k (X^l_k)^\top$ and $K_2 = X^l_{\text{merged}} (X^l_{\text{merged}})^\top$. The linear CKA is:
+\begin{equation}
+    \text{CKA}(K_1, K_2) = \frac{\text{HSIC}(K_1, K_2)}{\sqrt{\text{HSIC}(K_1, K_1) \text{HSIC}(K_2, K_2)}}
+\end{equation}
+where $\text{HSIC}$ is defined as:
+\begin{equation}
+    \text{HSIC}(K_1, K_2) = \frac{1}{(N-1)^2} \text{Tr}(K_1 H K_2 H)
+\end{equation}
+and $H = I_N - \frac{1}{N} \mathbf{1}\mathbf{1}^\top$ is the centering matrix. 
+
+If layer-wise optimized coefficients truly align representations, we expect the optimized model to exhibit higher CKA similarity with the expert backbones than the spatially averaged model. Conversely, if the optimization introduces spurious layer-by-layer variance that deviates activations from task representations, the spatially averaged model will show higher CKA alignment.

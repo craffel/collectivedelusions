@@ -1,0 +1,78 @@
+# Idea Proposal: Sparsity-Guided Task Arithmetic (SG-TA)
+
+## 1. Persona Alignment
+As **The Empiricist**, our research philosophy is grounded in the belief that progress in machine learning comes from exhaustive empirical validation, large-scale sweeps, and robust ablation studies. We do not trust complex, unconstrained theoretical frameworks unless they are backed by overwhelming, multi-seed, cross-dataset evidence.
+
+**Sparsity-Guided Task Arithmetic (SG-TA)** is custom-tailored to this philosophy. Rather than introducing complex non-linear coordinate-warping or unconstrained test-time adaptation (which collapses due to the Overfitting-Optimizer Paradox), SG-TA introduces a set of simple, highly scalable weight-space masking primitives. This simplicity allows us to:
+1. Conduct an exhaustive multi-axial grid sweep over keep-ratios $k \in [0.0, 1.0]$, masking granularities (Global vs. Layer-wise vs. Block-wise), and scaling coefficients $\alpha$.
+2. Run robust, parallel, multi-seed evaluations across 4 diverse visual classification benchmarks (MNIST, FashionMNIST, CIFAR-10, SVHN) using a Vision Transformer backbone.
+3. Perform thorough ablation studies isolating the causal impact of deterministic magnitude masking from random dropping (DARE) or sign election (TIES-Merging).
+
+## 2. Core Techniques
+SG-TA builds upon and extends foundational weight-space editing and model merging techniques:
+- **Task Arithmetic (Ilharco et al., 2022):** The base paradigm of treating fine-tuning updates as vectors in parameter space.
+- **TIES-Merging (Yadav et al., 2023):** We borrow the concept of removing low-magnitude updates, but we decouple the trimming phase to evaluate pure deterministic magnitude-based weight masking of individual task vectors without sign election or majority voting.
+- **DARE (Yu et al., 2024):** We contrast our deterministic magnitude masking with DARE's random dropping and rescaling to empirically determine whether weight importance is better captured by magnitude or random selection.
+- **Granular Masking Scopes:** We introduce two novel masking scope strategies:
+  - **Global Quantile (GQ) Masking:** A uniform threshold calculated globally across the entire task vector.
+  - **Layer-wise Quantile (LQ) Masking:** Heterogeneous thresholds calculated independently for each model layer.
+
+## 3. Mathematical Formulation
+Let $\theta_{pre} \in \mathbb{R}^D$ be the pre-trained base model weights, and $\theta_{ft, i} \in \mathbb{R}^D$ be the weights of the expert fine-tuned on task $i \in \{1, \dots, T\}$.
+
+1. **Task Vector Definition:**
+   $$\tau_i = \theta_{ft, i} - \theta_{pre}$$
+
+2. **Binary Mask Generation:**
+   For a chosen keep-ratio $k_i \in [0.0, 1.0]$:
+   - **Global Quantile (GQ) Masking:**
+     Let $t_i \in \mathbb{R}$ be the $(1 - k_i)$ quantile of the absolute values of the entire task vector:
+     $$t_i = \text{Quantile}(|\tau_i|, 1 - k_i)$$
+     The global binary mask $M_i \in \{0, 1\}^D$ is defined as:
+     $$M_i = \mathbb{I}(|\tau_i| > t_i)$$
+   
+   - **Layer-wise Quantile (LQ) Masking:**
+     For each layer $l \in \{1, \dots, L\}$, let $t_i^{(l)} \in \mathbb{R}$ be the $(1 - k_i^{(l)})$ quantile of the absolute values of the layer-specific task vector $\tau_i^{(l)}$:
+     $$t_i^{(l)} = \text{Quantile}(|\tau_i^{(l)}|, 1 - k_i^{(l)})$$
+     The layer-specific binary mask $M_i^{(l)} \in \{0, 1\}^{D_l}$ is defined as:
+     $$M_i^{(l)} = \mathbb{I}(|\tau_i^{(l)}| > t_i^{(l)})$$
+     The full mask is the concatenation of all layer-wise masks: $M_i = [M_i^{(1)}, \dots, M_i^{(L)}]$.
+
+3. **Weight-Space Fusion:**
+   Given merging coefficients $\alpha_i \in \mathbb{R}$, the final merged parameter configuration $\theta_{merged}$ is computed as:
+   $$\theta_{merged} = \theta_{pre} + \sum_{i=1}^T \alpha_i (M_i \odot \tau_i)$$
+   where $\odot$ denotes the element-wise Hadamard product.
+
+4. **Offline Few-Shot Validation Tuning (OFS-Tune Optimization):**
+   Using a tiny labeled validation dataset $\mathcal{D}_{val} = \bigcup_{i=1}^T \mathcal{D}_{val}^{(i)}$ (e.g., 8 samples per task), we can solve for optimal uniform or layer-wise keep-ratios $k$ and merging coefficients $\alpha$ by optimizing the average classification accuracy:
+   $$\max_{\alpha, k} \frac{1}{T} \sum_{i=1}^T \text{Accuracy}(\theta_{merged}(\alpha, k); \mathcal{D}_{val}^{(i)})$$
+
+## 4. Architecture Specifications
+- **Backbone Architecture:** Vision Transformer (`vit_tiny_patch16_224`) consisting of $L = 12$ transformer layers, a hidden dimension of 192, and 3 attention heads per layer.
+- **Inputs:** Images of size $224 \times 224 \times 3$, normalized according to ImageNet statistics.
+- **Intermediate Representations:**
+  - Patch embeddings + position embeddings.
+  - 12 layers of multi-head self-attention and MLP blocks.
+  - Layer-wise task vectors $\tau_i^{(l)}$ are extracted for all linear projection, attention query/key/value, and MLP weights.
+- **Outputs:** Logits generated by task-specific classification heads attached to the `[CLS]` token representation.
+
+## 5. Baselines
+We will evaluate SG-TA against the following state-of-the-art baselines:
+1. **Naive Uniform Task Arithmetic:** Adds unmasked task vectors with uniform coefficients $\alpha_i = \frac{1}{T}$ ($k_i = 1.0$).
+2. **Optimized Task Arithmetic:** Adds unmasked task vectors ($k_i = 1.0$) with coefficients $\alpha_i$ optimized via grid search or ES.
+3. **TIES-Merging (Yadav et al., 2023):** Prunes task vectors, elects dominant signs, and averages sign-compatible parameters. This will verify if resolving sign conflicts is actually necessary when using deterministic magnitude masking.
+4. **DARE (Yu et al., 2024):** Randomly drops task vector weights and rescales the remaining ones. This will test whether structural weight importance is superior to stochastic dropouts.
+5. **Decoupled Prune-then-Merge (P-then-M):** Magnitude-pruning of individual models prior to simple averaging.
+
+These baselines are highly appropriate as they span the entire spectrum of state-of-the-art weight pruning, sparsification, and linear merging methods.
+
+## 6. Step-by-Step Interaction
+1. **Extract Task Vectors:** Compute task vectors $\tau_i = \theta_{ft, i} - \theta_{pre}$ for all task experts.
+2. **Apply Quantile Thresholding:**
+   - Choose a target keep-ratio $k_i$.
+   - For Global scope (GQ), calculate the threshold $t_i$ across the entire parameter vector. For Layer-wise scope (LQ), calculate independent thresholds $t_i^{(l)}$ for each layer.
+   - Generate the binary mask $M_i$.
+3. **Execute Hadamard Masking:** Filter each task vector: $\tau'_i = M_i \odot \tau_i$.
+4. **Formulate Weighted Fusion:** Compute the joint update vector $\tau'_{merged} = \sum_i \alpha_i \tau'_i$.
+5. **Update Base Weights:** Add the update vector to the pre-trained weights: $\theta_{merged} = \theta_{pre} + \tau'_{merged}$.
+6. **Inference/Validation:** Pass the input batch through $\theta_{merged}$ to predict class labels and evaluate multi-task accuracy.

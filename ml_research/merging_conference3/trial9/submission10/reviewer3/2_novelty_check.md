@@ -1,0 +1,21 @@
+# 2_novelty_check.md: Assessment of Novelty and Delta from Prior Work
+
+## Key Novel Aspects
+1. **First Simplex-Constrained PAC-Bayesian Framework:** Ensembling weights physically lie on the probability simplex $\Delta^{K-1}$ (since they sum to 1 and are non-negative). Prior theoretical works modeled ensembling parameters using unconstrained distributions (like Gaussian priors/posteriors over log-temperatures), ignoring simplex geometry. This work is the first to model ensembling weights directly as a Dirichlet-distributed random vector over the simplex itself, providing a mathematically rigorous complexity control framework based on the exact analytical KL divergence between Dirichlet distributions.
+2. **Unsupervised Subspace Energy Projection (SEP):** The paper introduces a completely unsupervised, task-agnostic dimensionality reduction protocol that extracts orthonormal bases for task representation manifolds via SVD on early-layer activations. This extracts robust coordinates without requiring ground-truth task labels during serving.
+3. **Rigorous Properties of SEP (Basis Independence & Scale Invariance):** The paper formally states and proves (in Proposition 3.1) that SEP is mathematically invariant under any orthogonal change of basis in $\mathbb{R}^D$, and is completely scale-invariant under uniform magnification of activations.
+4. **Unsupervised test-time serving (PEM-Div):** A fully unsupervised adaptation route is introduced that minimizes prediction entropy while maximizing batch-wide routing diversity, bridging the gap between label-free serving and supervised adaptation.
+
+## The "Delta" from Prior Work
+- **SABLE (Sable et al., 2025):** 
+  * *SABLE's approach:* SABLE relies on a static, hand-tuned global temperature scale ($\tau=0.05$) and maps activations to ensembling weights using supervised centroid-based cosine similarity coordinates (requiring labeled samples to find centroids).
+  * *The Delta:* Dirichlet-PAC is completely unsupervised in its coordinate extraction (SEP SVD bases), which is essential for label-free online serving. Furthermore, instead of static, hand-tuned temperatures, Dirichlet-PAC dynamically calibrates task-specific temperatures on a small calibration split with a rigorous PAC-Bayesian bound.
+- **PAC-ZCA (Paczca et al., 2026):**
+  * *PAC-ZCA's approach:* PAC-ZCA applies a Gaussian prior and posterior distribution over unconstrained log-temperature parameters to regularize test-time ensembling.
+  * *The Delta:* Gaussian modeling is fundamentally unconstrained and ignores the geometry of the probability simplex. This misalignment can lead to "log-temperature explosion" or sudden entropy collapse, causing numerical instability. Dirichlet-PAC models ensembling weights directly over the simplex using a Dirichlet distribution, and its analytical KL divergence contains Gamma and digamma functions that act as an information barrier to naturally stabilize the optimization.
+- **Weight-Space Consolidation (TIES-Merging, DARE-Merging):**
+  * *Their approach:* These methods consolidate task-specific parameters permanently in weight-space before inference.
+  * *The Delta:* Weight-space merging is static and prone to severe representation interference and collapse, especially when loss landscapes are highly non-convex or task manifolds overlap. Dirichlet-PAC dynamically blends expert activations in parallel during inference, preserving the specialized knowledge of each expert and degrading gracefully under heavy manifold overlap.
+
+## Characterization of Novelty
+The novelty of this submission is **significant and highly principled**. Test-time model merging and adaptation have historically been dominated by empirical heuristics (such as SABLE and Class-Capacity Normalization) or misaligned parameter-space bounds (such as Gaussian PAC-ZCA). By introducing a simplex-constrained Dirichlet distribution over the ensembling weights and deriving the exact closed-form analytical KL divergence within an input-dependent, prediction-space PAC-Bayesian framework, the authors have bridged the gap between empirical test-time adapter ensembling and rigorous statistical learning theory. The mathematical proofs of basis independence and scale-invariance further elevate this contribution, making it a robust and comprehensive theoretical foundation.

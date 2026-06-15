@@ -1,0 +1,140 @@
+\section{Methodology}
+\label{submission:method}
+
+We present \textbf{Exclusive Parameter Merging (EPM)}, an elegant, training-free, and coherence-preserved parameter routing framework for weight-space model merging. EPM is built on two core techniques designed to maximize simplicity while effectively mitigating multi-task parameter conflict: \textbf{Soft Exclusive Parameter Allocation (Soft-EPA)} and \textbf{Task-Level Coefficient Tuning (TLC-Tune)}.
+
+\subsection{Soft Exclusive Parameter Allocation (Soft-EPA)}
+Let $\theta_{\text{base}} \in \mathbb{R}^D$ represent the parameters of a pre-trained base model, and let $\theta_k \in \mathbb{R}^D$ represent the fine-tuned expert model parameters for task $k \in \{1, \dots, K\}$, where all models share the same architecture and pre-trained initialization.
+
+\paragraph{Step 1: Task Vector Extraction}
+We extract the task vectors $\tau_k \in \mathbb{R}^D$ representing the parameter updates learned during fine-tuning:
+\begin{equation}
+\label{eq:task_vector}
+\tau_k = \theta_k - \theta_{\text{base}}
+\end{equation}
+
+\paragraph{Step 2: Coherence-Preserved Soft Routing}
+Standard merging techniques perform coordinate-wise blending or averaging of updates, which cancels out orthogonal representations. While scalar coordinate exclusivity resolves this canceling out, hard binary routing (at either the coordinate or tensor level) destroys structural representation coherence. Because layers or individual weights cannot cooperate, the internal activation manifolds are scrambled, resulting in a fragmented model that cannot process features coherently.
+
+To resolve this cooperation bottleneck and prevent experts fine-tuned on complex, high-entropy color datasets (which naturally learn massive weight updates with large gradient norms) from monopolizing coordinate routing, we introduce \textbf{Task Vector Standardization}. We define two variants of this standardization scheme based on the granularity of scale calculation: Global and Layer-wise.
+
+\paragraph{Global Task Vector Standardization}
+Let $\sigma_k$ represent the global standard deviation of the task vector elements across all $D$ parameters of the model for expert $k$:
+\begin{equation}
+\label{eq:standard_deviation}
+\sigma_k = \sqrt{ \frac{1}{|D|} \sum_{j=1}^D (\tau_{k, j} - \mu_k)^2 }
+\end{equation}
+where $\mu_k$ is the global mean of the task vector elements. Under this formulation, the standardized absolute scaled update magnitude for expert $k$ at coordinate $j$ across the network is calculated as:
+\begin{equation}
+\label{eq:standardized_magnitude}
+M_{k, j} = \left| \frac{\lambda_k \tau_{k, j}}{\sigma_k} \right|
+\end{equation}
+
+\paragraph{Layer-wise Task Vector Standardization}
+While Global Standardization is simple and effective, weight tensors in different layers (e.g., shallow attention projections vs. deep feed-forward projections) operate on highly distinct activation ranges and gradient physics. Using a single global $\sigma_k$ can cause certain layers to be completely dominated by a single task expert whose updates are localized to those specific layers. To align more closely with localized layer physics, we formulate \textbf{Layer-wise Task Vector Standardization}. Let $l \in \{1, \dots, L\}$ represent the index of the model's layers (or weight matrices). Let $\mathcal{P}_l \subset \{1, \dots, D\}$ represent the subset of coordinate indices belonging to layer $l$, where $\bigcup_l \mathcal{P}_l = \{1, \dots, D\}$. The layer-wise standard deviation $\sigma_{k, l}$ of the task vector for expert $k$ at layer $l$ is defined as:
+\begin{equation}
+\label{eq:layerwise_standard_deviation}
+\sigma_{k, l} = \sqrt{ \frac{1}{|\mathcal{P}_l|} \sum_{j \in \mathcal{P}_l} (\tau_{k, j} - \mu_{k, l})^2 }
+\end{equation}
+where $\mu_{k, l}$ is the mean of task vector elements within layer $l$. For any coordinate $j \in \mathcal{P}_l$ in layer $l$, the layer-wise standardized absolute scaled update magnitude is defined as:
+\begin{equation}
+\label{eq:layerwise_standardized_magnitude}
+M'_{k, j} = \left| \frac{\lambda_k \tau_{k, j}}{\sigma_{k, l}} \right|
+\end{equation}
+
+\paragraph{Theoretical Comparison of Scale Granularity}
+Mathematically, Layer-wise Standardization ensures a more equitable routing division at every single layer of the network. Because the routing decision in Equation~\ref{eq:layerwise_standardized_magnitude} is normalized by the layer-specific standard deviation, it prevents any single task with large weight updates in specific layers (like early attention projections) from monopolizing the parameter routing at those layers. Instead, each expert's coordinate share is determined relative to its own layer-wise variance. However, Layer-wise Standardization introduces a minor theoretical drawback: it ignores the global relative importance of layers. If an expert learns highly critical features by making massive updates to a specific layer while keeping other layers unchanged, layer-wise normalization will artificially inflate the non-critical layers' updates and deflate the critical layer's updates, potentially distorting the global hierarchy of task-specific features. In our empirical evaluations, we utilize Global Standardization as the primary default since it preserves the relative magnitude ratios across different layers, which we find is essential for keeping the global activation manifold coherent. Nonetheless, Layer-wise Standardization represents an elegant alternative for large-scale architectures where layer-wise scaling diversity is extreme.
+
+Under the default Global Standardization scheme, we identify the index of the dominant expert at coordinate $j$ using an argmax operator:
+\begin{equation}
+\label{eq:dominant_expert}
+k^*(j) = \arg\max_{k \in \{1, \dots, K\}} M_{k, j}
+\end{equation}
+
+The soft-exclusive update for expert $k$ at coordinate $j$ is then defined by keeping the dominant update at full strength while attenuating the non-dominant updates by $\gamma$:
+\begin{equation}
+\label{eq:soft_exclusive_update}
+\tau^{\text{exclusive}}_{k, j} = \begin{cases} \lambda_k \tau_{k, j} & \text{if } k = k^*(j) \\ \gamma \cdot \lambda_k \tau_{k, j} & \text{otherwise} \end{cases}
+\end{equation}
+
+The merged exclusive task vector before global thresholding is obtained by summing these soft-exclusive updates across all task experts:
+\begin{equation}
+\label{eq:merged_exclusive_vector}
+\tau^{\text{exclusive}}_j = \sum_{k=1}^K \tau^{\text{exclusive}}_{k, j}
+\end{equation}
+
+By expanding this sum, we reveal an elegant mathematical identity that demystifies why Soft-EPA preserves representational coherence:
+\begin{align}
+\label{eq:convex_combination}
+\tau^{\text{exclusive}}_j &= \tau^{\text{exclusive}}_{k^*(j), j} + \sum_{k \neq k^*(j)} \tau^{\text{exclusive}}_{k, j} \nonumber \\
+&= \lambda_{k^*(j)} \tau_{k^*(j), j} + \gamma \sum_{k \neq k^*(j)} \lambda_k \tau_{k, j} \nonumber \\
+&= (1 - \gamma) \cdot \lambda_{k^*(j)} \tau_{k^*(j), j} + \gamma \sum_{k=1}^K \lambda_k \tau_{k, j}
+\end{align}
+Equation~\ref{eq:convex_combination} demonstrates that Soft-EPA is mathematically equivalent to a convex/linear combination of pure coordinate-wise exclusivity ($\gamma = 0$) and standard Task Arithmetic ($\gamma = 1$). This elegant formulation shows that leaking a small amount of the standard linear blend acts as a structural ``glue'' or background regularizer, ensuring that while the dominant expert's update is highly prioritized to avoid weight-space interference, the overall network's activation trajectory remains aligned across layers.
+
+While a constant coherence retention factor $\gamma = 0.2$ is near-optimal for dense model merging ($p=0.0$), under parameter-constrained sparse merging regimes, keeping $\gamma$ small can lead to severe capacity starvation for non-dominant tasks. Specifically, under a target sparsity $p$, the network retains only a fraction $(1-p)$ of active parameters. Enforcing a low $\gamma$ on these remaining coordinates heavily attenuates non-dominant updates, leading to near-zero task vectors and representational collapse under extreme sparsity. To address this capacity limitation, we introduce **Dynamic Coherence Scheduling (DCS)**. Under DCS, the coherence retention factor $\gamma(p)$ dynamically scales with the target network sparsity $p$. Since the probability of coordinate-level parameter collisions decreases quadratically with pruning (proportional to $(1-p)^2$), the model can afford more cooperative blending under high sparsity. We define a quadratic scheduling rule:
+\begin{equation}
+\label{eq:dynamic_coherence_scheduling}
+\gamma(p) = \gamma_0 + (1 - \gamma_0) \cdot p^2
+\end{equation}
+where $\gamma_0 = 0.2$ represents the dense baseline coherence. Under DCS, the coherence retention factor smoothly transitions from highly exclusive routing under dense conditions ($\gamma(0.0) = 0.2$) to cooperative, scale-preserving distributed blending under compressed conditions ($\gamma(0.5) = 0.4$ and $\gamma(0.8) = 0.712$). This dynamic schedule prevents representational starvation under extreme pruning while preserving high spatial selectivity under dense merging.
+
+We note here a deliberate and crucial design choice in EPM: the decoupling of the standardization scale between decision routing and parameter integration. While routing decisions (Equations~\ref{eq:standardized_magnitude}--\ref{eq:dominant_expert}) and saliency ranking (Equations~\ref{eq:standardized_saliency_k}--\ref{eq:standardized_saliency_total}) are evaluated in a standardized space (divided by $\sigma_k$) to prevent dominant experts with massive gradient norms from monopolizing the merged network, the actual physical weight updates applied to the network (Equations~\ref{eq:soft_exclusive_update}, \ref{eq:merged_exclusive_vector}, and \ref{eq:sparsity_masking}) must remain in the network's original, unstandardized weight space. This is because the base pre-trained model weights $\theta_{\text{base}}$ are unstandardized, and task-specific expert representations are highly sensitive to their learned activation scales. Standardizing the actual weight modifications would severely distort the network's physical parameter scales, resulting in massive representational and feature-activation mismatches that destroy the pre-trained knowledge base. Thus, standardization is exclusively leveraged as a decision-making filter for masking and routing, whereas the original, task-optimized updates are used for physical parameter integration.
+
+This decoupling directly addresses the potential concern regarding coordinate-wise selection and representation scale misalignment. Specifically:
+(1) \emph{High standardized score but low unstandardized magnitude:} This occurs when a coordinate is highly task-distinctive relative to its task's global variance, yet physically small. Retaining this coordinate preserves a delicate task-specific representation direction that would otherwise be drowned out or pruned under uniform scale assumptions. Integrating its original unstandardized magnitude ensures the network preserves the precise activation scale optimized during fine-tuning.
+(2) \emph{Low standardized score but high unstandardized magnitude:} This occurs when a coordinate has a large physical update that is generic or noisy rather than task-distinctive. Selecting it based on absolute magnitude would lead to task dominance and representation pollution. Down-prioritizing or filtering it avoids weight-space interference.
+Consequently, this scale misalignment is not an oversight, but a deliberate and highly effective coordinate-wise regularizer that aligns the decision-making filter with task semantics while keeping the physical parameters aligned with pre-trained activation physics.
+
+To provide empirical context regarding this scale decoupling, we analyze the frequency of "scale overrides" across all 5.52 million parameters of our Vision Transformer backbone. A \emph{scale override} is defined as a coordinate $j$ where the standardized routing metric $M_{k, j}$ elects a task $k^*(j)$ (e.g., MNIST or FashionMNIST) whose update is task-distinctive relative to its global variance, but physically another task $k' \neq k^*(j)$ (e.g., SVHN or CIFAR-10) has a larger unstandardized absolute magnitude: $|\lambda_{k'} \tau_{k', j}| > |\lambda_{k^*(j)} \tau_{k^*(j), j}|$. 
+
+Our empirical analysis reveals that under Untuned EPM ($\Lambda = \mathbf{1.0}$), a scale override occurs at exactly \textbf{13.67\%} of all coordinates (754,985 parameters) across the model. When we apply TLC-Tune to optimize the minimax objective, the frequency of scale overrides is highly stable, occurring at \textbf{13.79\%} of all coordinates (761,836 parameters). Analyzing the direction of these overrides shows they are heavily directional: under TLC-Tuned EPM, SVHN (which has the largest global standard deviation $\sigma_{\text{SVHN}} = 0.000974$) physically overrides MNIST (which has the smallest $\sigma_{\text{MNIST}} = 0.000653$) at 297,253 coordinates and FashionMNIST at 212,037 coordinates. Crucially, SVHN is never physically overridden by any other task. 
+
+These statistics provide a powerful, concrete justification for our decoupled design. If EPM did not utilize Task Vector Standardization as a decision-making filter, then at nearly 13.8\% of all coordinates across the network, the massive updates of SVHN and CIFAR-10 would physically overpower and completely erase MNIST and FashionMNIST's updates, locking the network into the "Rich Task" Dominance Trap. By decoupling the standardized decision-making filter from unstandardized physical integration, EPM successfully routes these 761,836 parameters to preserve the delicate, task-distinctive features of the simpler experts, while ensuring the physical weights maintain the exact activation and gradient scales learned during fine-tuning.
+
+\subsection{Global Thresholding \& Sparsity Enforcement}
+To enforce an overall target network sparsity $p \in [0, 1)$ (where $p=0.5$ represents 50\% parameters pruned, and $p=0.8$ represents 80\% pruned), we apply a simple global magnitude-based thresholding step.
+
+\paragraph{Step 3: Standardized Saliency Score Calculation}
+To prevent simple task updates from being selectively pruned during global magnitude thresholding (the second part of the double-imbalance trap), we calculate a standardized coordinate saliency score $\tilde{S}_j$:
+\begin{equation}
+\label{eq:standardized_saliency_k}
+\tilde{S}_{k, j} = \begin{cases} \frac{|\lambda_k \tau_{k, j}|}{\sigma_k} & \text{if } k = k^*(j) \\ \frac{\gamma |\lambda_k \tau_{k, j}|}{\sigma_k} & \text{otherwise} \end{cases}
+\end{equation}
+\begin{equation}
+\label{eq:standardized_saliency_total}
+\tilde{S}_j = \sum_{k=1}^K \tilde{S}_{k, j}
+\end{equation}
+
+\paragraph{Step 4: Sparsity Masking}
+We sort the standardized saliency scores $\tilde{S}$ across the entire model and identify a global threshold $T_{\text{std}} \in \mathbb{R}$ such that exactly a fraction $p$ of the coordinates have a standardized saliency score below $T_{\text{std}}$. The final sparse exclusive task vector $\tau^{\text{final}}$ is defined as:
+\begin{equation}
+\label{eq:sparsity_masking}
+\tau^{\text{final}}_j = \begin{cases} \tau^{\text{exclusive}}_j & \text{if } \tilde{S}_j \ge T_{\text{std}} \\ 0 & \text{otherwise} \end{cases}
+\end{equation}
+
+The merged model weights are obtained by adding the sparse, exclusive task vector to the pre-trained base model weights:
+\begin{equation}
+\label{eq:merged_model_weights}
+\theta_{\text{merged}} = \theta_{\text{base}} + \tau^{\text{final}}
+\end{equation}
+
+\subsection{Task-Level Coefficient Tuning (TLC-Tune)}
+Optimizing hundreds of layer-wise continuous merging coefficients on tiny calibration sets causes transductive overfitting (the Overfitting-Optimizer Paradox). TLC-Tune restricts the optimization search space to only $K$ global scaling factors $\Lambda = [\lambda_1, \dots, \lambda_K]^T \in \mathbb{R}^K$ (one per task expert). 
+
+To prevent task monopolization (where the hardest task's loss dominates the optimization signal at the expense of other tasks), TLC-Tune optimizes directly for a balanced multi-task validation metric:
+\begin{equation}
+\label{eq:tlc_validation_metric}
+\mathcal{S}_{\text{val}} = \min_{k} \text{Acc}_k(\theta_{\text{merged}}) + 0.1 \cdot \text{Mean}(\text{Acc}(\theta_{\text{merged}}))
+\end{equation}
+By prioritizing the minimum validation accuracy across tasks, TLC-Tune strictly forces the optimizer to improve the worst-performing task, preventing task collapse. Because TLC-Tune utilizes a gradient-free (1+1) Evolution Strategy (ES) \cite{rechenberg1978evolution}, we are not restricted to differentiable functions. We optimize $\Lambda$ on a robust, stable offline validation split of 128 samples per task (512 total).
+
+\paragraph{Algorithm 1: TLC-Tune (1+1 ES)}
+At each step $t$:
+\begin{enumerate}
+  \item Perturb the current scaling parameters: $\Lambda^{(t)} = \Lambda + \epsilon$, where $\epsilon \sim \mathcal{N}(0, \sigma^2 I_K)$.
+  \item Reconstruct the exclusive merged model $\theta_{\text{merged}}(\Lambda^{(t)})$ using Equations~\ref{eq:task_vector}--\ref{eq:merged_model_weights}.
+  \item Evaluate the joint multi-task validation score: $\mathcal{S}_{\text{val}}^{(t)} = \min_{k} \text{Acc}_k(\theta_{\text{merged}}(\Lambda^{(t)})) + 0.1 \cdot \text{Mean}(\text{Acc}(\theta_{\text{merged}}(\Lambda^{(t)})))$.
+  \item Update step: If the perturbed score is higher than the previous best score, accept the mutation: $\Lambda \leftarrow \Lambda^{(t)}$, and increase the perturbation scale: $\sigma \leftarrow \sigma \cdot \alpha_{\text{up}}$. Otherwise, reject the mutation and decrease the scale: $\sigma \leftarrow \sigma \cdot \beta_{\text{down}}$.
+\end{enumerate}
+In our implementation, we initialize $\Lambda = \mathbf{1.0}$, $\sigma = 0.1$, $\alpha_{\text{up}} = 1.22$, and $\beta_{\text{down}} = 0.82$. The entire tuning process completes in under 1 minute, requires zero backpropagation, uses zero test-time compute, and achieves outstanding generalizability.

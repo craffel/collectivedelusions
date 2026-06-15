@@ -1,0 +1,143 @@
+\section{Methodology: FoldMerge (Neural Origami)}
+\label{sec:method}
+
+We present the complete mathematical and architectural formulation of FoldMerge (Neural Origami). 
+Our primary goal is to merge $K$ task-specific expert neural networks into a single multi-task network. 
+Let $f(x; \theta)$ represent a model parameterized by task-specific layers or adapters $\theta \in \mathbb{R}^d$, where $d$ is the number of target parameters to merge. 
+We are given a pre-trained base model $\theta_{base}$ and $K$ expert parameter vectors $\{ \theta_k \}_{k=1}^K$ fine-tuned from $\theta_{base}$ on $K$ distinct classification tasks.
+
+\subsection{Differentiable Coordinate Warp ($g_\phi$)}
+To bypass the limitations of linear parameter averaging, FoldMerge learns a non-linear, continuous coordinate transformation. 
+Specifically, we define a mapping function $g_\phi: \mathbb{R}^d \to \mathbb{R}^d$ parameterized by $\phi$, which is mathematically guaranteed to be a \emph{diffeomorphism}—meaning it is bijective, smooth, and has a smooth inverse $g_\phi^{-1}$.
+
+We construct $g_\phi$ using a cascade of $M = 4$ RealNVP affine coupling layers~\cite{dinh2016density}.\footnote{We clarify a key terminological distinction: while RealNVP coupling layers were originally developed for \emph{normalizing flows} to model probability density functions using the change-of-variables formula with log-determinant Jacobians, FoldMerge utilizes their invertible coupling architecture solely for coordinate-warping and functional parameter-space transformations, without performing density estimation.} 
+For each coupling layer $m \in \{1, \dots, M\}$, we split the input vector $w \in \mathbb{R}^d$ into two halves: $u_1, u_2 = \text{split}(w)$, where $u_1, u_2 \in \mathbb{R}^{d/2}$. 
+The forward transformation maps $(u_1, u_2)$ to $(u_1', u_2')$ as follows:
+\begin{align}
+  u_1' &= u_1 \\
+  u_2' &= u_2 \odot \exp(\bar{s}_\phi(u_1)) + t_\phi(u_1)
+\end{align}
+where $s_\phi: \mathbb{R}^{d/2} \to \mathbb{R}^{d/2}$ is a scale network, $t_\phi: \mathbb{R}^{d/2} \to \mathbb{R}^{d/2}$ is a translation network, and $\odot$ denotes the Hadamard (element-wise) product. 
+
+To ensure mathematical stability and prevent numerical scale explosion, we bound the outputs of the scale network using a hyperbolic tangent activation:
+\begin{equation}
+  \bar{s}_\phi(u_1) = \tanh(s_\phi(u_1))
+\end{equation}
+This mathematically guarantees that the scaling multiplier remains bounded within $[\exp(-1), \exp(1)]$, stabilizing the warp.
+
+Crucially, because $s_\phi$ and $t_\phi$ are parameterized as standard feed-forward networks (MLPs), they do not need to be invertible. 
+The triangular structure of the coupling layer guarantees that the inverse transformation $g_\phi^{-1}$ is analytically computable in a single forward pass:
+\begin{align}
+  u_1 &= u_1' \\
+  u_2 &= (u_2' - t_\phi(u_1')) \odot \exp(-\bar{s}_\phi(u_1'))
+\end{align}
+In our architecture, $s_\phi$ and $t_\phi$ are parameter-sharing MLPs consisting of 2 layers with a hidden dimension of 512, utilizing Gaussian Error Linear Units (GELUs) as the activation functions.
+
+\subsection{Parameter-Efficient Diffeomorphisms via Low-Rank Coupling (LoRA-Flow)}
+Applying high-dimensional normalizing flows to target layers with millions of parameters presents a significant computational bottleneck. To drastically compress the parameter footprint and accelerate the test-time optimization phase of FoldMerge, we propose a parameter-efficient alternative termed \textbf{LoRA-Flow}. 
+
+Instead of updating the full weight matrices of the MLPs in the scale ($s_\phi$) and translation ($t_\phi$) networks, we parameterize their layers using low-rank decompositions. Let $W \in \mathbb{R}^{d_{out} \times d_{in}}$ be a weight matrix in the MLP. We represent $W$ as:
+\begin{equation}
+  W = W_{0} + \frac{\alpha}{r} A B
+\end{equation}
+where $W_{0} \in \mathbb{R}^{d_{out} \times d_{in}}$ is a frozen base matrix, $A \in \mathbb{R}^{d_{out} \times r}$ and $B \in \mathbb{R}^{r \times d_{in}}$ are trainable low-rank matrices of rank $r \ll \min(d_{out}, d_{in})$, and $\alpha$ is a constant scaling hyperparameter. 
+
+To ensure that the normalizing flow starts exactly as the identity mapping at step 0, we can set $W_{0} = 0$ and initialize the trainable matrix $B$ to zero. This mathematically forces $W = 0$ at step 0, ensuring that the scale $s_\phi$ and translation $t_\phi$ outputs of the MLPs are exactly zero. Consequently, the coupling layers default to identity transformations, preventing the flow from randomly warping the weight coordinates before optimization begins. In our implementation of LoRA-Flow, we initialize the base weight matrix $W_0$ using standard Kaiming uniform initialization to provide expressive baseline representations, while initializing the trainable adapter matrix $B$ to zero (i.e., $\text{lora\_B} = 0$). This ensures the initial low-rank product is exactly zero, so the flow behaves close to or exactly as the identity mapping at step 0, ensuring stable initialization.
+
+By freezing $W_{0}$ and optimizing only the low-rank matrices $A$ and $B$, the number of trainable parameters in the diffeomorphism flow network scales as $O(r(d_{in} + d_{out}))$ instead of $O(d_{in} d_{out})$. This reduces the flow's parameter footprint from millions to a few thousand weights, minimizing GPU memory consumption and significantly accelerating backpropagation and gradient steps.
+
+\subsection{Origami Space and Latent-Space Task Arithmetic}
+Instead of merging parameters in the original, rigid Euclidean weight-space, FoldMerge maps the pre-trained base model $\theta_{base}$ and the $K$ task-specific parameters $\{ \theta_k \}_{k=1}^K$ into a latent, folded ``Origami Space'' via the forward diffeomorphism:
+\begin{align}
+  z_{base} &= g_\phi(\theta_{base}) \\
+  z_k &= g_\phi(\theta_k), \quad \forall k \in \{1, \dots, K\}
+\end{align}
+In Origami Space, the coordinate system has been bent and morphed such that the separate low-loss basins of attraction are aligned. 
+Rather than performing a normalized barycentric average (which can restrict the energy scales of different task features), FoldMerge performs additive latent coordinate combinations directly in the folded Origami Space:
+\begin{equation}
+  \bar{z} = 1.0 \cdot z_{base} + \sum_{k=1}^K \lambda_k z_k
+\end{equation}
+where $\lambda_k \geq 0$ are the adaptive task-specific merging coefficients. 
+
+\paragraph{Resolving Latent Scale Warping:}
+We note that because $g_\phi$ is a highly non-linear coordinate transformation, coordinate addition in Origami Space is \emph{not} equivalent to standard linear Euclidean parameter addition. 
+The non-linear dimensions of Origami Space are warped by the flow's scale and translation MLPs. 
+Thus, an unnormalized sum such as $1.0 \cdot z_{base} + \sum \lambda_k z_k$ (where the latent coordinates scale up) does \emph{not} translate to a catastrophic scaling of output activations in weight-space. 
+Instead, the inverse mapping $g_\phi^{-1}$ acts as a non-linear projection that dampens and warps these latent coordinates back onto the valid parameter manifold of output weights. 
+Furthermore, during the test-time adaptation loop, the flow parameters $\phi$ and coefficients $\lambda_k$ are jointly optimized to minimize prediction discrepancy. 
+If any scale distortion occurred, the optimization process would immediately penalize it, dynamically adjusting the translation and scale MLPs to find a stable configuration that preserves correct activation and weight scales.
+
+The final merged parameter vector $\theta_{MTL}$ is reconstructed by mapping the latent coordinates back to the original parameter space using the analytical inverse diffeomorphism:
+\begin{equation}
+  \begin{aligned}
+    \theta_{MTL}(\phi, \lambda) &= g_\phi^{-1}(\bar{z}) \\
+    &= g_\phi^{-1}\left( 1.0 \cdot g_\phi(\theta_{base}) + \sum_{k=1}^K \lambda_k g_\phi(\theta_k) \right)
+  \end{aligned}
+\end{equation}
+
+\paragraph{Linear Collapsing Property and Scale Distortion:} 
+Under the identity mapping ($s_\phi = 0$ and $t_\phi = 0$), FoldMerge collapses to an unnormalized linear combination of base parameters and fine-tuned parameters:
+\begin{equation}
+  \theta_{MTL} = 1.0 \cdot \theta_{base} + \sum_{k=1}^K \lambda_k \theta_k
+\end{equation}
+Because $\theta_k = \theta_{base} + \tau_k$, where $\tau_k$ is the task vector, this unnormalized sum corresponds to $(1.0 + \sum_{k=1}^K \lambda_k) \theta_{base} + \sum_{k=1}^K \lambda_k \tau_k$. 
+In flat, rigid Euclidean spaces, multiplying the pre-trained weights by a factor of $(1.0 + \sum \lambda_k) \approx 1.8\times$ (given typical optimized $\sum \lambda_k \approx 0.8$) would severely distort activation scales and degrade performance. 
+While the learned diffeomorphism $g_\phi$ is optimized to warp the coordinate system to absorb and project these scaled coordinates back onto a stable activation-preserving manifold, we acknowledge that this absolute-weight unnormalized addition represents an exploratory heuristic. 
+
+To mathematically resolve this scale distortion, we propose two mathematically superior alternative merging formulations for future non-linear coordinate-warping research:
+\begin{enumerate}
+  \item \textbf{Barycentric Latent Merging:} We can constrain the coordinates to lie on a convex simplex that preserves the original base model's energy scale in Origami Space:
+    \begin{equation}
+      \bar{z} = \left(1.0 - \sum_{k=1}^K \lambda_k\right) z_{base} + \sum_{k=1}^K \lambda_k z_k
+    \end{equation}
+  \item \textbf{Latent Task Vector Warping:} Instead of warping absolute parameters, we can warp the fine-tuned task vectors $\tau_k$ directly into Origami Space ($z_{\tau_k} = g_\phi(\tau_k)$) and add them to the pre-trained base model's unwarped weight, completely bypassing base model scale distortion:
+    \begin{equation}
+      \theta_{MTL} = \theta_{base} + g_\phi^{-1}\left( \sum_{k=1}^K \lambda_k g_\phi(\tau_k) \right)
+    \end{equation}
+\end{enumerate}
+In this work, we fully implement and evaluate both of these mathematically elegant alternatives directly in our codebase to study their scale-preserving benefits during non-linear coordinate warping.
+
+\subsection{Unsupervised Test-Time Optimization}
+Following the test-time adaptation paradigm of SyMerge~\cite{jung2025symerge}, we optimize the diffeomorphism parameters $\phi$ and merging coefficients $\lambda$ on unlabeled test streams $\mathcal{X}^{te}_k$. 
+The optimization is guided by expert teacher predictions to preserve specialized task knowledge. 
+For classification tasks, we minimize the Kullback-Leibler (KL) divergence between the merged model predictions and individual expert predictions:
+\begin{equation}
+  \label{eq:joint_loss}
+  \begin{aligned}
+    \min_{\phi, \lambda} \mathcal{L}(\phi, \lambda) = &\sum_{k=1}^K \mathbb{E}_{x \in \mathcal{X}^{te}_k} \Big[ \mathcal{D}_{KL}\Big( f(x; \theta_{MTL}) \parallel f(x; \theta_k) \Big) \Big] \\
+    &+ \gamma \mathcal{R}(\phi)
+  \end{aligned}
+\end{equation}
+where $\gamma > 0$ is a regularization hyperparameter, $\theta_{MTL}$ is the merged parameter vector, and $\mathcal{R}(\phi)$ is the implicit flow penalty.
+
+\subsection{Implicit Flow Regularization via Parameter Weight Decay}
+To ensure the coordinate warp remains a smooth local deformation around the identity mapping, preserving the original multi-modal geometry, we apply an $\ell_2$ penalty on the flow's parameters $\phi$:
+\begin{equation}
+  \mathcal{R}(\phi) = \sum_{p \in \phi} \|p\|_2^2
+\end{equation}
+This parameter penalty acts as a powerful implicit geometric regularizer. 
+By forcing the scale network $s_\phi$ and translation network $t_\phi$ MLP parameters towards zero, the affine coupling layers are encouraged to deviate minimally from an identity mapping ($s_\phi \to 0 \implies e^{\bar{s}_\phi} \to 1$ and $t_\phi \to 0$). 
+This mathematically prevents chaotic, volume-collapsing transformations and acts as a smooth geometric anchor. 
+Crucially, this implicit regularizer completely avoids the prohibitive $O(d^2)$ computational overhead of evaluating high-dimensional Jacobian matrices, making test-time adaptation extremely fast and highly scalable.
+
+\subsection{Theoretical Limitations and Open Questions}
+While FoldMerge presents a compelling geometric framework, we highlight key theoretical and architectural limitations that open up vital paths for future research:
+
+\paragraph{Alternative Invertible Architectures:}
+While FoldMerge utilizes RealNVP coupling layers due to their simplicity and fast analytical inverse, future research should explore more expressive invertible neural network (INN) architectures. Specifically, incorporating invertible $1\times 1$ convolutions (as in Glow~\cite{kingma2018glow}) could provide learnable linear coordinate mixtures between coupling blocks, mitigating the rigid coordinate-partition dependence of RealNVP. Additionally, utilizing Neural Spline Flows~\cite{durkan2019neural} could introduce highly expressive piecewise-rational quadratic splines for coordinate transformations, enabling highly non-linear, flexible warping paths while preserving analytical bijectivity and tractability.
+
+\paragraph{Coordinate Dependence vs. Permutation Symmetry:}
+RealNVP affine coupling layers are inherently coordinate-dependent. 
+They partition the parameter vector $w$ into two halves based on a rigid ordering of indices. 
+Because neural networks possess extensive permutation symmetries (wherein neurons within a layer can be permuted without altering functional output), this coordinate-dependent split violates permutation equivariance. 
+If the hidden channels of our target layer are permuted prior to merging, FoldMerge will learn a different coordinate warp. 
+
+To overcome this coordinate-dependence, we propose integrating a pre-alignment step prior to applying FoldMerge. Specifically, we can pre-align the permutation symmetries of the expert models $\{ \theta_k \}$ using state-of-the-art weight-matching or activation-matching algorithms, such as Git Re-Basin~\cite{ainsworth2022gitrebasin} or ZipIt!~\cite{stoica2023zipit}. By mapping all expert models to a shared, permutation-aligned coordinate system where neuron-to-neuron correspondences are maximized, we establish an optimal geometric starting point. Consequently, the learned diffeomorphism $g_\phi$ does not need to reconcile rigid permutation mismatches, and can focus entirely on modeling smooth, continuous local coordinate deformations, potentially unlocking significantly larger performance gains and faster test-time adaptation.
+
+\paragraph{Slicing Heuristic and Category Errors:}
+Warping the entire model weight space is computationally prohibitive. 
+To target the visual projection layer (`model.visual.proj` in ViT-B/32, which has shape $768 \times 512$, $d = 393,216$ parameters), we flatten the matrix into $768$ independent $512$-dimensional row vectors and process them in parallel through a shared flow network $g_\phi$. 
+From an algebraic perspective, a linear projection operator is a unified tensor. 
+Treating its rows as independent, identically distributed data samples passed through a single shared mapping is a localized heuristic compromise (a ``category error'' in weight-space topology). 
+This slicing fails to capture column-wise or cross-row correlations, and does not easily scale to unstructured networks. 
+We employ this slicing solely as a practical, computationally feasible bottleneck to demonstrate the trainability of non-linear coordinate warps, leaving unified, tensor-aware flow architectures as an important open challenge.

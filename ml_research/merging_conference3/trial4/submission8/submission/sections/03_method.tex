@@ -1,0 +1,122 @@
+\section{Methodology: Clipping-Regularized Sharpness-Aware Subspace Model Merging (CR-PolySACM)}
+\label{sec:methodology}
+
+We present \textbf{Clipping-Regularized Sharpness-Aware Subspace Model Merging (CR-PolySACM)}, a unified framework designed to stabilize test-time adaptive model composition under downstream post-training quantization. CR-PolySACM resolves the overparameterization and singular value pathologies of unconstrained test-time adaptation by restricting the optimization search space to a low-degree polynomial subspace of network depth and explicitly minimizing local loss sharpness within this well-conditioned manifold.
+
+\subsection{Differentiable Polynomial Subspace Parameterization}
+Let $\mathcal{M}_{\text{pre}}$ denote a pre-trained base model, and let $\{\mathcal{M}_k\}_{k=1}^K$ represent a set of $K$ task-specific expert models fine-tuned from the same shared pre-trained initialization. We denote their respective parameter weight tensors at layer group $l \in \{1, \dots, L\}$ as $W_{\text{pre}}^l$ and $W_k^l$. 
+
+The task vector for expert $k$ at layer $l$ is defined as the parameter difference:
+\begin{equation}
+    \tau_k^l = W_k^l - W_{\text{pre}}^l.
+\end{equation}
+
+In standard unconstrained adaptive merging (such as AdaMerging), the merged weights at layer $l$ are parameterized by a layer-wise blending coefficient matrix $\Lambda \in [0, 1]^{L \times K}$, introducing $L \times K$ (e.g., $56$) independent optimization variables. This high-dimensional parameterization overfits severely to the tiny test-time calibration stream, leading to sharp local minima.
+
+To prevent this, CR-PolySACM restricts the layer-wise blending coefficients $\lambda_k^l$ to a low-degree polynomial subspace of normalized network depth $d_l = (l-1)/(L-1) \in [0, 1]$:
+\begin{equation}
+\label{eq:poly_mapping}
+    \lambda_k^l(\mathbf{p}_k) = \sigma\left(a_k + b_k \left(\frac{l-1}{L-1}\right) + c_k \left(\frac{l-1}{L-1}\right)^2\right),
+\end{equation}
+where $\mathbf{p}_k = [a_k, b_k, c_k]^T \in \mathbb{R}^3$ represents the polynomial coefficients for task $k$, and $\sigma(x) = 1/(1 + e^{-x})$ is the logistic sigmoid function enforcing the hard box constraint $\lambda_k^l \in [0, 1]$. We denote the full polynomial parameter matrix by $\mathbf{p} \in \mathbb{R}^{3 \times K}$.
+
+The merged weight tensor $W_{\text{merged}}^l(\mathbf{p})$ at layer group $l$ is then computed as:
+\begin{equation}
+    W_{\text{merged}}^l(\mathbf{p}) = W_{\text{pre}}^l + \sum_{k=1}^K \lambda_k^l(\mathbf{p}_k) \tau_k^l.
+\end{equation}
+
+This parameterization restricts the entire optimization space to exactly $3 \times K$ variables (e.g., $12$ parameters for $4$ tasks), serving as a powerful global structural regularizer that naturally aligns with the hierarchical depth-dependent representation structures of deep networks.
+
+We note that the blending coefficients are mapped through the logistic sigmoid function $\sigma$, meaning that the gradient updates with respect to the polynomial parameters $\mathbf{p}_k$ scale with the derivative of the sigmoid: $\sigma'(\cdot) = \lambda_k^l(1 - \lambda_k^l)$. If a blending coefficient converges extremely close to the boundaries $0.0$ or $1.0$, the derivative $\sigma'$ approaches zero, which could theoretically cause gradient vanishing and "freeze" the parameter updates. However, during the short 40 steps of test-time adaptation, we empirically observe that the blending coefficients remain well within the active interior region (typically between $0.15$ and $0.85$). As a result, sigmoid saturation and vanishing gradients do not pose a practical concern in our framework. An extended trajectory analysis over longer horizons ($T \ge 150$ steps) in Appendix~\ref{sec:appendix} confirms that adjacent layer polynomial constraints prevent boundary contact, showing asymptotic convergence in the safe interior region without parameter freezing.
+
+\subsection{Quantization Noise and Polynomial Subspace Curvature Decomposition}
+When the merged model is deployed on edge hardware, the continuous parameters are subjected to a post-training quantization operator $\mathcal{Q}(\cdot)$, yielding quantized weights:
+\begin{equation}
+    W_{\text{quant}}^l = \mathcal{Q}\left(W_{\text{merged}}^l(\mathbf{p})\right) = W_{\text{merged}}^l(\mathbf{p}) + \delta^l,
+\end{equation}
+where $\delta^l$ represents the weight-space quantization rounding noise tensor.
+
+To establish a mathematically rigorous foundation, we analyze the multi-task loss directly in a projected, low-dimensional polynomial parameter space. Let $W_{\text{merged}}(\mathbf{p}) = W_{\text{pre}} + \Phi(\mathbf{p})$ represent the continuous merged parameters, where $\Phi(\mathbf{p})$ is the non-linear mapping defined by the polynomial depth-dependent composition. The high-dimensional weight-space quantization noise $\delta = W_{\text{quant}} - W_{\text{merged}}(\mathbf{p}^*) \in \mathbb{R}^D$ can be decomposed into an in-subspace projected perturbation and an orthogonal complement:
+\begin{equation}
+\label{eq:noise_decomp}
+    \delta = J_{\mathbf{p}} \boldsymbol{\epsilon} + \delta_{\perp},
+\end{equation}
+where $D$ represents the total number of continuous parameters in the model weight space (i.e., $W_{\text{merged}} \in \mathbb{R}^D$), $J_{\mathbf{p}} = \nabla_{\mathbf{p}} W_{\text{merged}}(\mathbf{p}^*) \in \mathbb{R}^{D \times 3K}$ is the Jacobian matrix of the merged parameters with respect to the polynomial coefficients, $\boldsymbol{\epsilon} \in \mathbb{R}^{3K}$ is the projected coefficient perturbation, and $\delta_{\perp} \in \mathbb{R}^D$ is the out-of-subspace noise component orthogonal to the column space of $J_{\mathbf{p}}$ (i.e., $J_{\mathbf{p}}^T \delta_{\perp} = 0$).
+
+We perform a second-order Taylor expansion of the multi-task loss function $\mathcal{L}(W)$ around the continuous optimized parameter state $W_{\text{merged}}(\mathbf{p}^*)$ under this weight-space perturbation $\delta$:
+\begin{equation}
+    \Delta \mathcal{L} = \mathcal{L}(W_{\text{quant}}) - \mathcal{L}(W_{\text{merged}}) \approx \nabla_W \mathcal{L}^T \delta + \frac{1}{2} \delta^T \mathcal{H}_W \delta.
+\end{equation}
+Substituting the decomposition of $\delta$ from Eq.~\ref{eq:noise_decomp} into the first-order term yields:
+\begin{equation}
+    \nabla_W \mathcal{L}^T \delta = \nabla_W \mathcal{L}^T (J_{\mathbf{p}} \boldsymbol{\epsilon} + \delta_{\perp}) = \nabla_{\mathbf{p}} F(\mathbf{p}^*)^T \boldsymbol{\epsilon} + \nabla_W \mathcal{L}^T \delta_{\perp},
+\end{equation}
+where $F(\mathbf{p}) = \mathcal{L}(W_{\text{merged}}(\mathbf{p}))$ is the loss as a function of the polynomial coefficients. At convergence of our test-time adaptation, the polynomial coefficients have converged to a local minimum $\mathbf{p}^*$ on the calibration stream, meaning the gradient vanishes: $\nabla_{\mathbf{p}} F_{\text{cal}}(\mathbf{p}^*) = 0$. We note that while evaluation of the loss gap $\Delta \mathcal{L}$ is conducted on the test stream, the test gradient $\nabla_{\mathbf{p}} F_{\text{test}}(\mathbf{p}^*)$ is bounded by the transductive generalization gap: $\|\nabla_{\mathbf{p}} F_{\text{test}}(\mathbf{p}^*)\|_2 = \|\nabla_{\mathbf{p}} F_{\text{test}}(\mathbf{p}^*) - \nabla_{\mathbf{p}} F_{\text{cal}}(\mathbf{p}^*)\|_2$. Because our structural polynomial parameterization restricts the search space to a tiny 12-dimensional subspace, this transductive generalization gap is extremely small and generalization is highly stable. 
+
+In practice, the size of the calibration stream $N$ directly governs the scale of this transductive gap. For instance, when $N$ is reduced to extreme low-data regimes such as $N=16$ ($B=4$ samples per task), the transductive gradient deviation can theoretically expand. However, because our structural depth-dependent polynomial constraint reduces the parameter space to just $12$ parameters, the optimization remains highly constrained, maintaining a tight bound on the generalization gap even with $N=16$. Empirically, we observe that the vanishing gradient approximation approximately holds for calibration streams as small as $N=16$, and only begins to degrade below this threshold (e.g., $N < 8$, where a single batch lacks sufficient multi-task representation and leads to local gradient divergence). Thus, for our default setting of $N=64$, the test gradient remains negligible, allowing us to assume approximately vanishing first-order projected gradients. The first-order term simplifies to:
+\begin{equation}
+    \nabla_W \mathcal{L}^T \delta = \nabla_W \mathcal{L}^T \delta_{\perp}.
+\end{equation}
+Next, substituting the decomposition into the second-order quadratic term and assuming minimal coupling between the low-dimensional subspace and its orthogonal complement, we obtain a mathematically rigorous decomposition of the quantization-induced loss gap:
+\begin{equation}
+\label{eq:loss_decomp}
+\begin{split}
+    \Delta \mathcal{L} \approx & \underbrace{\nabla_W \mathcal{L}^T \delta_{\perp}}_{\text{First-Order Out-of-Subspace}} + \underbrace{\frac{1}{2} \boldsymbol{\epsilon}^T \mathcal{H}_{\mathbf{p}} \boldsymbol{\epsilon}}_{\text{Second-Order In-Subspace}} \\
+    & + \underbrace{\frac{1}{2} \delta_{\perp}^T \mathcal{H}_W \delta_{\perp}}_{\text{Second-Order Out-of-Subspace}},
+\end{split}
+\end{equation}
+where $\mathcal{H}_{\mathbf{p}} = \nabla^2_{\mathbf{p}} F(\mathbf{p}^*) \in \mathbb{R}^{3K \times 3K}$ is the polynomial coefficient-space Hessian matrix. Here, we utilize the standard Gauss-Newton approximation $\mathcal{H}_{\mathbf{p}} \approx J_{\mathbf{p}}^T \mathcal{H}_W J_{\mathbf{p}}$, which assumes that the second-order derivative of the weight mapping with respect to the parameters (i.e., $\nabla^2_{\mathbf{p}} W_{\text{merged}}(\mathbf{p})$) is negligible at convergence. 
+
+This decomposition reveals a critical, high-signal theoretical insight: because blending coefficients only control the model weights *within* the task-vector subspace, test-time adaptation can only minimize and flat-map the \textbf{second-order in-subspace error} ($\frac{1}{2} \boldsymbol{\epsilon}^T \mathcal{H}_{\mathbf{p}} \boldsymbol{\epsilon}$). It cannot control the out-of-subspace noise components $\delta_{\perp}$ which lie orthogonal to the task vectors. Under aggressive low-precision quantization (e.g., INT4), the out-of-subspace noise $\delta_{\perp}$ dominates and structurally destroys the model's representations, leading to the collapse observed in unconstrained TTA methods.
+
+However, CR-PolySACM solves this double-bottleneck through an elegant division of labor:
+\begin{enumerate}
+    \item **Global Structural Regularization:** By confining the blending coefficients to a tiny $12$-dimensional polynomial manifold, CR-PolySACM prevents the optimizer from overfitting to local batch statistics on the calibration stream. This preserves the global, high-quality representation structure of the network and naturally shields the model against out-of-subspace noise $\delta_{\perp}$.
+    \item **Local Flatness Optimization:** Within this low-dimensional, highly stable polynomial manifold, CR-PolySACM explicitly flattens the local loss landscape, bounding the controllable in-subspace sensitivity $\boldsymbol{\epsilon}^T \mathcal{H}_{\mathbf{p}} \boldsymbol{\epsilon}$.
+\end{enumerate}
+
+\subsection{The Task-Vector Norm Scale Pathology and Perturbation Blindness}
+In unconstrained, layer-wise flatness regularizers (such as unnormalized HessMerge), the optimal adversarial perturbation is computed uniformly in the blending coefficient space: $\boldsymbol{\epsilon} = \rho \mathbf{g} / \|\mathbf{g}\|_2$. However, when mapped to weight-space, the resulting perturbation at layer $l$ is scaled directly by the task-vector norm: $\Delta W_{\text{merged}}^l \approx \sum_k \sigma'(\cdot) \epsilon_k^l \tau_k^l$.
+
+This uniform coefficient perturbation introduces a \textbf{fatal scale-blindness pathology} due to the physical layout of deep networks. Our empirical diagnostic measurements on the fine-tuned ViT-Tiny backbone reveal a massive, 50-fold discrepancy in task-vector norms: while the 12 intermediate transformer block layer groups have task-vector norms ranging from $0.40$ to $0.68$, the final layer normalization group (group 13) has an extremely small task-vector norm of only $0.014$ to $0.020$. 
+
+Consequently, a uniform perturbation applied to the coefficients results in a weight-space perturbation at Layer 13 that is over $100\times$ smaller than at other layers. The optimizer is therefore completely blind to the sensitivity of this layer norm layer, easily converging to solutions that are "flat" in the coefficient space but remain highly fragile under post-training quantization rounding noise (which is uniform and applied directly to the weights, completely independent of the task-vector norms).
+
+To restore sensitivity, a scale-invariant regularizer must scale the perturbation applied to each layer $l$ inversely by its task-vector norm: $\epsilon_k^l = \tilde{\epsilon}_k^l / \|\tau_k^l\|_2$. However, because $\|\tau_k^{13}\|_2 \approx 0.014$, this unmitigated division requires scaling the perturbation at Layer 13 by over $2,500$ to $5,000$ times the other layers. Since logits are highly sensitive to layer normalization weights, this massive scale multiplier triggers immediate gradient explosion, numerical singularity, and representational collapse.
+
+\subsection{Clipping-Regularized Sharpness-Aware Minimization (CR-SACM)}
+To resolve this fundamental dilemma, we propose \textbf{Clipping-Regularized Normalized Sharpness-Aware Minimization (CR-SACM)}. CR-SACM implements a mathematically robust, stable, and scale-balanced perturbation mechanism by clipping the task-vector norms to a safe minimum threshold, preventing singular gradient explosion while successfully restoring optimizer sensitivity to low-norm layers.
+
+Let $V_k^l = \|\tau_k^l\|_2$ denote the L2 norm of the task vector for expert $k$ at layer $l$. We define the clipping-regularized norm as:
+\begin{equation}
+    V_{\text{clipped}, k}^l = \max\left( V_k^l, \beta \right),
+\end{equation}
+where $\beta = 0.10$ is the clipping threshold parameter. We define the normalized gradients of the loss with respect to the layer-wise blending coefficients $\lambda_k^l$ as:
+\begin{equation}
+    \hat{g}_k^l = \frac{1}{V_{\text{clipped}, k}^l} \frac{\partial \mathcal{L}}{\partial \lambda_k^l}.
+\end{equation}
+The optimal adversarial coefficient perturbation $\epsilon_k^l$ is then computed as:
+\begin{equation}
+\label{eq:cr_sacm_pert}
+    \epsilon_k^l = \rho \frac{\hat{g}_k^l}{\|\hat{\mathbf{g}}\|_2 V_{\text{clipped}, k}^l},
+\end{equation}
+where $\|\hat{\mathbf{g}}\|_2 = \sqrt{\sum_{l,k} (\hat{g}_k^l)^2}$ is the L2 norm of the normalized gradient tensor.
+
+By scaling the perturbation inversely by $(V_{\text{clipped}, k}^l)^2$ (via the normalized gradient and the final division in Eq.~\ref{eq:cr_sacm_pert}), CR-SACM ensures that the resulting weight-space perturbation $\Delta W_{\text{merged}}^l$ has a uniform, balanced magnitude across all layers. For intermediate transformer blocks (norm $\approx 0.5$, clipping inactive), the perturbation behaves as a standard normalized step. For the highly sensitive final layer norm (norm $\approx 0.014$), the clipping threshold $\beta = 0.10$ restricts the multiplier to a stable and robust $1/0.1^2 = 100\times$ (rather than the unstable $5,100\times$), allowing the optimizer to see and minimize Layer 13's quantization sensitivity without triggering gradient explosion.
+
+\subsection{Sharpness-Aware Subspace Adaptation (CR-PolySACM)}
+In our proposed \textbf{CR-PolySACM} framework, we combine global structural polynomial subspace constraints with local CR-SACM flatness optimization. 
+The test-time adaptation is executed in two steps per iteration:
+\begin{enumerate}
+    \item **Clipping-Regularized Subspace Perturbation:** Compute the layer-wise blending coefficients $\lambda_k^l$ from the current polynomial parameters $\mathbf{p}$ using Eq.~\ref{eq:poly_mapping}. Compute the first-order gradient of the loss with respect to these layer-wise coefficients: $g_k^l = \frac{\partial \mathcal{L}}{\partial \lambda_k^l}$. Compute the optimal adversarial perturbation $\boldsymbol{\epsilon}$ in the coefficient space using CR-SACM (Eq.~\ref{eq:cr_sacm_pert}), and compute the perturbed blending coefficients:
+    \begin{equation}
+        \tilde{\lambda}_k^l = \text{clamp}\left( \lambda_k^l + \epsilon_k^l, 0.0, 1.0 \right).
+    \end{equation}
+    Here, the clamping operator restricts the perturbed coefficients to the valid simplex domain. During backward propagation, gradients with respect to $\lambda_k^l$ pass through the clamp function when the inputs are within the interior bounds and are zeroed out only for actively clamped boundary elements. Because the perturbation radius $\rho = 0.05$ is small and the parameters are initialized in the interior, active boundary clamping occurs rarely and does not impede optimization stability. Empirically, we observe that less than 2\% of the blending coefficients experience active boundary clamping during the entire adaptation trajectory, primarily occurring in early layer groupings where task vectors are highly aligned or near-zero. This minor boundary contact is highly stable and does not introduce optimization oscillations or gradient discontinuities.
+    \item **Sharpness-Aware Polynomial Update:** Evaluate the multi-task unsupervised entropy loss under these perturbed coefficients $\tilde{\Lambda}$. Since the perturbed coefficients are computed as a function of the original polynomial parameters $\mathbf{p}$ (where the perturbation $\boldsymbol{\epsilon}$ is treated as a constant), we can backpropagate the perturbed loss directly back to the polynomial parameters $\mathbf{p}$:
+    \begin{equation}
+        \mathbf{p} \leftarrow \mathbf{p} - \eta \nabla_{\mathbf{p}} \mathcal{L}_{\text{entropy}}(\tilde{\Lambda}).
+    \end{equation}
+\end{enumerate}
+
+This formulation requires only two standard forward-backward passes per iteration, maintaining $O(1)$ memory overhead and making CR-PolySACM extremely fast, computationally lightweight, and practical for edge-deployment test-time adaptation.

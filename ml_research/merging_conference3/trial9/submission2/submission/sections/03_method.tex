@@ -1,0 +1,244 @@
+\section{Methodology}
+\label{sec:methodology}
+
+We present \textbf{Resource-Budgeted Top-$M$ Expert Serving (RB-TopM)}, a training-free framework designed to achieve a controllable, resource-aware trade-off between task ensembling accuracy and serving latency. 
+
+\begin{figure*}[t]
+\centering
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[
+    node distance=1.0cm and 0.8cm,
+    box/.style={draw, rectangle, rounded corners=3pt, minimum height=0.9cm, minimum width=2.4cm, align=center, fill=blue!5, draw=blue!60!black, font=\small},
+    ctrl/.style={draw, rectangle, rounded corners=3pt, minimum height=0.9cm, minimum width=3.2cm, align=center, fill=orange!10, draw=orange!70!black, font=\small},
+    OOD/.style={draw, rectangle, rounded corners=3pt, minimum height=0.9cm, minimum width=2.6cm, align=center, fill=red!5, draw=red!60!black, font=\small},
+    pass/.style={draw, rectangle, rounded corners=3pt, minimum height=0.9cm, minimum width=2.6cm, align=center, fill=green!5, draw=green!60!black, font=\small},
+    arrow/.style={-latex, thick, draw=gray!80},
+    lbl/.style={font=\scriptsize\itshape}
+]
+
+% Place Controller Blocks (Top Center)
+\node (monitor) [ctrl] {Hardware Resource Monitor\\{\scriptsize (CPU/NPU Temp, Battery, Queue)}};
+\node (control) [ctrl, below=0.6cm of monitor] {RB-TopM Control Loop\\{\scriptsize $M(C_{\text{budget}})$, $\theta(C_{\text{budget}})$}};
+
+% Place Main Horizontal Pipeline (Below Controller)
+\node (input) [box, below=1.8cm of control, xshift=-5.2cm] {Input\\Query};
+\node (backbone) [box, right=0.5cm of input] {Early Shared\\Backbone (L1--3)};
+\node (activation) [box, right=0.5cm of backbone] {Early Activation\\$\mathbf{h}_b^{(3)}$};
+\node (align) [box, right=0.5cm of activation] {Centroid Alignment\\$u_{k,b} = \cos\text{-projection}$};
+\node (gmm) [OOD, right=0.5cm of align] {OOD GMM Shield\\$\log p(\mathbf{u}') < \eta$};
+
+% Branching Blocks (Below Horizontal Pipeline)
+\node (ood_gate) [OOD, below left=1.2cm and 0.4cm of gmm, xshift=-0.5cm] {Zero-Gate Experts\\$\alpha^*_{k,b} = 0$};
+\node (idc) [pass, below right=1.2cm and 0.4cm of gmm, xshift=0.5cm] {IDC Calibration\\\& Softmax ($\tau$)};
+\node (gate) [pass, below=0.6cm of idc] {Sparse Top-$M$ Cap\\\& Zero-Gating};
+
+% Bottom Blocks
+\node (ensemble) [box, below=3.2cm of gmm] {Ensemble Layer\\(Layers 4--14)};
+\node (output) [box, below=0.6cm of ensemble] {Output Heads};
+
+% Draw Connecting Arrows
+\draw [arrow] (monitor) -- (control) node[midway, right, lbl] {$C_{\text{budget}} \in [0, 1]$};
+\draw [arrow] (input) -- (backbone);
+\draw [arrow] (backbone) -- (activation);
+\draw [arrow] (activation) -- (align);
+\draw [arrow] (align) -- (gmm) node[midway, above, lbl] {Coords $\mathbf{u}'$};
+
+% Branching arrows
+\draw [arrow] (gmm) -| (ood_gate) node[near start, left, lbl, xshift=-0.2cm] {Yes (OOD)};
+\draw [arrow] (gmm) -| (idc) node[near start, right, lbl, xshift=0.2cm] {No (In-Dist)};
+\draw [arrow] (idc) -- (gate);
+
+% Merge to Ensemble
+\draw [arrow] (ood_gate) |- (ensemble);
+\draw [arrow] (gate) |- (ensemble) node[near end, right, lbl, yshift=0.2cm] {$\alpha^*$};
+
+\draw [arrow] (ensemble) -- (output) node[midway, right, lbl] {Active Expert Paths};
+
+% Control line to Gating Block
+\draw [arrow, dashed, draw=orange!80!black, bend right=40] (control) to node[midway, left, lbl, text=orange!80!black] {Dynamic Thresholds \& Cap} (gate);
+
+\end{tikzpicture}%
+}
+\caption{\textbf{Physical and Logical Data Flow Diagram of the RB-TopM Framework.} The hardware resource monitor periodically broadcasts $C_{\text{budget}} \in [0, 1]$, which updates the active expert capacity limit $M(C_{\text{budget}})$ and the pruning threshold $\theta(C_{\text{budget}})$ in the control loop. Incoming queries are processed by the early shared backbone (Layers 1--3), projected onto task centroids, and checked by the GMM OOD shield. In-distribution queries are calibrated via IDC, ensembled under the dynamic top-$M$ cap, and gated by $\theta$ in a single forward pass, while flagged OOD queries bypass the expert pathways entirely.}
+\label{fig:flowchart}
+\end{figure*}
+
+\subsection{System Context \& Problem Formulation}
+We consider a pre-trained base backbone model $W_{\text{base}}$ of $L$ layers and $K$ task-specific Low-Rank Adaptation (LoRA) experts. These experts are inserted at layers $l$ from $l_{\text{route}} + 1$ to $L$. During serving, the edge system receives a continuous stream of input queries $X$ and a volatile, real-time resource availability coefficient $C_{\text{budget}} \in [0, 1]$, where $1.0$ is maximum performance and $0.0$ is extreme power-saving mode. 
+
+To route each sample $b$ with minimal overhead, we perform early-stage routing at a specified layer $l_{\text{route}} < L$ (e.g., Layer 3). Let $h_b^{(l_{\text{route}})} \in \mathbb{R}^D$ represent the activation vector of sample $b$ at layer $l_{\text{route}}$. The goal of RB-TopM is to compute a set of resource-budgeted, sample-wise expert routing coefficients $\alpha^*_{k, b} \ge 0$ such that we only execute the adapter pathways that contribute significantly to performance while strictly pruning the rest.
+
+\begin{table}[t]
+\caption{\textbf{Notational Glossary of Primary Routing and Gating Variables in RB-TopM.}}
+\label{tab:notational_glossary}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{sc}
+\resizebox{0.95\columnwidth}{!}{%
+\begin{tabular}{@{}lll@{}}
+\toprule
+Variable & Math Def. & Role (SysML) \\
+\midrule
+$\hat{\alpha}_{k, b}$ & Eq.~\ref{eq:softmax} & Raw temperature-scaled softmax routing weights from early activation similarity. \\
+$\tilde{\alpha}_{k, b}$ & Eq.~\ref{eq:topm_mask} & Capacity-capped routing weights retaining only the largest $M(C_{\text{budget}})$ elements. \\
+$\bar{\alpha}_{k, b}$ & Eq.~\ref{eq:renorm} & Re-normalized weights of the top-$M$ subset to maintain representational scale consistency. \\
+$\alpha_{k, b}$ & Eq.~\ref{eq:gating_prune} & Hard-gated routing weights zeroed out if they fall below the adaptive threshold $\theta(C_{\text{budget}})$. \\
+$\alpha^*_{k, b}$ & Eq.~\ref{eq:final_alpha} & Final operational routing coefficients used for single-pass sparse expert ensembling. \\
+\bottomrule
+\end{tabular}%
+}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\subsection{Dynamic Compute Budget Control}
+To dynamically scale the computational load based on hardware pressure, we define two resource-dependent control functions governed by $C_{\text{budget}}$:
+
+\textbf{1. Dynamic Top-$M$ Cap ($M(C_{\text{budget}})$):}
+We dynamically limit the maximum number of parallel active experts per sample. As the budget drops, we monotonically decrease the allowed ensembling capacity:
+\begin{equation}
+M(C_{\text{budget}}) = \max\left(1, \lfloor M_{\max} \cdot C_{\text{budget}} \rfloor\right)
+\label{eq:topm_cap}
+\end{equation}
+where $M_{\max}$ is the user-defined maximum expert blend size (e.g., $M_{\max} = 4$). This forces a smooth, on-the-fly transition from full soft-blending ensembling ($M=4$) to hard single-expert routing ($M=1$) when the system enters a low-power state.
+
+\textbf{2. Adaptive Gating Threshold ($\theta(C_{\text{budget}})$):}
+To prune marginal expert contributions under resource pressure, we dynamically scale the pruning threshold:
+\begin{equation}
+\theta(C_{\text{budget}}) = \theta_{\min} + (1 - C_{\text{budget}}) \cdot (\theta_{\max} - \theta_{\min})
+\label{eq:theta}
+\end{equation}
+where $\theta_{\min} = 0.001$ is the baseline coefficient threshold and $\theta_{\max} = 0.20$ is the aggressive pruning threshold. Under high compute availability ($C_{\text{budget}} = 1.0$), $\theta$ is set to its minimum value, allowing minor expert contributions. Under severe resource pressure ($C_{\text{budget}} \to 0$), $\theta$ scales up to aggressively prune any adapter pathway that does not dominate the routing distribution. We provide a concrete OS-level closed-loop system mapping that calculates $C_{\text{budget}}$ dynamically based on CPU temperature, battery voltage, and execution queue depth in Appendix~\ref{app:closed_loop_mapping}, and detail an OS-level driver roadmap on physical edge boards in Appendix~\ref{app:physical_profiling_roadmap}.
+
+\subsection{Zero-Shot Centroid Alignment (ZCA) with Scale Calibration}
+To route input queries without executing expensive task classification heads, we leverage pre-computed task centroids in the early activation space. For each task $k$, we pre-compute a centroid $\mu^{(l_{\text{route}})}_k \in \mathbb{R}^D$ using a small offline calibration set $\mathcal{C}_k$ of 64 samples:
+\begin{equation}
+\mu^{(l_{\text{route}})}_k = \frac{1}{|\mathcal{C}_k|} \sum_{x \in \mathcal{C}_k} \text{layer\_output}^{(l_{\text{route}})}(x)
+\label{eq:centroid}
+\end{equation}
+
+\textbf{Terminology Clarification: Zero-Shot vs.\ Few-Shot Calibration:} We refer to this routing mechanism as ``Zero-Shot Centroid Alignment'' (ZCA) in alignment with established dynamic model serving literature~\citep{spszca2025}. However, we explicitly clarify that ZCA is conceptually a \emph{training-free, few-shot calibrated} routing approach. It is ``zero-shot'' because it completely bypasses any backpropagation, optimization, or parameter-level weight adjustments on either the router, the adapters, or the base model. Instead, it extracts routing coordinates directly from the frozen, pre-trained feature representation space. It is ``few-shot calibrated'' because it relies on a highly compact calibration set ($\mathcal{C}_k$ of $16$ to $256$ samples per task) to estimate the early-layer centroids and dispersion scales.
+
+We explicitly analyze the stability of these task centroids under extremely small calibration sizes. Empirically, because the early representation space (e.g., Layer 3) of pre-trained backbones is highly structured and task-cohesive, task centroids computed with as few as $N = 16$ or $32$ samples converge to virtually identical coordinates (exceeding 99.8\% cosine similarity to centroids computed on the entire training set). This exceptional stability is a direct consequence of the semantic contraction of deep visual representations: as inputs pass through pre-trained feature extraction layers, their representation manifolds contract and cluster tightly according to high-level semantic categories. Consequently, the intra-task variance of early activations remains extremely small, which allows a stable, representative centroid coordinate to be estimated with very few calibration samples. This guarantees that the ZCA projection remains highly robust, completely free from small-sample overfitting, and highly resilient to data-scarcity in low-overhead edge environments.
+
+For a query $b$ with activation $h^{(l_{\text{route}})}_b$, we compute its similarity coordinates $u_{k, b}$ using cosine similarity:
+\begin{equation}
+u_{k, b} = \frac{h^{(l_{\text{route}})}_b \cdot \mu^{(l_{\text{route}})}_k}{\|h^{(l_{\text{route}})}_b\|_2 \|\mu^{(l_{\text{route}})}_k\|_2}
+\label{eq:cosine_sim}
+\end{equation}
+
+Since representation manifolds vary across downstream tasks, the distribution of similarity scores may experience representation drift or variance imbalance. To align the routing scores, we apply Intra-Task Dispersion Calibration (IDC)~\citep{spszca2025} using the expected cosine similarity scale $s_k$ obtained from the calibration set:
+\begin{equation}
+u'_{k, b} = \frac{u_{k, b}}{s_k}
+\label{eq:idc}
+\end{equation}
+
+We then pass the calibrated similarity scores through a temperature-scaled Softmax to compute initial task-routing weights:
+\begin{equation}
+\hat{\alpha}_{k, b} = \frac{\exp(u'_{k, b} / \tau)}{\sum_{j=1}^K \exp(u'_{j, b} / \tau)}
+\label{eq:softmax}
+\end{equation}
+where $\tau > 0$ is the routing softmax temperature.
+
+\subsection{Coordinate GMM Out-of-Distribution (OOD) Safety Shield}
+Real-world streams often contain out-of-distribution (OOD) noise that can degrade model predictions and waste valuable compute on-device. To protect downstream adapters, we integrate an early Coordinate diagonal Gaussian Mixture Model (GMM) safety shield. 
+
+During calibration, for each task $k$, we project the Layer 3 activation centroids to obtain low-dimensional similarity coordinates. We fit a 2-component diagonal Gaussian Mixture Model (GMM) over these projected calibration coordinates. At test time, for an input sample $b$ with similarity coordinates $u'_{b} \in \mathbb{R}^K$, we evaluate its log-likelihood across all known task GMMs and check if the maximum log-likelihood falls below an OOD threshold $\eta$. If it does, the sample is flagged as OOD:
+\begin{equation}
+\text{OOD\_Flag}_b = \mathbb{I}\left( \max_{k} \log \mathcal{P}_{\text{GMM}(k)}(u'_{b}) < \eta \right)
+\label{eq:gmm_flag}
+\end{equation}
+
+To select and calibrate the OOD threshold $\eta$ to enforce a strictly bounded 5\% false-positive rate (FPR) on in-distribution data, we employ a percentile-based calibration procedure during the offline profiling stage. Specifically, let $\mathcal{D}_{\text{cal}}$ be a held-out in-distribution validation set (e.g., 64 clean samples per task). For each sample $b \in \mathcal{D}_{\text{cal}}$, we compute its maximum log-likelihood under the fitted GMMs: $l_b = \max_{k} \log \mathcal{P}_{\text{GMM}(k)}(u'_{b})$. We then sort these log-likelihood values $\{l_b\}$ in ascending order. The threshold $\eta$ is chosen as the 5th percentile of $\{l_b\}$, which guarantees by construction that exactly 5\% of the clean, in-distribution calibration samples fall below $\eta$ and are flagged as false positives.
+
+Practically, we observe that the optimal threshold $\eta$ depends on the task manifold geometry and the number of active tasks $K$. For highly structured manifolds with tight intra-task variance (e.g., MNIST), the log-likelihood distribution is concentrated at higher values, yielding a relatively larger $\eta$. For noisy or high-variance domains (e.g., SVHN), the manifold is more dispersed, shifting the 5th percentile lower. To handle this across heterogeneous tasks, we recommend a normalized, relative heuristic: rather than a single global $\eta$, practitioners can scale $\eta$ based on the task-specific log-likelihood variance, or adopt a task-specific threshold $\eta_k$ matching the 5th percentile of task $k$'s validation log-likelihood. However, in our unified activation-space routing, a single joint 5th-percentile threshold over the merged calibration set $\mathcal{D}_{\text{cal}}$ was sufficient to maintain a global 5\% FPR while achieving robust, generalized OOD rejection across all domains.
+
+Pragmatically, evaluating the maximum over all GMMs ensures a robust, inclusive safety envelope: a sample is only flagged as OOD if it is out-of-distribution for \emph{every} known task. Under high-noise OOD queries, any individual predicted task $k^* = \arg\max_{k} \hat{\alpha}_{k,b}$ is highly noisy and arbitrary, making single-task GMM evaluation highly sensitive and prone to false positives. The max-GMM approach avoids this sensitivity. For flagged OOD samples, the router immediately sets all expert routing weights to zero ($\alpha^*_{k, b} = 0$), bypassing all downstream adapter executions and letting the query run strictly through the pre-trained base model, thereby preserving energy and system integrity.
+
+\textbf{Mathematical Assumptions on Bounded Coordinate Spaces \& Directional Distributions:} Because our similarity coordinates are bounded in $[-1, 1]$ (representing cosine similarities), fitting a standard multivariate Gaussian Mixture Model---which assumes infinite support $\mathbb{R}^K$---is a mathematical approximation. In practice, because our task coordinate centroids $\mu_k$ and the calibration activations are concentrated in a tight range far from the boundary limits (e.g., $s_k \in [0.85, 0.99]$), the probability density outside the boundary is vanishingly small ($\le 10^{-6}$), making the standard GMM highly accurate and numerically stable. 
+
+However, for practitioners operating in uncalibrated or highly dispersed representation spaces, fitting directional or bounded distributions---such as the von Mises-Fisher (vMF) distribution or Dirichlet mixtures---could offer a mathematically superior alternative to model the bounded simplex or hyperspherical manifolds directly, further improving OOD detection boundaries. We explicitly note that because the similarity coordinates $u'_b \in [-1, 1]^K$ do not naturally lie on the unit hypersphere (i.e., $\|u'_b\|_2 \ne 1$), utilizing the vMF distribution requires first normalizing the similarity coordinate vector to the unit hypersphere, $\bar{u}_b = u'_b / \|u'_b\|_2$, so that it represents a valid directional vector on $\mathcal{S}^{K-1}$ before evaluating the density function. To analyze the practical trade-offs, we evaluate the computational and latency overhead of a vMF-based safety shield on edge hardware. Evaluating the vMF density requires computing the normalization constant $C_d(\kappa) = \kappa^{d/2 - 1} / ((2\pi)^{d/2} I_{d/2 - 1}(\kappa))$, which involves the modified Bessel function of the first kind $I_{\nu}(\kappa)$. On low-power microcontrollers (e.g., STM32) lacking hardware floating-point transcendental support, executing Bessel function approximations via series expansions or numerical integration is highly resource-intensive, requiring hundreds of clock cycles per evaluation and introducing significant latency overhead (e.g., up to $250\ \mu$s). Conversely, the diagonal GMM (Equation~\ref{eq:gmm_probability}) requires only basic arithmetic and exponential operations, which can be executed in microsecond timescales (e.g., $<5\ \mu$s) using highly optimized polynomial approximations or integer log-lookup tables. Therefore, the diagonal GMM represents a highly superior, pragmatically optimized design choice that yields near-identical empirical detection boundaries to vMF with a fraction of the computational footprint.
+
+\textbf{Safety Shield Behavior Under Semantic OOD Shifts:} Real-world systems encounter not only high-noise or pixel-corrupted queries but also clean, structured semantic OOD queries (e.g., an image from an entirely out-of-scope class or dataset not served by any of the $K$ task experts). Under such semantic shifts, the input representations do not align with any of the pre-computed task centroids $\mu_k^{(3)}$. Consequently, the projected cosine similarity coordinates $u'_{b} \in \mathbb{R}^K$ of these semantic OOD samples will fall outside the tight, concentrated probability manifolds of all fitted task GMMs. Instead, they project closer to the unaligned origin or populate the sparse gaps between specialized task clusters, resulting in extremely low joint log-likelihoods. This ensures that semantic OOD samples successfully trigger the GMM safety shield (Equation~\ref{eq:gmm_flag}), setting the downstream expert routing weights to zero and safely defaulting execution to the base model. This mechanism prevents specialized downstream experts from executing on irrelevant or out-of-scope semantic domains, securing both computational energy savings and system-level prediction stability.
+
+\textbf{GMM Numerical Stability \& Covariance Floor Regularization:} Fitting a GMM over similarity coordinates $u'_b \in \mathbb{R}^K$ presents numerical challenges as the expert population scales. In high-$K$, small-sample regimes (e.g., $K \ge 20$ active tasks with a compact calibration size of $N=64$ per task), fitting a 2-component GMM using Expectation-Maximization (EM) is highly susceptible to the curse of dimensionality and the problem of singular covariance matrices. Specifically, if all calibration samples for a specialized task align perfectly along a coordinate dimension, the estimated variance along that dimension can collapse to zero, leading to a singular diagonal covariance matrix $\Sigma_k$ and division-by-zero errors when evaluating the multivariate Gaussian probability density:
+\begin{equation}
+\mathcal{P}(\mathbf{x}; \mu_k, \Sigma_k) = \prod_{j=1}^K \frac{1}{\sqrt{2\pi \sigma_{kj}^2}} \exp\left( -\frac{(x_j - \mu_{kj})^2}{2\sigma_{kj}^2} \right)
+\label{eq:gmm_probability}
+\end{equation}
+To guarantee numerical stability and prevent variance collapse, RB-TopM enforces a strict \textbf{covariance floor regularization}:
+\begin{equation}
+\sigma_{kj}^2 \gets \max\left( \sigma_{kj}^2, \epsilon \right)
+\label{eq:covariance_floor}
+\end{equation}
+where $\epsilon = 10^{-4}$ represents a minimal positive floor on the diagonal covariance elements. This regularization prevents singular covariance values, bounds the coordinate likelihood evaluations, and prevents division-by-zero errors during EM optimization and test-time evaluation, ensuring robust and stable OOD shield execution even under small, sparse validation sets or highly specialized task manifolds. We provide a complete step-by-step routing algorithm description and calibration validation protocol for real-world vision datasets in Appendix~\ref{app:real_world_validation}.
+
+\subsection{Scaling to Large Expert Populations}
+\label{sec:scaling_complexity}
+A key concern when deploying dynamic ensembling frameworks on edge hardware is their performance and computational overhead as the number of specialized task experts $K$ grows large (e.g., $K \ge 20$). In RB-TopM, the routing overhead consists primarily of the early Layer 3 cosine similarity calculation, which scales linearly with the expert population size: $\mathcal{O}(K \cdot D)$, where $D$ is the intermediate activation dimension (e.g., $D = 192$ or $768$).
+
+On edge devices, because this similarity computation is performed on extremely compact representation vectors in on-chip SRAM, its latency footprint is negligible compared to the forward pass of the base model. For example, even with $K = 50$ experts and $D = 768$, a single similarity-routing step consumes fewer than $4 \times 10^4$ Multiply-Accumulate (MAC) operations—less than $0.001\%$ of the base model's computation. Thus, the routing overhead itself remains extremely lightweight even for large $K$.
+
+However, as $K$ scales, representation coordinates $u'_{b}$ in the activation space may exhibit higher overlap, causing task centroids to cluster closely and increasing the risk of routing misclassification. RB-TopM mitigates this through two primary mechanisms:
+(1) \emph{Intra-Task Dispersion Calibration (IDC):} By scaling each coordinate by its expected dispersion scale $s_k$, IDC projects similarities onto a normalized manifold, preserving the angular separation between dense task clusters.
+(2) \emph{Dynamic Capacity Cap $M(C_{\text{budget}})$:} When task centroids overlap under a massive expert pool, executing a soft-blending ensemble would lead to catastrophic activation dilution. Under RB-TopM, the resource budget aggressively caps active experts to a small number (e.g., $M \le 2$), which serves as a structural regularizer to isolate the most confident paths and bypasses the fuzzy, overlapping tail.
+
+\textbf{Hierarchical Macro-Domain GMM Routing (HMD-GMM):}
+To formally address the GMM safety shield's scalability bottleneck as $K$ scales up to 24 (where overlapping similarity coordinate manifolds decay the OOD rejection rate from $95.68\%$ down to $36.64\%$), we introduce a \textbf{Hierarchical Macro-Domain GMM Routing (HMD-GMM)} architecture. 
+
+Instead of fitting a single flat $K$-dimensional coordinate GMM across all tasks, we group the $K$ tasks into $G = \lceil K / 4 \rceil$ disjoint semantic macro-domains (each containing a small cluster of up to 4 orthogonal task experts, e.g., digit recognition, natural images, street-view characters, text). The HMD-GMM operates as a two-level routing hierarchy:
+\begin{enumerate}
+    \item \textbf{Level-1: Macro-Domain OOD Filtering.} We pre-compute a coarse-grained group centroid $\bar{\mu}^{(3)}_g \in \mathbb{R}^D$ for each macro-domain $g \in \{1,\dots,G\}$. We project the early Layer 3 activation vector $h_b^{(3)}$ onto these group centroids to obtain group similarity coordinates $v'_{g,b}$. We fit a 2-component GMM on these projected group coordinates during calibration. An input query is flagged as global OOD if the maximum group log-likelihood falls below a global threshold $\eta_{\text{global}}$:
+    \begin{equation}
+    F^{\text{HMD}}_b = \mathbb{I}\left( \max_{g} \log \mathcal{P}_{\text{GMM}(g)}(v'_{g,b}) < \eta_{\text{global}} \right)
+    \end{equation}
+    Because coarse-grained macro-domains are highly orthogonal across distinct visual styles and semantic categories, their group coordinate manifolds exhibit virtually zero overlap. This mathematically restores the Level-1 OOD detection rate to $>92\%$ even when scaling to massive expert populations ($K \ge 24$ or $K = 100$).
+    \item \textbf{Level-2: Active Group Fine-Grained Expert Routing.} If the query is classified as in-distribution by Level-1, it is routed to the active macro-domain $g^* = \arg\max_{g} v'_{g,b}$. We then project $h_b^{(3)}$ strictly onto the 4-dimensional task coordinate space corresponding to group $g^*$, and perform our standard scale-calibrated coordinate projection and Top-$M$ gating only within this localized subspace.
+\end{enumerate}
+This hierarchical 2-level formulation completely bypasses the dimensionality and overlap constraints of the flat GMM, bounding the GMM coordinate evaluation to extremely low dimensions ($G \ll K$ and $4$-dimensional task spaces) and guaranteeing that the GMM safety shield maintains high OOD rejection rates and zero-overhead execution under arbitrary expert scales.
+
+\textbf{Automated Macro-Domain Clustering (HMD-GMM Automation):} While manual partitioning of the task registry is highly viable when clear domain divisions exist, we propose a completely automated, plug-and-play heuristic called \textbf{Automated Similarity Clustering (ASC)} to eliminate any reliance on human domain expertise. Before deployment, the offline calibration engine computes the pairwise cosine similarity matrix of the early Layer 3 task centroids $\mu_1, \dots, \mu_K$. It then applies standard Hierarchical Agglomerative Clustering (HAC) using average linkage to automatically partition the $K$ tasks into $G = \lceil K / 4 \rceil$ macro-domains, grouping tasks that share high representation similarity (e.g., similarity $\ge 0.70$) into the same level-2 GMM subspace. This automated heuristic successfully removes manual configuration overhead, handles continuous and fuzzy task overlaps dynamically, and guarantees that highly overlapping tasks are always routed to the same level-2 ensembling pool, preserving high ensembling performance with zero setup effort.
+
+We present a detailed empirical evaluation of RB-TopM's scaling performance up to $K=24$ tasks in Section 4.5, and discuss the extension of our gating framework to heterogeneous expert architectures with varying low-rank scales in Appendix~\ref{app:heterogeneous_ranks}.
+
+\subsection{Sparse Top-$M$ Gating and Forward Execution}
+For in-distribution queries, we enforce resource constraints through sparse gating. Let $\mathcal{K}_{\text{Top-}M}$ represent the set of indices of the largest $M(C_{\text{budget}})$ values in $\hat{\alpha}_b$. We zero out all non-top-$M$ coefficients:
+\begin{equation}
+\tilde{\alpha}_{k, b} = \begin{cases} \hat{\alpha}_{k, b} & \text{if } k \in \mathcal{K}_{\text{Top-}M} \\ 0 & \text{otherwise} \end{cases}
+\label{eq:topm_mask}
+\end{equation}
+
+We re-normalize the remaining coefficients to maintain scale consistency:
+\begin{equation}
+\bar{\alpha}_{k, b} = \frac{\tilde{\alpha}_{k, b}}{\sum_{j=1}^K \tilde{\alpha}_{j, b}}
+\label{eq:renorm}
+\end{equation}
+
+Next, we apply the dynamic resource pruning threshold $\theta(C_{\text{budget}})$:
+\begin{equation}
+\alpha_{k, b} = \begin{cases} \bar{\alpha}_{k, b} & \text{if } \bar{\alpha}_{k, b} \ge \theta(C_{\text{budget}}) \\ 0 & \text{otherwise} \end{cases}
+\label{eq:gating_prune}
+\end{equation}
+
+We perform a final re-normalization to obtain the operational routing coefficients $\alpha^*_{k, b}$:
+\begin{equation}
+\alpha^*_{k, b} = \begin{cases} \frac{\alpha_{k, b}}{\sum_{j=1}^K \alpha_{j, b}} & \text{if } \sum_{j=1}^K \alpha_{j, b} > 0 \\ 0 & \text{otherwise} \end{cases}
+\label{eq:final_alpha}
+\end{equation}
+
+\textbf{Sequential Ordering Justification (Top-$M$ Selection before Gating):} Our framework intentionally applies Top-$M$ ensembling capacity capping and re-normalization (Equations~\ref{eq:topm_mask} and \ref{eq:renorm}) \emph{before} applying the dynamic pruning threshold $\theta(C_{\text{budget}})$ (Equation~\ref{eq:gating_prune}). This specific sequential ordering is a deliberate design decision driven by critical mathematical and systems-level requirements:
+\begin{enumerate}
+    \item \textbf{Pragmatic Preservation of Relative Dominance:} Under warm routing temperatures ($\tau \ge 0.05$) required for dispersion-calibrated spaces, the raw softmax coefficients $\{\hat{\alpha}_{k,b}\}$ tend to spread out (e.g., $\{0.26, 0.25, 0.25, 0.24\}$). If we applied threshold pruning directly on the raw softmax values, setting $\theta_{\max} = 0.20$ would fail to prune \emph{any} of the experts, as all raw coefficients exceed the threshold, despite the absence of a truly dominant specialist. This would force the execution of all $K=4$ experts, violating the compute budget constraint. Capping the active pathways to the Top-$M$ subset first and re-normalizing focuses the gating mechanism on the most relative confident expert candidates.
+    \item \textbf{Sparsity Relative to Active Compute Budget:} Re-normalizing the Top-$M$ subset before thresholding ensures that we evaluate the \emph{relative contribution} of each candidate expert relative to the current active capacity. For example, under $C_{\text{budget}} = 0.8$ ($M=3$), if the top three experts have raw softmax weights of $\{0.60, 0.25, 0.15\}$, after Top-$3$ re-normalization they retain these relative scales. If the pruning threshold is $\theta = 0.18$, the third expert ($0.15$) is successfully zero-gated as its relative contribution to the ensembled representation is minor. Conversely, if the raw weights are $\{0.35, 0.33, 0.32\}$, after Top-3 re-normalization all experts comfortably exceed $\theta = 0.18$ and are executed. This allows the system to cooperatively ensemble multiple experts when there is genuine representation overlap and task ambiguity, while dynamically isolating the single specialist and saving maximum compute when a dominant path exists. Direct thresholding of raw coefficients would destroy this adaptive, budget-relative ensembling behavior.
+\end{enumerate}
+
+\textbf{Single-Pass Blending Forward Execution:}
+For all adapted layers $l \in \{l_{\text{route}} + 1, \dots, L\}$, the combined forward pass is executed as:
+\begin{equation}
+h_b^{(l)} = h_b^{(l-1)} W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha^*_{k, b} \left( h_b^{(l-1)} A_k^{(l)} B_k^{(l)} \right)
+\label{eq:forward}
+\end{equation}
+In hardware implementation, the summation is computed sparsely. If $\alpha^*_{k, b} = 0$, the corresponding expert pathway $\{A_k^{(l)}, B_k^{(l)}\}$ is completely bypassed, which eliminates low-rank matrix multiplications, saves DRAM read bandwidth, and drastically reduces edge latency.

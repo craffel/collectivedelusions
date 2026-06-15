@@ -1,0 +1,24 @@
+# Paper Summary: QA-Merge (Quantization-Aware Merge)
+
+## Main Topic and Problem Statement
+This paper addresses the deployment of dynamic model ensembling and weight-merging systems in latent coordinate spaces on resource-constrained edge hardware. While methods like Stateless Activation-Based Latent Ensembling (SABLE), ChemMerge, and Momentum-Merge show strong performance under full-precision (Float32) environments, they experience catastrophic "Quantization Collapse" when compiled for extreme low-precision limits (e.g., 8-bit integer [INT8] activations and 4-bit integer [INT4] ensembling weights) required for edge processors. The rounding operations inherent in low-precision uniform quantization introduce aggressive step noise that destroys representation boundaries, leading to overlapping task centroids, gradient vanishing during routing head optimization, and static-like Uniform Merging performance.
+
+## Proposed Approach (QA-Merge)
+To resolve this deployment bottleneck and stabilize dynamic ensembling within low-precision edge pipelines, the authors propose **QA-Merge** (Quantization-Aware Merge), a hardware-compatible suite of four practical techniques:
+1. **Quantized Centroid Calibration (QCC):** A statistically robust estimator that calculates task-specific centroids in high-precision continuous space during few-shot calibration and then rounds the final averages, preventing centroid shifting and overlap in low-precision grids. It also leverages scale-invariant cosine similarity in the integer coordinate space.
+2. **Straight-Through Estimator (STE) Gating:** Uses the STE to bypass the non-differentiable rounding operator during calibration, allowing robust, end-to-end backpropagation and preventing gradient vanishing across discrete coordinate boundaries.
+3. **Error-Feedback Trajectory Stabilization (EF-Smooth):** A recursive noise-shaping filter that tracks layer-wise blending coefficient rounding errors and feeds them forward as high-pass corrections to stabilize representation trajectories under strict INT4 ensembling weight constraints. It utilizes a branchless, sorting-free projection called Permutation-Invariant Single-Pass Apportionment (PI-SPA).
+4. **Activation Error Feedback (AEF):** Residually accumulates sub-grid layer-wise activation rounding errors and adds them back to the next layer's update. This successfully overcomes the "Small-Step Quantization Bottleneck" where tiny, sub-grid dynamic updates ($\approx 0.01$) are otherwise rounded to zero on coarse INT8 grids.
+
+## Key Findings and Evidence
+- **Quantization Collapse Identification:** The paper identifies and deconstructs the quantization collapse, showing that standard SABLE and ChemMerge under naive INT8/INT4 quantization drop directly to the accuracy of static Uniform Merging (e.g., SABLE naive drops from 76.20% to 73.70% at $\rho=0.2$, matching Uniform's 73.90%).
+- **Accuracy Recovery:** QA-Merge achieves near-100% recovery of full-precision ensembling gains. Under small-sample ($N_{\text{cal}} = 64$) and large-sample ($N_{\text{cal}} = 4000$) regimes, QA-Merge closes the gap to the Float32 ceiling within 0.1–0.3% absolute accuracy.
+- **Microarchitectural & On-Device Benchmarks:** Physical microcontroller measurements on an ARM Cortex-M7 (STM32H753XI) show that the QA-Merge integer loop runs in 0.18 ms per forward pass compared to 0.95 ms for the Float32 FPU loop, achieving a **5.2x latency speedup** and reducing power consumption by **42%** (to 18 mW).
+- **SmoothQuant Parameter Sweeping:** A sensitivity sweep over the migration strength parameter $\alpha \in [0.0, 1.0]$ under outlier conditions shows that an optimal balance at $\alpha \in [0.1, 0.3]$ minimizes Gating Logit MSE ($0.000869$) and maximizes the Gating Decision Match Rate ($97.80\%$) without runtime systems overhead.
+
+## Explicitly Claimed Contributions
+1. **Deconstruction of Quantization Collapse:** Formulating and empirically analyzing how discrete rounding noise collapses high-precision routing manifolds.
+2. **The QA-Merge Suite:** Formalizing the combination of QCC, STE Gating, EF-Smooth, and AEF as a unified, hardware-friendly framework.
+3. **Exhaustive Sandbox Evaluations & Physical MCU Benchmarking:** Evaluating inside the 14-layer Coordinate Sandbox (ICS) across diverse entanglement levels, proving full-precision recovery and achieving massive latency/power improvements on physical Cortex-M7 hardware.
+4. **Permutation-Invariant Single-Pass Apportionment (PI-SPA):** Proposing a sorting-free, branchless Simplex Projection algorithm with $O(K)$ complexity that guarantees exact discrete allocations summing to 1.0, resolving compilation fragility and on-device bottlenecks.
+5. **Dynamic Outlier-Aware Activation Scaling:** Formulating dynamic scale balancing (Approach 1 & 2) to protect low-precision grids from outlier-driven scale inflation.

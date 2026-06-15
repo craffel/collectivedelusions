@@ -1,0 +1,38 @@
+# 3. Soundness and Methodology
+
+## Clarity of the Description
+The description of the QA-Merge framework is exceptionally clear, highly detailed, and mathematically rigorous. The mathematical symbols, equations, and dimensions are precisely defined. The authors structure the methodology logically, starting with the symmetric uniform quantization operator, then moving to offline centroid calibration (QCC), parametric gating optimization (STE), coefficient stabilization (EF-Smooth), and finally activation error feedback (AEF). 
+
+Furthermore, the Appendix provides complete, step-by-step pseudocode for both the main low-precision propagation loop (Algorithm 1) and the Discrete Simplex Projection (Algorithm 2), which makes the system easy to trace and understand.
+
+## Appropriateness of Methods
+The proposed techniques are highly appropriate and directly target the mathematical root causes of "Quantization Collapse" in dynamic ensembling:
+- **AEF (Activation Error Feedback):** Directly addresses the *Small-Step Quantization Bottleneck* where tiny representation updates are smaller than the quantization grid size and are rounded to zero. By accumulating errors residually, it ensures that these small updates eventually cross the quantization threshold, preserving the dynamic contributions of task-specific experts.
+- **EF-Smooth (Error-Feedback Trajectory Stabilization):** Recursively diffuses ensembling coefficient rounding errors across deep layers, preventing representational drift and stabilizing the blending path on a discrete 4-bit simplex grid.
+- **QCC (Quantized Centroid Calibration):** Avoids sample-level quantization noise propagation into centroids by averaging first in continuous space and then quantizing the mean. This is statistically superior to averaging quantized activations, especially under small-sample constraints.
+- **STE Gating:** Appropriately bypasses the non-differentiable rounding operator during offline optimization, enabling gradients to flow back to the gating parameters.
+
+## Mathematical Proofs and Guarantees
+As a theory-focused reviewer, we closely inspect the correctness of the proofs in the Appendix:
+1. **Appendix A.1 (EF-Smooth Error Bounds Analysis):** The derivation of the cumulative discrepancy $\sum_{l=l_0}^{l_0+H} (\boldsymbol{\alpha}^{(l)} - \tilde{\boldsymbol{\alpha}}^{(l)}) = \mathbf{e}^{(l_0+H)} + (1-\beta) \sum_{l=l_0}^{l_0+H-1} \mathbf{e}^{(l)} - \beta \mathbf{e}^{(l_0-1)}$ is mathematically correct. Under perfect error diffusion ($\beta = 1.0$), the sum collapses due to telescoping:
+   $$\sum_{l=l_0}^{l_0+H} \left( \boldsymbol{\alpha}^{(l)} - \tilde{\boldsymbol{\alpha}}^{(l)} \right) = \mathbf{e}^{(l_0+H)} - \mathbf{e}^{(l_0-1)}$$
+   This guarantees that the cumulative weight error is bounded by the single-layer quantization step $\Delta$ coordinate-wise, completely independent of the network depth $H$. This is a powerful, elegant, and correct theoretical guarantee.
+2. **Appendix A.2 (Proof of Theorem 3.1 - AEF):** The proof of the telescoping bounded representational error of AEF is correct. The layer-wise representational step is correctly derived as $\tilde{h}^{(l)} - \tilde{h}^{(l-1)} = \text{pull}^{(l)} + \mathbf{e}^{(l-1)}_{\text{act}} - \mathbf{e}^{(l)}_{\text{act}}$. Summing this relation across $l=4$ to $L$ yields:
+   $$\tilde{h}^{(L)} - \left( \tilde{h}^{(3)} + \sum_{l=4}^L \text{pull}^{(l)} \right) = -\mathbf{e}^{(L)}_{\text{act}}$$
+   Applying the uniform coordinate-wise rounding bound $|e_{\text{act}, d}^{(L)}| \leq \frac{s_{\text{act}}}{2}$, the $\ell_2$ norm of the error is bounded by:
+   $$\left\| \tilde{h}^{(L)} - \left( \tilde{h}^{(3)} + \sum_{l=4}^L \text{pull}^{(l)} \right) \right\|_2 \leq \frac{s_{\text{act}} \sqrt{D}}{2}$$
+   This proof is mathematically flawless and rigorously formalizes why AEF prevents representation drift.
+3. **Intellectual Honesty in Remark 1.1:** The authors show commendable intellectual honesty by noting that the "ideal accumulated trajectory" ($\tilde{h}^{(3)} + \sum \text{pull}^{(l)}$) in Theorem 3.1 is defined using intermediate quantized states $\tilde{h}^{(l-1)}$ and ensembling weights $\tilde{\boldsymbol{\alpha}}^{(l)}$. Because intermediate quantized states affect subsequent pull calculations, this trajectory can mathematically diverge from the true unquantized Float32 path ($h^{(L)}_{\text{float}}$). Theorem 3.1 bounds the *numerical rounding error* relative to the local quantized trajectory, but does not guarantee zero divergence from the Float32 path. The authors empirically evaluate this trajectory divergence in Section 4.4, showing that it remains extremely small ($\approx 0.0413$ at Layer 14) and does not degrade classification accuracy, which completes the analysis rigorously.
+
+## Potential Technical Flaws and Limitations
+1. **Computational Overhead of Runtime Division/Square Root in Cosine Gating:**
+   In Section 3.2, cosine similarity is computed in the integer coordinate space at each layer:
+   $$d_{k, b} = \frac{Q(h_b^{(3)}, s_{\text{act}}, 8) \cdot c'_k}{\| Q(h_b^{(3)}, s_{\text{act}}, 8) \|_2 \| c'_k \|_2 + \epsilon}$$
+   Computing the $\ell_2$ norm $\| Q(h_b^{(3)}, s_{\text{act}}, 8) \|_2$ requires a sum of squares and a square root. While the dot product is a cheap integer MAC operation, the square root and subsequent division are highly expensive on resource-constrained microcontrollers (e.g., ARM Cortex-M7), which often lack vector division/square-root instructions. Since centroid similarity gating is executed at *every* layer $l$ from 4 to 14 in the ensembling loop, doing this at runtime is a potential systems-level bottleneck. The paper discusses scale-alignment for combining gating logits in registers (Section 3.3) but does not explain how the square root or division of cosine similarity is computed efficiently in integer-only hardware.
+2. **Assumptions of Uniform Rounding Bounds under Clipping:**
+   The proofs of EF-Smooth and AEF assume standard uniform rounding bounds ($|e_k^{(l)}| \leq \frac{\Delta}{2}$ and $|e_{\text{act}, d}^{(l)}| \leq \frac{s_{\text{act}}}{2}$). However, these bounds only hold if no register overflow or clipping occurs. If the percentile-based static calibration or hardware-level clipping operator (discussed in Section 3.1) is triggered (e.g., by out-of-distribution outliers), the rounding error can exceed these bounds, which violates the assumptions of the proofs. The mathematical analysis would be more robust if it accounted for or bounded the probability of clipping-induced errors.
+3. **Deterministic Bias in PI-SPA Tie-Breaking:**
+   The Permutation-Invariant Single-Pass Apportionment (PI-SPA) perturbs remainders with a static expert identifier: $r'_k = r_k + \epsilon \cdot \text{ID}_k$. This ensures perturbed remainders are strictly unique and guarantees permutation invariance. However, under exact ties ($r_1 = r_2$), the expert with the higher static ID is always favored. While the authors note that exact ties are rare and have no observed impact on accuracy, this static tie-breaker introduces a deterministic statistical bias and breaks symmetry. A discussion of unbiased or randomized alternatives (and their hardware trade-offs) would strengthen the theoretical rigor.
+
+## Reproducibility
+The reproducibility of this work is **excellent**. The paper provides explicit mathematical formulations, detailed baseline definitions, complete pseudocode for the ensembling and discrete simplex projection loops, and a concrete hardware deployment blueprint. The inclusion of a PyTorch toy script (`toy_qamerge_lora.py`) further confirms that the method can be easily replicated in standard deep learning frameworks.

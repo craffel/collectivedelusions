@@ -1,0 +1,36 @@
+# Novelty Check
+
+## Originality of SABLE
+SABLE (Sample-wise Activation Blending of Low-Rank Experts) presents a highly original and mathematically elegant solution to the problem of **streaming heterogeneity** in test-time model merging. It shifts the entire dynamic ensembling paradigm from weight-space parameter merging to **activation-space on-the-fly ensembling**. 
+
+### 1. Paradigm Shift: Activation Space vs. Parameter Space
+Traditional dynamic model merging approaches, such as Parameter-Free Subspace Routing (PFSR), operate in parameter space. To run a batch of queries, they must average the sample-wise routing coefficients across the batch dimension ($\bar{\alpha}_k = \frac{1}{B}\sum_b \alpha_{k, b}$) to construct a single set of merged weights $W_{\text{merged}} = W_{\text{base}} + \sum_k \bar{\alpha}_k V_k$. This is a severe limitation because under heterogeneous batches (mixed tasks), the coefficients average out, causing the merged model to collapse into a static, sub-optimal uniform average. SABLE bypasses this limitation by ensembling in **activation space**. Leveraging the distributive property of matrix multiplication, SABLE evaluates the shared pre-trained base model once for the batch, and runs parallel lightweight expert adapter passes, scaling and summing their activations on a per-sample basis:
+$$Y_b = X_b W_{\text{base}} + \sum_k \alpha_{k, b} \cdot \left( (X_b A_k) B_k \right)$$
+This represents a profound conceptual shift, moving from systems-level scheduling hacks (like Micro-Batch Homogenization) to a clean, network-level, stateless algebraic solution.
+
+### 2. Layer-Dependent Hybrid-Rank Protocol
+In high-dimensional real-world backbones, constraining rank to $r \le 4$ throughout the entire adapter head severely restricts representation capacity in low-dimensional output projection layers (the classification bottlenecks), degrading SABLE Strict performance. SABLE introduces a novel **Layer-Dependent Hybrid-Rank Protocol** (SABLE Hybrid) that ensembles massive hidden layers (where parameters are high but rank can be aggressively compressed) at low rank (e.g., $r=2$), while ensembling final output projection layers (where parameters are negligible but capacity is crucial) at full-precision (full-rank) updates. This hybrid parameterization achieves the best of both worlds: extreme parameter efficiency and high joint accuracy.
+
+### 3. Refined Zero-Data Centroids
+Dynamic model merging typically requires support data to compute activation prototypes. While weight-based centroids allow a completely data-free setup, they suffer from **Vector Cancellation**: class-specific weights optimized for discriminability point in opposite directions, and averaging them row-wise shrinks the centroid's norm, making it highly sensitive to noise. SABLE introduces a highly principled mathematical refinement: **Refined Zero-Data Centroids**. By applying L2-normalization to each class weight vector before taking their row-mean:
+$$c_{\text{refined}, k} = \frac{1}{C}\sum_c \frac{W_{\text{expert}, 2, k}[c, :]}{\|W_{\text{expert}, 2, k}[c, :]\|_2}$$
+SABLE preserves the semantic task orientation of classification parameters in a completely data-free manner. This mathematical insight is highly original and bridges the performance gap between zero-data weight-space heuristics and support-data activation prototypes.
+
+### 4. Deep Scientific and Theoretical Insights
+The novelty of this work is substantially elevated by the authors' deep, rigorous scientific explanations of two counter-intuitive empirical phenomena:
+
+#### A. The Low-Rank Regularization Paradox
+Under the Layer-Dependent Hybrid-Rank Protocol, the authors observe a non-monotonic trend where SABLE Hybrid at $r=2$ consistently and significantly outperforms its $r=4$ counterpart. Rather than treating this as a simple noise artifact, the authors explain that because the output layer is kept full-rank, the intrinsic capacity is preserved. Constraining the hidden layer to $r=2$ acts as a powerful regularizer, filtering out high-frequency representation noise and forcing the network to propagate only the most dominant, task-robust subspace components. Conversely, $r=4$ increases capacity, letting task-irrelevant features and cross-task adapter interference leak through. This paradox provides a highly actionable design insight for practitioners.
+
+#### B. Destructive Representational Interference of High-Capacity Experts
+Under highly confounded, ambiguous input streams (50-50 overlaid images), soft blending ($M=2$) outperforms hard routing ($M=1$) at extremely low ranks ($r=2$), but this relationship completely reverses at higher ranks ($r=8$). The authors provide a brilliant explanation: at higher ranks, the adapters are highly expressive and reconstruct the unregularized, highly specialized expert manifolds with near-perfect fidelity. Since these experts are trained independently, their high-capacity representations have disjoint, incompatible manifolds. Soft-blending them causes these manifolds to collide, resulting in mutual cancellation and representation scrambling. At extremely low ranks, the low-rank bottleneck acts as an aggressive low-pass filter, retaining only the smoothest, task-robust semantic coordinates that can be blended constructively.
+
+## Comparison to Prior Work
+- **Static Merging (Task Arithmetic, TIES, RegMean, Fisher Merging, Model Soups):** These methods are static and cannot adapt to incoming queries at test time. SABLE is dynamic and performs sample-wise on-the-fly ensembling.
+- **Dynamic Merging (PFSR):** PFSR is state-of-the-art but operates in parameter space, suffering from catastrophic **heterogeneity collapse** under mixed batches. SABLE performs activation-space ensembling, achieving 0.00% collapse.
+- **Systems scheduling (MBH):** MBH wraps the model in a stateful scheduling, buffering, sorting, and partitioning pipeline. It introduces queuing latency, state dependencies, and compute overhead. SABLE is completely stateless and network-level, achieving superior performance with a 6.8$\times$ latency reduction.
+- **PEFT Ensembling (LoraHub, MoE-Adapters):** LoraHub computes a static linear combination of LoRA weights using gradient-free optimization, which is incapable of sample-wise adaptation. MoE-Adapters rely on heavy parametric routing layers that require multi-task training, violating SABLE's zero-parameter, zero-calibration philosophy. SABLE is non-parametric, calibration-free, and performs stateless ensembling natively inside a single-pass forward execution.
+- **Mid-Layer Routing (Late Adaptation):** Solves the Representational Alignment Paradox by running early layers through the base network, avoiding the need for an external routing model, which is highly novel compared to standard multi-layer ensembling.
+
+## Conclusion on Novelty
+SABLE is highly novel, bringing an elegant, self-contained network-level solution that satisfies Occam's razor. The mathematical formulation, hybrid rank protocol, zero-data centroid refinements, and the deep, intellectually satisfying explanations of non-monotonic trends show exceptional academic depth that far exceeds standard incremental PEFT ensembling papers.

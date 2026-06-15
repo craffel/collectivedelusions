@@ -1,0 +1,73 @@
+\section{Methodology}
+\label{sec:method}
+
+We present the complete formulation of \textbf{Confidence-Gated Hybrid Routing (CGHR)} and \textbf{Micro-Batch Homogenization (MBH)}. Our method integrates the representational flexibility of learned parametric routing with the zero-shot stability of parameter-free projections, specifically optimized for real-world deployment.
+
+\subsection{System Model: The Isolating Coordinate Sandbox}
+To validate our proposed methods, we formulate a synthetic multi-task simulation framework, the \emph{Isolating Coordinate Sandbox}. Let $L=1$ represent the number of layers, $D=192$ be the global hidden feature dimension, and $K=4$ be the number of specialized experts. The task space is partitioned into $K$ distinct block coordinates, each of dimension $d = D/K = 48$. Each expert $k \in \{0, \dots, K-1\}$ is a classification head $W_k \in \mathbb{R}^{C_k \times d}$ where $C_k = 10$ classes.
+
+To replicate realistic expert performance ceilings, the classifier weights are pre-normalized using \emph{Unit-Norm Calibration} (UNC) such that $\|W_{k, c}\|_2 = 1$ for all classes $c$. The globally pooled feature representation $z_b \in \mathbb{R}^D$ of sample $b$ is composed of $K$ blocks: $z_b = [z_{0, b}, z_{1, b}, z_{2, b}, z_{3, b}]$. For an active task $k$, the corresponding block $z_{k, b}$ contains class prototypes contaminated with specialized noise levels $\sigma_k$ to replicate real-world expert ceilings:
+\begin{itemize}
+    \item Task 0 (MNIST): $\sigma_0 = 0.05 \implies 100.0\%$ expert accuracy.
+    \item Task 1 (Fashion-MNIST): $\sigma_1 = 0.05 \implies 100.0\%$ expert accuracy.
+    \item Task 2 (CIFAR-10): $\sigma_2 = 0.35 \implies 88.6\%$ expert accuracy.
+    \item Task 3 (SVHN): $\sigma_3 = 1.25 \implies 26.4\%$ expert accuracy. We explicitly note that this extremely low ceiling is a deliberate synthetic device used to model a "weak expert" (essentially operating as a near-random classifier in this sandbox coordinate), rather than representing realistic SVHN classification performance. This weak expert serves as a valuable diagnostic tool to analyze how our routing framework behaves under extreme task degradation (see Appendix~\ref{app:clarifications} for an investigation of CGHR boundary behavior under uniform task degradation, where all experts are weak, demonstrating the system's graceful transition to the robust parameter-free pathway).
+\end{itemize}
+Non-active blocks ($j \ne k$) are contaminated with standard random Gaussian noise $\mathcal{N}(0, I_d)$.
+
+We explicitly highlight a core structural assumption of this sandbox design: the feature vector $z_b$ is partitioned into $K$ disjoint block coordinates, representing a clean spatial task-representation isolation. This represents an idealized setup where expert representational coordinates are orthogonal and completely decoupled in the representation space. While this orthogonal partitioning serves as a valuable mathematical tool to isolate and audit individual routing dynamics under controlled conditions, in real-world neural network backbones (such as pre-trained Transformers), features are highly overlapping and shared across tasks. We discuss the structural and baseline comparison implications of this disjoint coordinate assumption in detail in Section~\ref{sec:experiments}.
+
+\subsection{Pathway A: Parametric Gating}
+The parametric routing pathway consists of a lightweight linear router parameterized by weights $W_{\text{param}} \in \mathbb{R}^{K \times D}$ and bias $b_{\text{param}} \in \mathbb{R}^K$. Given the penultimate representation $z_b \in \mathbb{R}^D$, raw routing logits $a_b$ are computed as:
+\begin{equation}
+a_b = W_{\text{param}} z_b + b_{\text{param}}
+\end{equation}
+The parametric routing coefficients $\alpha^{\text{param}}_b \in \mathbb{R}^K$ are obtained via Softmax activation:
+\begin{equation}
+\alpha^{\text{param}}_{k, b} = \frac{\exp(a_{k, b})}{\sum_{j=1}^K \exp(a_{j, b})}
+\end{equation}
+The parametric router is optimized using Cross-Entropy loss over task labels on a small calibration set of size $N$ using AdamW with $L_2$ weight decay. While expressive, Pathway A is highly vulnerable to transductive overfitting under small $N$.
+
+\subsection{Pathway B: Parameter-Free Subspace Routing}
+To guarantee a stable fallback, Pathway B leverages Parameter-Free Subspace Routing (PFSR). PFSR requires zero trainable parameters and operates by projecting penultimate representations onto pre-trained expert classification weight manifolds using cosine similarities. Let $W_{k, c} \in \mathbb{R}^d$ be the class-$c$ prototype weight of Expert $k$. We compute the calibrated cosine-similarity task coordinate:
+\begin{equation}
+u'_{k, b} = \frac{\max_{c} \frac{W_{k, c} \cdot z_{k, b}}{\|W_{k, c}\|_2 \|z_{k, b}\|_2}}{\sqrt{2\log C_k / d}}
+\end{equation}
+The parameter-free routing coefficients $\alpha^{\text{pfsr}}_b \in \mathbb{R}^K$ are derived using a temperature-scaled Softmax:
+\begin{equation}
+\alpha^{\text{pfsr}}_{k, b} = \frac{\exp(u'_{k, b} / \tau)}{\sum_{j=1}^K \exp(u'_{j, b} / \tau)}
+\end{equation}
+where $\tau = 0.001$ is a fixed hyperparameter controlling gating peakiness.
+
+\subsection{Confidence Gating Mechanism}
+At test time, CGHR evaluates the routing prediction confidence of Pathway A. If the parametric prediction is highly confident, we utilize Pathway A; otherwise, we fall back to Pathway B. Formally, given a confidence threshold $\gamma_{\text{conf}} \in [0, 1]$, the hybrid routing coefficients $\alpha^{\text{hybrid}}_b$ are computed sample-wise:
+\begin{equation}
+\alpha^{\text{hybrid}}_b = \begin{cases} 
+\alpha^{\text{param}}_b & \text{if } \mathcal{C}(\alpha^{\text{param}}_b) \ge \gamma_{\text{conf}} \\
+\alpha^{\text{pfsr}}_b & \text{if } \mathcal{C}(\alpha^{\text{param}}_b) < \gamma_{\text{conf}}
+\end{cases}
+\end{equation}
+We evaluate three distinct formulation candidates for the confidence metric $\mathcal{C}(\alpha^{\text{param}}_b)$:
+\begin{enumerate}
+    \item \textbf{Max Probability}:
+    \begin{equation}
+    \mathcal{C}_{\text{max}}(\alpha^{\text{param}}_b) = \max_{k \in \{1, \dots, K\}} \alpha^{\text{param}}_{k, b}
+    \end{equation}
+    \item \textbf{Negative Entropy}:
+    \begin{equation}
+    \mathcal{C}_{\text{entropy}}(\alpha^{\text{param}}_b) = 1 - \frac{-\sum_{k=1}^K \alpha^{\text{param}}_{k, b} \log \alpha^{\text{param}}_{k, b}}{\log K}
+    \end{equation}
+    \item \textbf{Margin}:
+    \begin{equation}
+    \mathcal{C}_{\text{margin}}(\alpha^{\text{param}}_b) = \alpha^{\text{param}}_{[1], b} - \alpha^{\text{param}}_{[2], b}
+    \end{equation}
+    where $[1]$ and $[2]$ denote the first and second largest routing coefficients in $\alpha^{\text{param}}_b$.
+\end{enumerate}
+
+\subsection{Micro-Batch Homogenization (MBH)}
+When processing mixed-task deployment streams, standard dynamic merging computes a single set of merged weights averaged over the batch representation, leading to \emph{heterogeneity collapse}. To prevent this, Micro-Batch Homogenization (MBH) dynamically partitions a heterogeneous batch $X$ of size $B$ into $G$ homogeneous micro-batches $\{X^{(1)}, \dots, X^{(G)}\}$ on the fly. 
+Specifically, MBH groups samples according to their target task argmax predicted by the routing layer:
+\begin{equation}
+\hat{k}_b = \arg\max_{k} \alpha^{\text{hybrid}}_{k, b}
+\end{equation}
+All samples sharing the same predicted task $\hat{k}_b$ are aggregated into a single homogeneous micro-batch $X^{(g)}$. The routing coefficients are averaged locally within each micro-batch, the expert parameters are fused, and the specialized model outputs are executed. Finally, the individual micro-batch predictions are re-aligned to match the original stream input order. This sample-wise isolation completely bypasses representational smoothing and protects dynamic merging from collapse.

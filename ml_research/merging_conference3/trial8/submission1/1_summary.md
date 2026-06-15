@@ -1,0 +1,24 @@
+# Systematic Critique - Step 1: Summary of the Paper
+
+## 1. Core Motivation and Problem Statement
+The paper addresses the challenge of test-time dynamic model ensembling and routing under heterogeneous multi-task input streams. It critiques the fundamental and ubiquitous "Euclidean assumption" shared by existing state-of-the-art ensembling and routing schemes (like PFSR, SABLE, and SPS-ZCA): that activation representations and task boundaries are best modeled in flat Euclidean space ($\mathbb{R}^D$).
+
+The authors argue that this flat geometric foundation introduces two primary limitations:
+1. **Representation Crowding:** In flat Euclidean space, the volume of a sphere scales polynomially with dimension ($V(r) \propto r^D$). As a result, when embedding a high number of disjoint task manifolds, representations crowd around the coordinate origin. This leads to heavy overlaps and destructive inter-task cross-talk during ensembling.
+2. **Taxonomic and Power-Law Mismatch:** Deep neural representations are inherently hierarchical, exhibiting power-law scale relationships and nested taxonomy boundaries. Forcing these scale-invariant hierarchical structures into flat Euclidean spaces results in high topological distortion, which degrades both representation alignment and the precision of distance-based routing.
+
+## 2. Proposed Methodology (HyperMerge)
+To overcome these limitations, the authors introduce **HyperMerge** (*Hyperbolic Space Activation Routing and Fusion*), a dynamic model ensembling system built entirely upon non-Euclidean geometry:
+* **Poincaré Ball Model:** Projects intermediate Euclidean activations into the Poincaré Ball ($\mathbb{D}_c^D$) via exponential maps ($\exp_{\mathbf{0}}^c$) and projects them back to Euclidean space via logarithmic maps ($\log_{\mathbf{0}}^c$).
+* **Hyperbolic Centroid Alignment (HCA):** Computes robust task-specific barycenters (Fréchet means) on a tiny calibration split. To obtain a closed-form solution, it projects Poincaré coordinates to Beltrami-Klein coordinates ($\mathbb{K}_c^D$), computes the *Einstein midpoint* weighted by Lorentz factors, and maps back.
+* **Beltrami-Klein Symmetric Blending (BKSB):** Performs non-linear, permutation-invariant ensembling of adapter updates. It projects unscaled Poincaré updates directly to the Beltrami-Klein model $\mathbb{K}_c^D$, computes the Lorentz-weighted Einstein midpoint using dynamic routing weights and Lorentz factors, and maps the merged Klein state back to Poincaré coordinates. This formulation is completely symmetric and applies the routing weights exactly once, resolving the order-dependence of sequential Möbius addition and avoiding the double-weighting flaw of other ad-hoc schemes.
+* **Hyperbolic Out-of-Distribution Rejection (HOR):** Implements a non-parametric outlier detector that evaluates the minimum hyperbolic geodesic distance from incoming samples to known task centroids, rejecting queries that exceed a distance threshold $\gamma_{\text{OOD}}$.
+
+## 3. Key Evaluation and Claims
+* **Evaluation Setup:** Evaluated inside a synthetic 14-layer, 192-dimensional "Analytical Coordinate Sandbox" designed to simulate representation flows with $K = 4$ task experts (simulating MNIST, F-MNIST, CIFAR-10, SVHN) adapted via rank-8 LoRA.
+* **Key Performance Claims and Internal Inconsistencies:**
+  * **The Inconsistency:** The paper contains a major internal discrepancy regarding its key performance numbers. 
+    * The **Abstract, Introduction, and Figure 1 Caption** claim that HyperMerge achieves a joint mean accuracy of **89.30%** under both stream configurations, which is highly competitive with SABLE at **89.65%** and SPS-ZCA at **88.55%**. 
+    * However, **Table 1 and Section 4.4 text** report the multi-seed results: HyperMerge achieves **83.40% $\pm$ 5.15%**, SABLE (Early Routing) achieves **84.03% $\pm$ 5.15%**, and SPS-ZCA achieves **83.05% $\pm$ 4.95%**. The authors completely failed to align the text and tables in the experimental section with the abstract and introduction, which is a major writing flaw.
+  * **Overlapping Subspace Sandbox:** For the highly crowded Overlapping Subspace Sandbox, the paper similarly reports multi-seed results in **Table 2 and Section 4.5 text** where SABLE Early achieves **77.98% $\pm$ 2.12%**, SPS-ZCA achieves **77.32% $\pm$ 1.98%**, and HyperMerge achieves **76.62% $\pm$ 3.96%** (Tuned is **76.50% $\pm$ 3.36%**). This directly contradicts their claim that HyperMerge resolves representation crowding, as flat Euclidean baselines still outperform the hyperbolic formulation.
+  * **Latency and Systems Overhead:** The authors claim that HyperMerge delivers $O(1)$ constant-latency dynamic ensembling natively in a single forward pass without systems-heavy scheduling, queuing, or buffering (such as Micro-Batch Homogenization), maintaining flatline stream robustness.

@@ -1,0 +1,13 @@
+# Summary of the Paper
+
+## Overview
+The paper introduces **Pruned Gradient Merging (PG-Merge)**, an active test-time model merging framework designed to resolve the **Overfitting-Optimizer Paradox** in online parameter-space model fusion. In test-time adaptation (TTA) for model merging, layer-wise merging coefficients are optimized on a small, unlabeled test-time data stream (often only a few dozen samples) to minimize prediction entropy on-the-fly. However, unconstrained high-dimensional optimization (e.g., standard layer-wise AdaMerging) easily leads to transductive overfitting on local noise, resulting in severe representational decay and joint performance collapse across tasks.
+
+Critiquing prior state-of-the-art (SOTA) solutions—such as RegCalMerge (which introduces complex spatial regularizers and class-capacity normalization) and PolyMerge (which restricts the search space to a rigid geometric polynomial trajectory)—as overly convoluted and hyperparameter-heavy, the authors propose a training-free, non-parametric, and minimalist alternative. PG-Merge restricts the optimization degrees of freedom by applying a dynamic, binary sparse gradient mask at each adaptation step. By sorting absolute gradient magnitudes and zeroing out all but the top-$p\%$ (e.g., $5\%$--$15\%$) most critical values, PG-Merge allows only high-sensitivity coordinates to adapt while keeping the remaining parameters strictly frozen.
+
+## Key Contributions Claims
+1. **The Minimalist Hypothesis:** Exposes the redundant complexity in existing TTA model merging regularizers and shows that a minimalist, non-parametric gradient-sparsity mechanism is sufficient to stabilize online adaptation.
+2. **Pruned Gradient Masking:** Formulates a dynamic gradient-magnitude sorting and thresholding mechanism that acts as an analytical, online low-pass filter on coefficient updates.
+3. **Strict Parameter Freezing (Momentum Projection):** Introduces a post-update parameter projection step to prevent historical momentum leakage under advanced optimizers like Adam, guaranteeing that masked coordinates remain mathematically frozen.
+4. **Rigorous Empirical Evaluation:** Evaluates the approach on a compact Vision Transformer (`vit_tiny`) backbone across four visual classification tasks (MNIST, FashionMNIST, CIFAR-10, and SVHN) using properly converged task experts.
+5. **The Sparsity Sweet Spot:** Demonstrates that restricting active updates to an extremely sparse subset ($p=0.05$, or updating only $\approx 3$ coefficients per step) represents the optimal regularization regime, yielding peak average accuracy ($62.70\%$) and outperforming unregularized AdaMerging ($61.08\%$) and SOTA RegCalMerge ($62.35\%$).

@@ -1,0 +1,27 @@
+# Paper Evaluation: 2. Novelty and Theoretical Delta
+
+## Key Novel Aspects
+The paper introduces several distinct novel elements to the model-merging and dynamic test-time adaptation (TTA) literature:
+1. **Methodological Deconstruction of "Quantum" Analogy:** The paper translates the complex, wave-inspired formulation of Quantum Wavefunction Superposition Merging (QWS-Merge) into a standard deep learning framework. It characterizes the "wave wavefunction superposition" as a non-monotonic cosine activation function with redundant parameterization (amplitude scales and phase alignments).
+2. **Exposing the "Baseline Confounder":** The paper highlights a pervasive issue in "quantum-inspired" deep learning literature, where elaborate mathematical metaphors hide simpler statistical mechanisms. It demonstrates that the supposed superiority of these methods is an artifact of comparison against crippled, unregularized classical baselines.
+3. **The Layer-Averaging Collapse Proof:** The paper provides a mathematical formulation demonstrating that when layer-wise routing weights are averaged to merge a unified global classification head, the multi-layer linear parameter space collapses back into a single-layer effective router.
+4. **Exposing the "Robustness-Accuracy Illusion":** The paper provides a conceptual and mathematical critique of how simplex normalization (like Softmax) provides an illusion of robustness by forcing dynamic routing coefficients toward a mediocre, uniform average.
+5. **Characterization of Stream Heterogeneity Collapse:** It analyzes the behavior of test-time dynamic routing under mixed-task inference streams and identifies how batch averaging leads to "heterogeneity collapse."
+
+## Delta from Prior Work
+- **From Dynamic Merging (AdaMerging, PolyMerge, ZipMerge):** Prior dynamic merging methods focus on test-time adaptation under homogeneous streams. This work is the first to systematically analyze the impact of heterogeneous, mixed-task batching on dynamic routing performance.
+- **From QWS-Merge:** The delta is a rigorous, direct deconstruction. Rather than proposing another complex model, this paper is a "demystifying" work that shows simple linear classical projections with $L_2$ regularization outperform the SOTA.
+- **From Empirical Model-Merging Literature:** The paper introduces the concept of an "Isolating Coordinate Sandbox" to separate the routing error ($\text{Error}_{routing}$) from the weight-space alignment error ($\text{Error}_{alignment}$), which is typically entangled in standard ViT or LLM sweeps.
+
+## Characterization of Novelty
+The novelty is **significant and highly refreshing**. In a literature dominated by increasingly complex and heuristically-driven architectures, this paper represents a rare "deflationary" contribution. It systematically strips away unnecessary mathematical obfuscation to reveal the true drivers of performance. 
+
+However, from a **theorist's perspective**, there is a notable overclaim in how the authors characterize the generality of their mathematical proofs:
+- **Overclaiming the Generality of Layer-Averaging Collapse:** In Section 5 and Section 8, the authors claim that the proof of layer-averaging collapse "applies universally to *any* dynamic routing model." This is mathematically incorrect. 
+  The proof is based on the linearity of the inner product and the summation operator:
+  $$\bar{\alpha}_k = \frac{1}{L} \sum_{l=1}^L \left( \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k} \right) = \left\langle \psi(x)_b, \frac{1}{L} \sum_{l=1}^L W_{l, k} \right\rangle + \frac{1}{L} \sum_{l=1}^L B_{l, k}$$
+  This exact algebraic collapse **only** holds for purely linear routers (L3-Linear). 
+  For non-linear routers, such as L3-Tanh, L3-Softmax, or QWS-Merge (cosine), the sum of non-linear functions cannot be simplified to a single non-linear function of the same family:
+  $$\frac{1}{L} \sum_{l=1}^L \tanh\left(\langle \psi(x)_b, W_{l, k} \rangle + B_{l, k}\right) \neq \tanh\left(\langle \psi(x)_b, W_{eff, k} \rangle + B_{eff, k}\right)$$
+  Mathematically, a sum of $L$ non-linear functions represents a *mixture model* or a single-hidden-layer neural network with $L$ hidden units. This has a strictly greater representational capacity than a single non-linear function. Therefore, the parameter space of layer-wise non-linear routing does *not* mathematically collapse to a single-layer routing space in the same family. The authors' claim of "universal applicability" of the proof is a theoretical overreach that ignores the fundamental properties of non-linear mappings.
+- **Why the Empirical Sandbox Collapses Anyway:** Although the mathematical collapse only holds strictly for L3-Linear, the multi-layer models in the sandbox still fail to beat the global baseline due to optimization difficulties in data-scarce splits (64 samples). The backpropagation of classification loss through the deep layer-by-layer network introduces immense noise, which obscures any representational benefit that the non-collapsed mixture models might have had. The paper's empirical results support this (e.g., L3-Tanh and L3-Softmax are outperformed by the simple Linear Router), but the authors should distinguish between *strict algebraic collapse* (which only applies to linear models) and *optimization/generalization collapse* due to noise and overfitting (which applies to non-linear layer-wise models under data scarcity).

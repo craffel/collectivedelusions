@@ -1,0 +1,345 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the formal mathematical framework of \textbf{ThermoMerge}.
+We first define the test-time model merging problem and our self-labeling proxy objective.
+We then derive our physics-inspired optimization strategy using Stochastic Gradient Langevin Dynamics (SGLD) paired with an exponential Simulated Annealing cooling schedule.
+Finally, we address parameter dimensionality mismatch, describe its interaction with mini-batch stochasticity, and analyze its computational complexity.
+
+\subsection{Problem Formulation and Model Setup}
+Let $X^{te} = \{x\}$ be an unlabeled test-time dataset sampled from a mixture of $K$ downstream target tasks.
+We are provided with a pre-trained base model $f(\cdot; \Theta_{pre})$ and a set of $K$ fine-tuned expert models $\{f(\cdot; \Theta_k)\}_{k=1}^K$, where each expert has been fine-tuned on its respective task $k$.
+The architectures of these models consist of a shared encoder backbone (with $L-1$ layers) and task-specific classification heads.
+
+For each layer $l \in \{1, \dots, L-1\}$ in the shared encoder, the task vector of the $k$-th expert is defined as:
+\begin{equation}
+    \tau_k^l = \theta_k^l - \theta_{pre}^l
+\end{equation}
+where $\theta_k^l$ and $\theta_{pre}^l$ represent the parameters of layer $l$ for the $k$-th expert and pre-trained base model, respectively.
+
+To combine these experts while mitigating interference, we define a merged encoder parameterized by layer-wise and task-wise merging coefficients $\Lambda = \{\lambda_k^l\}$ of size $(L-1) \times K$.
+The merged parameter for layer $l$ of the encoder backbone is constructed via a linear combination of task vectors:
+\begin{equation}
+    \theta_{MTL}^l = \theta_{pre}^l + \sum_{k=1}^K \lambda_k^l \tau_k^l
+\end{equation}
+Alongside the encoder parameters, we maintain a set of task-specific layers (e.g., classification heads) parameterized by $\Theta^{tr} = \{\theta_k^{tr}\}_{k=1}^K$.
+These heads are initialized to the fine-tuned classifier weights of their respective experts but will be dynamically updated during test-time adaptation.
+
+\subsection{Stable Self-Labeling Test-Time Objective}
+Because test-time adaptation occurs in a data-scarce and unlabeled environment during inference, we require a proxy objective to supervise parameter optimization.
+While earlier adaptive methods like AdaMerging~\cite{yang2024adamerging} minimize prediction entropy, this can lead to degenerate solutions where the model collapses to single-class predictions.
+
+To ensure stable supervision, we adopt the expert-guided self-labeling cross-entropy objective from SyMerge~\cite{jung2025symerge}.
+We pass each unlabeled sample $x \in X^{te}$ through the $K$ fixed unmerged fine-tuned expert models to obtain teacher predictions, $C_k^{ft}(x) = f(x; \Theta_k)$, which serve as soft self-labels.
+The joint test-time proxy loss function $\mathcal{L}_{TT}(\Lambda, \Theta^{tr})$ is defined as:
+\begin{equation}
+\mathcal{L}_{TT}(\Lambda, \Theta^{tr}) = \mathbb{E}_{x \sim X^{te}}\left[ \sum_{k=1}^K \mathcal{L}_{CE}\left( C_k^{merged}(x), C_k^{ft}(x) \right) \right]
+\end{equation}
+where $C_k^{merged}(x)$ is the merged model's output for task $k$ using the merged encoder and task head $\theta^{tr}_k$, and $\mathcal{L}_{CE}$ is the cross-entropy loss.
+This is given by the composition:
+\begin{equation}
+    C_k^{merged}(x) = f^L\left(f^{1:L-1}(x; \Theta_{MTL}^{enc}); \theta^{tr}_k\right)
+\end{equation}
+
+\paragraph{Vulnerability of Self-Labeling to Teacher Bias.} While expert-guided soft self-labels provide exceptionally stable supervision compared to standard prediction entropy minimization, this objective introduces a theoretical vulnerability to \emph{teacher bias} and confirmation bias.
+Since the proxy loss relies purely on fixed, unmerged expert predictions as teacher labels, any systematic errors or high-entropy, low-confidence predictions from these experts on difficult downstream samples will be propagated to the merged model.
+In extreme cases, joint SGLD exploration could be misdirected to regions that merely reinforce these incorrect teacher predictions.
+
+To mitigate this teacher-bias risk in real-world deployments, we suggest three elegant engineering strategies: (1) \textbf{Confidence-Based Filtering}: Only calculate the proxy loss on samples where at least one expert prediction exceeds a confidence threshold $\tau$ (e.g., $\max_c [C_k^{ft}(x)]_c > 0.85$), filtering out highly noisy or out-of-distribution samples that would corrupt the gradient updates. (2) \textbf{Entropy-Based Weighting}: Scale the loss contribution of each sample $x$ inversely with the Shannon entropy of the expert predictions, ensuring that highly certain, sharp teacher predictions dominate the adaptation step while ambiguous, high-entropy predictions are naturally discounted. (3) \textbf{Predictive Agreement Monitoring (Detection)}: To actively \emph{detect} confirmation bias during adaptation, practitioners can monitor the running predictive agreement (e.g., Jensen-Shannon divergence or class-wise alignment) between the adapting merged model and the individual teacher experts.
+A rapid, monotonic increase in predictive agreement accompanied by a collapse in prediction entropy without a corresponding reduction in proxy loss on a small held-out calibration set serves as a strong statistical signature of confirmation bias, signaling that SGLD is overfitting to the teachers' mistakes.
+Tracking this signature enables dynamic early-stopping or an automated temporary increase in the Langevin temperature $T_t$ to "re-melt" and escape the corrupted basin.
+
+\subsection{Thermodynamic Optimization via SGLD}
+Under severe task interference, the joint proxy loss landscape $\mathcal{L}_{TT}(\Lambda, \Theta^{tr})$ is highly non-convex, containing severe high-frequency ripples and sharp, sub-optimal local basins.
+Standard deterministic optimization schemes (like SGD or Adam) update parameters purely in the direction of the negative gradient, meaning they are mathematically incapable of escaping local traps.
+
+To resolve this, we model test-time merging as a thermodynamic system.
+We replace deterministic gradient updates with Stochastic Gradient Langevin Dynamics (SGLD).
+SGLD models parameter trajectories as a continuous physical diffusion process (the Langevin equation) where the parameters are subjected to coordinate-wise thermal agitation.
+
+At each test-time adaptation step $t$, we generalize the optimization process by updating each independent parameter group or tensor.
+Let $j \in \mathcal{P}$ index the set of independent updated parameter groups (including the low-dimensional merging coefficients $\Lambda$ and each independent task classifier head or multi-layered weights $W_j$).
+The SGLD update equation for any specific parameter tensor $\Theta^{(j)}$ is given by:
+\begin{equation}
+    \label{eq:sgld_generic}
+    \Theta^{(j)}_{t+1} = \Theta^{(j)}_t - \eta_j \nabla_{\Theta^{(j)}} \mathcal{L}_{TT}(\Lambda_t, \Theta^{tr}_t) + \sigma_j \cdot \epsilon^{(j)}_t
+\end{equation}
+where $\eta_j$ is the learning rate of parameter group $j$, $\sigma_j$ is the coordinate-wise thermal noise standard deviation, and $\epsilon^{(j)}_t \sim \mathcal{N}(0, I_{d_j})$ is a standard independent multivariate Gaussian noise vector in $d_j = \text{dim}(\Theta^{(j)})$ dimensions.
+
+\subsection{Dimensionality-Scaled Langevin Noise (DSLN)}
+We identify a critical mathematical and physical challenge in test-time model merging: the joint adaptation of extremely low-dimensional merging coefficients $\Lambda$ (where $d_{\Lambda} = \text{dim}(\Lambda) \approx 10^1$ to $10^2$) alongside highly high-dimensional classification heads $\Theta^{tr}$ (where $d_{\Theta} = \text{dim}(\Theta^{tr}) \approx 10^5$ to $10^6$).
+
+If one were to apply standard coordinate-wise SGLD noise without scaling, the expected total squared norm of the noise vector added to a parameter group of dimension $d$ would be:
+\begin{equation}
+    \mathbb{E}\left[\|\sqrt{2 \eta T_t} \cdot \epsilon\|^2\right] = d \cdot 2 \eta T_t
+\end{equation}
+where $\epsilon \sim \mathcal{N}(0, I_d)$.
+This formulation reveals a severe physical hazard: as $d \to \infty$, the total thermal kinetic energy injected into the parameter group explodes linearly with the dimension.
+For a classification head with $10^6$ parameters, the injected noise power is six orders of magnitude larger than that added to the merging coefficients.
+This astronomical thermal agitation acts as an uncontrolled heat bath that instantly "boils" and destroys the highly structured, pre-trained classification features, causing gradient explosion and optimization collapse.
+
+To resolve this dimensionality mismatch, we propose \textbf{Dimensionality-Scaled Langevin Noise (DSLN)}.
+We scale the coordinate-wise noise standard deviation inversely with the square root of the parameter group's dimension $d_j$:
+\begin{equation}
+    \sigma_j = \sqrt{\frac{2 \eta_j T_t}{d_j}}
+\end{equation}
+By scaling the coordinate-wise noise in this manner, the expected total thermodynamic kinetic energy injected into each parameter group becomes perfectly invariant to its dimensionality:
+\begin{equation}
+    \mathbb{E}\left[\|\sigma_j \cdot \epsilon^{(j)}\|^2\right] = d_j \cdot \left(\frac{2 \eta_j T_t}{d_j}\right) = 2 \eta_j T_t
+\end{equation}
+From a rigorous statistical physics perspective, scaling the noise variance by $1/d_j$ while keeping the global temperature parameter $T_t$ constant implies that the effective coordinate-wise temperature of parameter group $j$ is scaled inversely by its dimension: $T^{(j)}_{\text{effective}} = T_t / d_j$.
+Under the classical Equipartition Theorem, a uniform thermodynamic equilibrium in contact with a single uniform heat bath would require every independent degree of freedom to receive equal thermal energy, causing the aggregate perturbation norm to grow linearly with $d_j$ (as shown in Equation 10).
+By forcing the aggregate injected energy to be invariant to dimension, DSLN deliberately breaks uniform physical equilibrium.
+Instead, it frames joint adaptation as a \textbf{multi-scale, non-equilibrium thermodynamic system} where different parameter groups operate at different effective temperatures.
+This allows the low-dimensional merging coefficients (with extremely small $d_j$) to remain "hot" and aggressively hop over energy barriers, while the high-dimensional classification heads (with extremely large $d_j$) are kept "cold" to prevent feature degradation.
+Rather than a simple uniform equilibrium, DSLN acts as a highly structured, non-equilibrium statistical mechanics regularizer that stabilizes multi-scale joint Langevin adaptation.
+
+\paragraph{Resolving the High-Dimensional Noise Paradox.} An apparent paradox might arise to a superficial reader: since $d_j$ is large for deep networks, the coordinate-wise noise standard deviation $\sigma_j$ added to each individual weight becomes vanishingly small (e.g., $\approx 10^{-3}$), which might suggest that the high-dimensional parameters are updated almost purely deterministically.
+We clarify that this coordinate-wise dampening is not a limitation, but a fundamental mathematical requirement of high-dimensional geometry.
+
+In a $d_j$-dimensional space, there are $d_j$ orthogonal degrees of freedom.
+Even though the noise along any single coordinate is small, the aggregate perturbation vector explores a hyperspherical shell of radius $\sqrt{2\eta_j T_t}$.
+This ensures that the classifier head still undergoes robust joint Langevin exploration in the high-dimensional space without drifting infinitely far from its initialized expert manifold.
+Without DSLN, the coordinate-wise noise would accumulate across all dimensions, completely blowing the parameters out of their functional boundaries.
+DSLN thus represents a mathematically sound and physically beautiful unification of multi-scale parameter adaptation.
+
+\paragraph{Layer-wise vs. Global DSLN Computation.} A crucial implementation detail for multi-layered neural networks is how the dimension $d_j$ is computed.
+If we were to use a single global dimension representing the union of all adapted parameters across the entire network, the massive classification heads would dominate the scaling factor, resulting in excessive dampening of intermediate layers.
+To prevent this, DSLN is computed \emph{layer-by-layer and group-by-group}.
+Specifically, for each independent parameter group or functional module $j$ (such as a specific layer's weights, a specific classifier's weights, or the merging coefficients $\Lambda$), we compute $d_j$ as the exact number of elements in that specific group: $d_j = \text{size}(\Theta^{(j)})$.
+
+\paragraph{Resolving the Weight-Bias Thermodynamic Imbalance.} A subtle yet important design consideration in layer-wise scaling is the handling of weights and biases of the same functional layer.
+If a weight matrix and its corresponding bias vector are treated as separate independent tensors, we encounter a severe \emph{thermodynamic imbalance}.
+Because bias dimensions are typically multiple orders of magnitude smaller than weight dimensions ($d_{bias} \ll d_{weight}$), separate scaling causes the bias parameters to receive a coordinate-wise noise standard deviation $\sigma_{bias}$ that is significantly larger than the weight noise standard deviation $\sigma_{weight}$ (e.g., in our MNIST classifiers where $d_{weight}=640$ and $d_{bias}=10$, bias parameters are perturbed $\sqrt{640/10} = 8$ times more heavily than weights).
+This excessive thermal perturbation on biases can induce representation instability, shifting activation distributions and degrading pre-trained features.
+To resolve this weight-bias thermodynamic imbalance, we recommend defining parameter groups $j$ at the functional layer level rather than the individual tensor level.
+Under this \emph{Layer-wise Functional Parameter-Group Scaling}, the weights and biases of a given layer $l$ are grouped together into a single joint parameter group of dimension $d_l = d_{weight} + d_{bias}$, and both weights and biases are perturbed using the same layer-wise coordinate-wise noise standard deviation $\sigma_l = \sqrt{2 \eta_l T_t / d_l}$.
+This unified formulation guarantees that all parameters of a functional layer co-exist in uniform thermodynamic equilibrium under the same effective temperature, preventing distribution shifts and stabilizing joint adaptation.
+Indeed, in all our reported deep learning (MLP and LoRA) experiments, this joint functional grouping was implemented as the default configuration.
+In our PyTorch implementation, this is achieved by parsing the model named parameters, identifying matching weight-bias pairs (e.g., \texttt{layer.weight} and \texttt{layer.bias}), summing their sizes to compute $d_l$, and passing this joint dimension to our custom AdamSGLD optimizer to scale their coordinate-wise perturbations identically.
+
+\paragraph{Handling of Normalization Layers.} In deep architectures, parameters belonging to normalization layers (such as Batch Normalization or Layer Normalization scales and biases) are extremely sensitive to perturbations, and injecting random noise can easily degrade high-level representation features.
+In ThermoMerge, we follow the established standards of test-time model merging (like SyMerge) and keep all normalization parameters in the pre-trained encoder backbone strictly frozen.
+They are not updated by gradient steps nor perturbed by SGLD.
+This completely preserves the internal statistical alignment of the pre-trained backbone.
+If a practitioner indeed elects to adapt normalization layers under test-time drift, they must be defined as independent, low-dimensional parameter groups $j \in \mathcal{P}$, where $d_j$ is the channel or feature dimension $c$.
+DSLN then automatically scales their coordinate-wise noise standard deviation to $\sigma_j = \sqrt{2 \eta_j T_t / c}$, protecting their functional boundaries from thermal destruction while still enabling controlled, thermodynamic adaptation.
+
+\paragraph{Hyperparameter Calibration Guidelines.} In SGLD, the exploratory behavior is governed by the initial temperature $T_0$ and the Simulated Annealing cooling rate $\gamma$.
+To bypass dense grid sweeps, we offer the following heuristics for calibration:
+\begin{enumerate}
+\item \emph{Initial Temperature $T_0$}: Select $T_0$ such that the initial aggregate coordinate-wise thermal perturbation $\sigma_j \cdot \epsilon_j$ has a magnitude comparable to the expected gradient update.
+Mathematically, we express this calibration heuristic as:
+    \begin{equation}
+        T_0^{(j)} = \alpha \cdot \frac{\eta_j \mathbb{E}\left[\|\nabla_{\Theta^{(j)}} \mathcal{L}_{TT}\|_2^2\right]}{d_j}
+    \end{equation}
+where $\alpha \in [0.01, 0.1]$ is a scaling factor that controls the exploratory aggressiveness of the hot phase, and $\mathbb{E}\left[\|\nabla_{\Theta^{(j)}} \mathcal{L}_{TT}\|_2^2\right]$ is estimated by averaging the squared $L_2$ norm of the gradients during the first few adaptation iterations.
+\item \emph{Cooling Rate $\gamma$}: Choose $\gamma$ based on the total adaptation step budget $T_{max}$ to ensure the system is fully "crystallized" (frozen) by the end.
+This is formulated as:
+    \begin{equation}
+        \gamma = \left(\frac{T_{min}}{T_0}\right)^{\frac{1}{T_{max}}}
+    \end{equation}
+where $T_{min} \approx 10^{-4} T_0$ is the target freezing temperature.
+Setting $\gamma$ according to this schedule ensures that by the final step, the temperature has decayed to $T_{T_{max}} \approx 0.0001 \cdot T_0$, effectively transitioning the SGLD exploration into pure deterministic convergence.
+\end{enumerate}
+
+\paragraph{Addressing Gradient Non-Stationarity and Dynamic Calibration.} In deep learning optimization, gradients frequently exhibit strong \emph{non-stationarity}: during the initial adaptation steps, gradient norms are typically very large due to model initialization conflicts, but they decay rapidly as the parameters approach a local basin.
+If $T_0$ is calibrated purely using a static average of the initial high-magnitude gradients, the static cooling schedule $T_t = T_0 \cdot \gamma^t$ might cause the system to remain excessively hot and over-explore (or even oscillate) in later stages of adaptation, failing to settle.
+Conversely, if $T_0$ is set too low based on converged gradients, the system will under-explore and fail to escape initial traps.
+
+To address this, we analyze the possibility of a \emph{dynamic, rolling calibration scheme} where the temperature $T_t$ is dynamically scaled based on the running average of gradient norms:
+\begin{equation}
+    T_t^{(j)} = \alpha \cdot \frac{\eta_j \cdot V_t^{(j)}}{d_j} \cdot \gamma^t
+\end{equation}
+where $V_t^{(j)}$ is an exponential moving average (EMA) of the squared gradient norms of parameter group $j$, updated at each step according to:
+\begin{equation}
+    V_t^{(j)} = \beta \cdot V_{t-1}^{(j)} + (1 - \beta) \cdot \|\nabla_{\Theta^{(j)}} \mathcal{L}_{TT}\|_2^2
+\end{equation}
+where $\beta \in (0, 1)$ is the exponential smoothing momentum (typically set to $0.9$ or $0.99$).
+By tying the temperature to the rolling gradient magnitude, the injected thermal noise automatically scales down as the model approaches flatter regions (where gradient norms approach zero), acting as a self-regulating physical stabilizer.
+This prevents over-exploration during late-stage convergence and accelerates crystallization, while preserving aggressive thermal hopping when the model encounters steep, sub-optimal energy barriers.
+In our empirical evaluations, we found that while the static calibration heuristic in Equation 12 is highly robust and sufficient for low-latency adaptation (due to the exponential cooling rate $\gamma = 0.9$ rapidly quenching noise anyway), incorporating this dynamic rolling calibration represents a promising and elegant direction to further stabilize long-horizon or highly non-stationary joint adaptation.
+
+\paragraph{Safely Calibrating $\alpha$ via Early-Stage Thermodynamic Monitoring.} In unsupervised test-time adaptation settings, labeled validation data is unavailable to perform hyperparameter sweeps, making the sensitivity to the calibration scale $\alpha$ a potential risk for real-world production systems.
+If $\alpha$ is accidentally set too large ($\alpha \ge 0.5$), excessive thermal noise can instantly "vaporize" pre-trained classification features, leading to irreversible representational collapse.
+To mitigate this risk and ensure safe, autonomous deployment, we propose an automated \textbf{Predictive Agreement and Entropy Safeguard} during early-stage adaptation.
+During the first $3$ steps of adaptational warm-up, the system monitors two zero-shot proxy signals on the streaming test batch: (1) the running predictive Shannon entropy of the merged model's outputs, and (2) the average predictive agreement (e.g., Jaccard index or Soft Cosine similarity) with the individual expert teachers.
+If the prediction entropy approaches a uniform distribution (e.g., $\bar{H} \ge 0.95 \cdot \ln(C)$, where $C$ is the number of classes) or if the predictive agreement collapses below a baseline threshold (indicating a failure to construct coherent outputs), the safeguard automatically triggers an \textbf{Emergency Quenching} signal.
+The system immediately resets the parameters to their initialization state and halves the calibration scaling factor ($\alpha \leftarrow 0.5 \cdot \alpha$).
+This simple, communication-free, and unsupervised safety valve guarantees that the model remains within stable thermal boundaries, completely avoiding representational vaporization even under extremely miscalibrated initial temperatures.
+
+\subsection{Geometric Trapping and Thermodynamic Rescue in PEFT/LoRA Merging}
+\label{sec:geometric_trapping}
+A central question in the test-time model merging literature is why thermodynamic global search (SGLD) is highly critical and performant under Parameter-Efficient Fine-Tuning (PEFT/LoRA) model merging, whereas its benefits are more subtle in full-parameter merging.
+We present a rigorous physical and geometric explanation of this phenomenon.
+
+In standard full-parameter model merging, the optimization space is exceptionally high-dimensional (e.g., $d \approx 10^5$ to $10^9$).
+In highly high-dimensional spaces, local minima are rarely strict, trapped basins; instead, they are almost always saddle points that have multiple directions of negative or flat curvature.
+This massive dimensionality provides abundant degrees of freedom, meaning there almost always exists some alternative "wide tunnel" or escape path that standard deterministic gradient descent (like SyMerge) can navigate to find a viable joint configuration.
+
+Conversely, under PEFT/LoRA model merging, the pre-trained base model weights are strictly frozen, and adaptation is constrained to a highly restricted, low-rank subspace (where a rank $r = 4$ manifold represents a tiny fractional slice of the total parameter space).
+This low-rank constraint dramatically reduces the available degrees of freedom, forcing the parameter updates to navigate extremely narrow, low-dimensional "tunnels" in the weight manifold.
+Under parameter conflicts and multi-task task interference, these narrow tunnels easily become blocked by loss barriers, creating strict, inescapable energy barriers and sharp local traps.
+
+In this highly constrained, low-rank regime, deterministic optimizers (like Adam or SGD) lack the dimensional flexibility to find alternative paths, becoming permanently trapped.
+This leads to severe overfitting or representational collapse on task experts.
+In contrast, ThermoMerge's isotropic Langevin noise acts as a critical external heat source that pushes the low-rank parameters over these inescapable energy barriers, allowing them to jointly diffuse through narrow tunnels and locate the globally flat, synergistic minimum.
+This mathematically demonstrates that SGLD's global exploration is particularly vital and indispensable when joint adaptation is executed in constrained, parameter-efficient subspaces.
+
+\subsection{Simulated Annealing Cooling Schedule}
+To transition the system from global exploration to precise local convergence, we govern the temperature $T_t$ using a Simulated Annealing exponential cooling schedule:
+\begin{equation}
+    T_t = T_0 \cdot \gamma^t
+\end{equation}
+where $T_0$ is the initial temperature, and $\gamma \in (0, 1)$ is the cooling rate.
+This schedule induces two distinct physical phases during test-time adaptation:
+\begin{enumerate}
+\item \textbf{The Hot Phase (Disordered Exploration)}: When $t$ is small, the temperature $T_t \approx T_0$ is high.
+The high-energy thermal noise dominates the gradient updates, enabling the model to aggressively explore the landscape, hop over energy barriers, and escape sharp sub-optimal local traps.
+\item \textbf{The Cold Phase (Crystalline Convergence)}: As $t \to \infty$, the temperature $T_t \to 0$.
+The stochastic noise term vanishes, and SGLD naturally reduces to standard deterministic gradient updates.
+This allows the parameters to settle and "freeze" precisely into the wide, flat globally optimal synergistic minimum.
+\end{enumerate}
+
+\paragraph{Discussion on Alternative Cooling Schedules.} In classical Simulated Annealing, several cooling schedules have been proposed, including linear cooling ($T_t = T_0 - \alpha t$) and logarithmic cooling ($T_t = T_0 / \ln(1 + t)$).
+While logarithmic cooling theoretically guarantees convergence to the global minimum, it requires an astronomical number of steps to cool down, rendering it completely non-viable for real-time, low-latency test-time adaptation (which must run on-the-fly inside 8--10 steps).
+On the other hand, linear cooling decreases temperature at a constant rate, which can cool the system down too quickly during the critical early exploration phase, causing the parameters to get trapped in the nearest local basin.
+In contrast, our exponential cooling schedule balances global exploration and localized crystallization.
+During the initial steps, exponential cooling decays slowly enough to allow the parameters to explore a wide basin area, and then cools rapidly in the later steps to accelerate deterministic convergence.
+This provides the optimal trade-off between optimization quality and test-time inference latency.
+
+Importantly, SGLD naturally prioritizes flat basins over sharp ones.
+Because sharp basins have steep walls, the probability of escaping a sharp basin under thermal agitation is exponentially higher than escaping a wide, flat basin (which has a lower gradient near its center).
+Consequently, as the system cools down, the parameters naturally crystallize in the flattest joint minimum, yielding outstanding out-of-distribution (OOD) generalization.
+
+\paragraph{Thermodynamic Quenching vs. Quasi-Static Equilibrium.} In classical thermodynamics and statistical mechanics, the convergence proofs of Simulated Annealing assume a \emph{quasi-static} cooling schedule.
+This implies that the temperature decreases infinitely slowly ($T_{max} \to \infty$) so that at each step $t$, the parameter distribution remains in local thermal equilibrium with the heat bath, satisfying the Boltzmann distribution $p(\Theta) \propto e^{-\mathcal{L}(\Theta)/T_t}$.
+However, test-time adaptation is heavily constrained by real-time latency and must adapt within a tiny step budget (e.g., $T_{max} = 250$ in our testbed, or even fewer steps in streaming settings).
+Decreasing the temperature so rapidly is equivalent to physical \emph{quenching} (rapid freezing rather than slow crystallization).
+From a non-equilibrium statistical physics perspective, quenching pushes the system far out of thermodynamic equilibrium.
+It can lead to "amorphous" or "glassy" states where the parameters freeze in sub-optimal local basins before they can locate the crystalline global minimum.
+
+We mitigate this quenching deficit in ThermoMerge in two ways: first, our self-labeling proxy loss provides exceptionally stable supervision compared to prediction entropy minimization, which keeps the gradients highly directed and reduces the energy barrier height.
+Second, we pre-condition SGLD using running second moments (drawing from Adam), which dynamically adapts the coordinate-wise step sizes to match the local curvature.
+
+\paragraph{Mathematical Formulation of Preconditioned SGLD (Adam-SGLD).} To rigorously detail this curvature-aware diffusion, we present the exact mathematical update of our preconditioned SGLD (Adam-SGLD) optimizer.
+For each parameter group $j \in \mathcal{P}$, we denote the gradient of the proxy test-time loss as $g_t^{(j)} = \nabla_{\Theta^{(j)}} \mathcal{L}_{TT}(\Lambda_t, \Theta_t^{tr})$.
+We track the running second moment of these gradients $v_t^{(j)}$ with exponential smoothing momentum $\beta_2 \in (0, 1)$:
+\begin{equation}
+    v_t^{(j)} = \beta_2 v_{t-1}^{(j)} + (1 - \beta_2) \left(g_t^{(j)}\right)^2
+\end{equation}
+where the square is applied element-wise. We then define the diagonal preconditioning matrix $G_t^{(j)}$ as:
+\begin{equation}
+    G_t^{(j)} = \frac{1}{\sqrt{v_t^{(j)}} + \epsilon_{stab}}
+\end{equation}
+where $\epsilon_{stab} \approx 10^{-8}$ is a numerical stability constant.
+Following the fluctuation-dissipation theorem on Riemannian manifolds, the preconditioned SGLD update scales both the gradient step and the coordinate-wise Langevin noise standard deviation by the local geometry:
+\begin{equation}
+    \Theta_{t+1}^{(j)} = \Theta_t^{(j)} - \eta_j \cdot G_t^{(j)} \odot g_t^{(j)} + \sigma_j \cdot \sqrt{G_t^{(j)}} \odot \epsilon_t^{(j)}
+\end{equation}
+where $\odot$ denotes the element-wise Hadamard product, $\epsilon_t^{(j)} \sim \mathcal{N}(0, I_{d_j})$, and $\sigma_j = \sqrt{2 \eta_j T_t / d_j}$ is our Dimensionality-Scaled Langevin Noise (DSLN) standard deviation.
+
+This formulation mathematically explains how the Langevin noise behaves under Adam preconditioning: in directions of high curvature (large $v_t^{(j)}$, small $G_t^{(j)}$), the noise is heavily suppressed to preserve representational stability.
+In flat directions (small $v_t^{(j)}$, large $G_t^{(j)}$), the noise is amplified, accelerating diffusion along the valley floor.
+This curvature-aware scaling allows ThermoMerge to perform extremely rapid global exploration and flat-minima localization, even under severe test-time adaptational quenching.
+We transparently discuss this non-equilibrium behavior as an inherent constraint of real-time test-time adaptation, and suggest that the excellent empirical results are due to the synergistic combination of SGLD exploration and gradient-informed preconditioned acceleration.
+
+\paragraph{Generalization to Other Preconditioning Schemes.} While we implement Adam preconditioning in ThermoMerge due to its dominant usage and superior empirical performance in modern deep learning, the formulation scales naturally to other adaptive preconditioning methods.
+For instance, under RMSprop preconditioning, the diagonal preconditioning matrix $G_t^{(j)}$ is constructed using the square root of exponential moving averages of squared gradients, which yields noise scaling behavior identical to Adam-SGLD but without momentum-smoothed gradients.
+Under AdaGrad preconditioning, $G_t^{(j)}$ accumulates historical squared gradients monotonically, causing $G_t^{(j)} \to 0$ as $t \to \infty$.
+This naturally scales down the coordinate-wise Langevin noise standard deviation as adaptation progresses, serving as an implicit physical cooling mechanism that works in harmony with our explicit Simulated Annealing schedule.
+Broadening preconditioned SGLD to these alternative schemes demonstrates the theoretical modularity of our thermodynamic framework, providing a family of curvature-aware diffusion optimizers for test-time adaptation.
+
+\paragraph{The Sampler-Optimizer Transition.} Standard Stochastic Gradient Langevin Dynamics (SGLD) was originally derived as a Markov Chain Monte Carlo (MCMC) algorithm designed to sample from the posterior distribution of a Bayesian neural network under a constant, non-zero temperature.
+When the temperature remains fixed ($T_t = T_0 > 0$), SGLD generates a continuous Markov chain whose stationary distribution asymptotically converges to the Bayesian posterior distribution.
+Under this classic regime, the trajectory of SGLD can be used to estimate epistemic uncertainty and perform ensemble predictions.
+However, when SGLD is coupled with a Simulated Annealing cooling schedule, the temperature exponentially decays to zero ($T_t \to 0$ as $t \to T_{max}$).
+
+Mathematically, this zero-temperature limit alters the behavior of SGLD in a fundamental way: as the thermal noise decays, the probability of jumping across energy barriers approaches zero, causing the parameter trajectories to "freeze" inside a local basin.
+Once the noise is fully suppressed, the algorithm behaves purely as a global stochastic optimizer returning a single point estimate (the frozen parameters) rather than a distribution.
+Consequently, the traditional Bayesian posterior sampling guarantees (such as posterior variance and uncertainty quantification) do not strictly hold at the end of the Simulated Annealing schedule.
+We explicitly embrace this sampler-to-optimizer transition: our goal in test-time model merging is not posterior representation or distribution sampling, but finding a single, highly robust, and flat joint configuration of parameters and classifiers under real-time latency constraints.
+This physical optimization view remains fully consistent with Simulated Annealing, but we caution that the final model must be interpreted as a point-optimized synergistic system rather than a Bayesian ensemble.
+
+\subsection{Interaction with Mini-Batch Stochasticity}
+In practical applications, test-time adaptation is executed over mini-batches of unlabeled data, which naturally introduces Stochastic Gradient Noise (SGN) due to sampling.
+However, we note that SGN is highly anisotropic and biased: its covariance is determined purely by the data gradient directions.
+In test-time settings, downstream batches can be small, correlated, or non-representative, making natural SGN insufficient and biased for escaping local traps across all parameters.
+
+By contrast, the noise in ThermoMerge is generated from an isotropic, unbiased Gaussian distribution $\mathcal{N}(0, I)$, ensuring that exploration happens uniformly in all directions.
+To analyze how SGLD's isotropic noise behaves under varying mini-batch sizes, we model the total parameter covariance update as:
+\begin{equation}
+    \Sigma_{total} = \Sigma_{SGN} + \sigma_j^2 I
+\end{equation}
+where $\Sigma_{SGN} \propto \frac{1}{B}$ is the anisotropic covariance from a mini-batch of size $B$, and $\sigma_j^2 I$ is our isotropic Langevin noise covariance.
+
+When the batch size $B$ is small, the increased anisotropic SGN provides rapid, natural exploration along the active gradient manifold.
+However, because SGN cannot explore degrees of freedom orthogonal to active gradients, smaller batch sizes alone cannot prevent the model from getting trapped in sharp local basins.
+In this regime, the isotropic Langevin noise term $\sigma_j^2 I$ acts as a crucial regularizer, guaranteeing unbiased exploration across all $d_j$ dimensions.
+Conversely, when $B$ is large, SGN is suppressed ($\Sigma_{SGN} \to 0$), and our isotropic Langevin noise remains the primary driver of global exploration.
+This synergistic interplay guarantees that ThermoMerge remains exceptionally robust to the choice of batch size during test-time adaptation, functioning optimally under both high-stochasticity and low-stochasticity data regimes.
+
+\subsection{Computational and Memory Complexity}
+A key advantage of ThermoMerge is its extreme computational efficiency.
+Sampling standard coordinate-wise Gaussian noise vectors $\epsilon_t$ has a computational complexity of $O(d)$, where $d$ is the number of parameters being updated.
+Multiplying by a scalar factor and adding it to the parameter weights also takes $O(d)$ operations.
+
+Because the backward pass (computing gradients via backpropagation) has a complexity of $O(P)$ (where $P$ is the total number of model parameters, and $P \gg d_{\Lambda} + d_{\Theta}$), the extra computational cost of SGLD is virtually negligible.
+ThermoMerge requires exactly the same amount of memory as standard SyMerge or AdaMerging (retaining only gradients and parameter copies), adding zero memory overhead.
+This makes ThermoMerge ideal for resource-constrained test-time adaptation during real-time inference.
+
+\paragraph{Implementation Guideline: Noise Buffer Pre-allocation.} While SGLD has linear computational complexity $O(d)$, repeatedly allocating large random tensors (such as a classification head's noise vector $\epsilon_t$) at every step inside deep learning frameworks like PyTorch can introduce substantial memory fragmentation and garbage collection overhead.
+This overhead can hinder GPU kernel execution and increase test-time adaptation latency.
+To achieve maximum efficiency in real-time inference environments, we recommend a simple yet highly effective implementation guideline: \textbf{pre-allocate noise buffers}.
+Specifically, during initialization, a single static noise buffer of the same shape as each adapted parameter tensor is allocated on the target device.
+In each adaptation step, instead of calling \texttt{torch.randn()}, we generate noise in-place inside the pre-allocated buffer using \texttt{noise\_buffer.normal\_()}.
+This in-place operation avoids any dynamic memory allocation, reduces runtime overhead to absolute zero, and enables optimal PyTorch JIT compilation and GPU kernel fusion.
+We explicitly clarify that pre-allocating this static noise buffer adds exactly zero peak GPU memory overhead to the system.
+This is because SGLD operates sequentially tensor-by-tensor, meaning a single unified noise buffer of size equal to the largest parameter tensor in the group can be allocated and shared across all parameter groups during the update step, ensuring that the maximum memory footprint is strictly bounded and negligible:
+\begin{verbatim}
+# During initialization phase:
+self.noise_buffer = torch.empty_like(param)
+
+# During test-time adaptation step:
+self.noise_buffer.normal_()
+param.add_(self.noise_buffer, alpha=sigma)
+\end{verbatim}
+
+The complete ThermoMerge framework is detailed in Algorithm~\ref{alg:thermomerge}.
+
+\begin{algorithm}[tb]
+\caption{ThermoMerge: Thermodynamic Test-Time Model Merging}
+\label{alg:thermomerge}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: Pre-trained model $f(\cdot; \Theta_{pre})$, unmerged fine-tuned expert models $\{f(\cdot; \Theta_k)\}_{k=1}^K$, unlabeled test data $X^{te}$, learning rates $\{\eta_j\}_{j \in \mathcal{P}}$, initial temperature $T_0$, cooling rate $\gamma$, max steps $T_{max}$.
+\STATE \textbf{Initialize}: 
+\STATE \quad Merging coefficients $\Lambda_0 \in \mathbb{R}^{(L-1) \times K}$ (e.g., set to $0.3$)
+\STATE \quad Task-specific classification heads $\Theta^{tr}_0 = \{\theta^{tr}_{k, 0}\}_{k=1}^K$ using unmerged fine-tuned classifier weights.
+\STATE \quad $T_t \leftarrow T_0$
+\FOR{$t = 0$ \textbf{to} $T_{max} - 1$}
+    \STATE Sample a batch of unlabeled test data $x \sim X^{te}$
+    \STATE \COMMENT{\emph{Generate expert predictions as teacher labels}}
+    \FOR{$k = 1$ \textbf{to} $K$}
+        \STATE Compute soft self-labels: $C_k^{ft}(x) \leftarrow f(x; \Theta_k)$
+    \ENDFOR
+    \STATE \COMMENT{\emph{Construct merged encoder using current coefficients}}
+    \FOR{$l = 1$ \textbf{to} $L-1$}
+        \STATE $\theta_{MTL}^l \leftarrow \theta_{pre}^l + \sum_{k=1}^K \lambda_k^l (\theta_k^l - \theta_{pre}^l)$
+    \ENDFOR
+    \STATE \COMMENT{\emph{Forward pass through merged model}}
+    \STATE Compute merged predictions: $C_k^{merged}(x) \leftarrow f^L(f^{1:L-1}(x; \Theta_{MTL}^{enc}); \theta^{tr}_k)$
+    \STATE \COMMENT{\emph{Loss and backpropagation}}
+    \STATE Compute proxy loss: $\mathcal{L}_{TT}(\Lambda_t, \Theta^{tr}_t) \leftarrow \frac{1}{|x|} \sum_{i \in x} \sum_{k=1}^K \mathcal{L}_{CE}(C_k^{merged}(i), C_k^{ft}(i))$
+    \STATE \COMMENT{\emph{Langevin perturbation with Dimensionality-Scaling (DSLN) and update}}
+    \FOR{each updated parameter tensor or group $j \in \mathcal{P}$ (e.g., $\Lambda$ and each independent classifier tensor)}
+        \STATE Compute dimension: $d_j \leftarrow \text{size}(\Theta^{(j)})$
+        \STATE Compute scaled noise standard deviation: $\sigma_j \leftarrow \sqrt{2 \eta_j T_t / d_j}$
+        \STATE Sample standard Gaussian noise: $\epsilon^{(j)}_t \sim \mathcal{N}(0, I_{d_j})$
+        \STATE Update parameters: $\Theta^{(j)}_{t+1} \leftarrow \Theta^{(j)}_t - \eta_j \nabla_{\Theta^{(j)}} \mathcal{L}_{TT} + \sigma_j \cdot \epsilon^{(j)}_t$
+    \ENDFOR
+    \STATE \COMMENT{\emph{Exponential cooling}}
+    \STATE $T_{t+1} \leftarrow T_t \cdot \gamma$
+\ENDFOR
+\STATE \textbf{Output}: Final merged model with parameters determined by $\Lambda_{T_{max}}$ and classification heads $\Theta^{tr}_{T_{max}}$.
+\end{algorithmic}
+\end{algorithm}

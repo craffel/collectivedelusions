@@ -1,0 +1,244 @@
+\section{Methodology}
+\label{sec:method}
+
+We present \textbf{Parameter-Free Activation Blending (PFAB)}, an elegant, training-free framework designed to serve heterogeneous multi-task inference streams in a single parallelized forward pass. In this section, we formalize the heterogeneous multi-task serving problem, detail our non-parametric gating coordinates, and formulate sample-wise activation-space blending. Finally, we provide a mathematical and systems complexity analysis to demonstrate the efficiency gains of our approach.
+
+\subsection{Problem Formulation: Heterogeneous Multi-Task Serving}
+Let $\mathcal{M}_{base}$ represent a frozen pre-trained foundation model consisting of $L$ layers. We are given a set of $K$ specialized expert adapters (e.g., LoRA) \cite{hu2021lora}, where each expert $k \in \{1, \dots, K\}$ has been independently fine-tuned on a distinct task. At each attention or projection layer $l \in \{1, \dots, L\}$, the expert's adapter parameter updates are represented by low-rank matrices $B_k^{(l)} \in \mathbb{R}^{D \times r}$ and $A_k^{(l)} \in \mathbb{R}^{r \times D}$, where $r \ll D$ is the rank and $D$ is the hidden dimension.
+
+During inference, the model is deployed on a heterogeneous stream where requests from multiple distinct tasks are grouped into a single batch $X \in \mathbb{R}^{B \times D_{in}}$ of size $B$. Each individual sample $b \in \{1, \dots, B\}$ in the batch belongs to an unknown task. 
+
+Standard dynamic model merging frameworks compute a set of batch-wide merging coefficients $\boldsymbol{\alpha} = [\alpha_1, \dots, \alpha_K]^T \in \mathbb{R}^K$ to compile a single merged model weight state at layer $l$:
+\begin{equation}
+  W^{(l)}_{merged} = W^{(l)}_{base} + \sum_{k=1}^K \alpha_k \left( B_k^{(l)} A_k^{(l)} \right)
+\end{equation}
+Because the same merged weight $W^{(l)}_{merged}$ must process the entire batch $X$, any chosen coefficient vector $\boldsymbol{\alpha}$ is a global batch-level compromise. On a heterogeneous batch containing mixed tasks, computing $\boldsymbol{\alpha}$ via standard gating layers leads to \emph{batch-averaging collapse}: the coefficients average out to a flat, uniform distribution ($\alpha_k \approx 1/K$), destroying specialized expert knowledge and degrading performance across all tasks.
+
+Prior state-of-the-art systems resolved this collapse via Micro-Batch Homogenization (MBH) \cite{subspace2026}, which partitions the heterogeneous batch into $G \le K$ homogeneous sub-batches based on predicted task labels. While effective, executing $G$ separate sequential forward passes of the backbone shifts the complexity to the systems serving layer and results in sequential latency bottlenecks.
+
+To study these coordinate dynamics, representation-space shifts, and systems-level tradeoffs under perfectly controlled conditions, we validate our mathematical formulation on a high-fidelity \emph{Isolating Coordinate Sandbox} simulation framework. This environment mathematically models multi-layer neural network representations and task-isolated coordinate subspaces, allowing us to analytically prove and isolate our non-parametric gating and activation-blending equations under high-entropy mixed-task streams.
+
+\subsection{Non-Parametric Gating Coordinates}
+To achieve sample-wise routing with zero trainable parameters and zero calibration data, \textsc{PFAB} extracts task identification signals directly from the model's penultimate representations. Let $z_b \in \mathbb{R}^D$ be the penultimate representation of sample $b$, extracted from the final layer of the base model backbone.
+
+\paragraph{Unit-Norm Calibration (UNC)}
+Because each expert $k$ was fine-tuned independently, the intermediate representations of different experts can undergo severe scale drift. This representation scale imbalance causes certain experts to dominate routing decisions. To resolve this, we propose \emph{Unit-Norm Calibration (UNC)}, a training-free normalization technique that projects both the representations $z_b$ and the pre-trained classification weights $W_{k,c} \in \mathbb{R}^D$ (where $c \in \{1, \dots, C_k\}$ is the class prototype index of Expert $k$) onto the unit hypersphere:
+\begin{equation}
+  \tilde{z}_b = \frac{z_b}{\|z_b\|_2}, \quad \tilde{W}_{k,c} = \frac{W_{k,c}}{\|W_{k,c}\|_2}
+\end{equation}
+
+\paragraph{Cosine Similarity Projection}
+We compute the raw task-coordinate similarity $u_{k, b}$ by projecting the calibrated representation onto the normalized classification heads of Expert $k$ using maximum cosine similarity:
+\begin{equation}
+  u_{k, b} = \max_{c \in \{1, \dots, C_k\}} \tilde{W}_{k, c} \cdot \tilde{z}_b
+\end{equation}
+
+\paragraph{Class-Size Scaling Calibration}
+Because different experts may have asymmetrical classification spaces (i.e., different class counts $C_k$) and hidden dimensions $D$, the maximum cosine similarity is statistically biased toward experts with larger output vocabularies. To correct this extreme-value statistical bias, we scale the raw coordinates by the theoretical maximum expected value of random projections:
+\begin{equation}
+  u'_{k, b} = \frac{u_{k, b}}{\sqrt{2\log C'_k / D}}
+\end{equation}
+where $C'_k = \max(C_k, 2)$ represents the effective classification cardinality. We introduce this effective cardinality to resolve a critical mathematical edge case: if an expert task is binary classification represented by a single head output (or a regression/detection task) such that $C_k = 1$, then $\log C_k = 0$, leading to a catastrophic division-by-zero failure. By constraining $C'_k \ge 2$, we guarantee a strictly positive denominator, successfully neutralizing the division-by-zero vulnerability while representing the minimum binary choice space of any classification query.
+
+While the divisor $\sqrt{2\log C'_k / D}$ is derived analytically assuming class prototype weights $\tilde{W}_{k,c}$ behave as independent, random projections on the unit hypersphere, we openly acknowledge that real trained neural network weight vectors are highly optimized, structured, and correlated, thus violating the independent, random projection assumptions. When class weights are highly correlated or organized hierarchically, they span a lower-dimensional manifold than the full ambient dimension $D$, making their effective independent cardinality much smaller than the raw class count $C_k$. Consequently, our analytical penalty divisor can slightly over-penalize large classification spaces compared to a truly random weight configuration. Nonetheless, we frame this Class-Size Scaling formula not as a rigid, exact theoretical identity but as a highly practical, training-free, and well-calibrated heuristic motivated by extreme-value statistics, which empirically neutralizes vocabulary cardinality biases across asymmetric task suites with zero parameters. An interesting direction for future work is to dynamically calibrate the divisor by estimating the effective independent dimensionality of the classification head (e.g., utilizing the participation ratio or the Shannon entropy of the head matrix's singular value spectrum) instead of the raw hidden dimension $D$.
+
+\paragraph{Temperature-Scaled Softmax}
+The sample-specific task coefficient $\alpha_{k, b}$ for Expert $k$ and sample $b$ is derived via a sharp, temperature-scaled Softmax:
+\begin{equation}
+  \alpha_{k, b} = \frac{\exp(u'_{k, b} / \tau)}{\sum_{j=1}^K \exp(u'_{j, b} / \tau)}
+\end{equation}
+where $\tau > 0$ is a static scaling temperature. By setting $\tau = 0.001$, we perform near-discrete, high-confidence task identification, routing each sample to its corresponding expert with minimal cross-task dilution.
+
+\subsection{Activation-Space Adapter Blending}
+Rather than using the coefficients $\alpha_{k, b}$ to merge model weights, \textsc{PFAB} shifts the blending operation directly into the activation space. At each attention or projection layer $l \in \{1, \dots, L\}$, let $H^{(l-1)} \in \mathbb{R}^{B \times D}$ represent the input activation tensor to the layer.
+
+The shared base model forward pass yields the base activation tensor:
+\begin{equation}
+  X_{base}^{(l)} = H^{(l-1)} W_{base}^{(l)} \in \mathbb{R}^{B \times D}
+\end{equation}
+Concurrently, we pass the input activations through the $K$ parallel expert adapters to produce the task-specific feature deltas:
+\begin{equation}
+  X_k^{(l)} = H^{(l-1)} B_k^{(l)} A_k^{(l)} \in \mathbb{R}^{B \times D}
+\end{equation}
+
+Instead of performing a batch-level compromise in weight-space, we perform sample-wise blending directly in activation space by weighting each expert's adapter contribution by its corresponding sample-specific coefficient $\alpha_{k, b}$:
+\begin{equation}
+  H^{(l)}_b = X_{base, b}^{(l)} + \sum_{k=1}^K \alpha_{k, b} X_{k, b}^{(l)} \quad \forall b \in \{1, \dots, B\}
+\end{equation}
+
+In vectorized tensor form, this sample-wise activation blending is formulated as:
+\begin{equation}
+  H^{(l)} = X_{base}^{(l)} + \sum_{k=1}^K \mathbf{diag}(\boldsymbol{\alpha}_k) X_k^{(l)}
+\end{equation}
+where $\boldsymbol{\alpha}_k = [\alpha_{k, 1}, \dots, \alpha_{k, B}]^T \in \mathbb{R}^B$ is the batch-wide coefficient vector for Expert $k$, and $\mathbf{diag}(\boldsymbol{\alpha}_k)$ denotes the diagonal matrix acting as a sample-wise scaling operator.
+
+We explicitly note that executing parallel LoRA adapters and scaling their outputs at the activation level is structurally identical to the forward execution pass of multi-adapter Low-Rank Mixture-of-Experts (LoRA-MoE) serving frameworks (such as S-LoRA \cite{s_lora2024} or Punica \cite{punica2023}). While those frameworks focus heavily on optimizing low-level systems execution for learned parametric gating networks, \textsc{PFAB}'s contribution is a fundamentally different, minimalist gating strategy. Specifically, rather than training complex routing heads or relying on multi-stage optimization, \textsc{PFAB} serves as a non-parametric, calibration-free gating alternative. By projecting activations onto frozen pre-trained classification heads, we achieve fine-grained, sample-level routing with zero trainable parameters and zero calibration data.
+
+\paragraph{Intermediate Activation Scale Imbalance \& Layer-Wise Adapter Scaling}
+While our proposed Unit-Norm Calibration (UNC) successfully calibrates the penultimate hidden representations and the classification weights to ensure unbiased gating coefficients ($\alpha_{k, b}$), we openly acknowledge a key physical limitation: UNC does not normalize or calibrate the intermediate adapter activation outputs $X_k^{(l)}$ across different experts. In real-world multi-tenant registries, independent experts are frequently fine-tuned under completely disjoint training configurations—with varying learning rates, weight decays, optimizer parameters, or low-rank bottlenecks ($r$). As a direct consequence, their converged parameters can possess wildly different Frobenius norms, leading to massive activation scale drift across experts. If Expert 1 produces feature updates $X_1^{(l)}$ that are an order of magnitude larger than Expert 2's updates $X_2^{(l)}$ at Layer $l$, the blended activation representation $H^{(l)}$ will be physically dominated by Expert 1's features, even if the computed gating coefficients are equal (e.g., $\alpha_1 = \alpha_2 = 0.5$). We frame this intermediate scale mismatch as a key scientific constraint of non-parametric activation blending of independently trained models.
+
+To perfectly resolve this scale drift without introducing learnable parameters or requiring labeled calibration data, we propose \textbf{Layer-Wise Adapter Scaling (LAS)} as a simple, training-free scaling mechanism executed during serving. Specifically, for each expert adapter $k$ at layer $l$, we estimate its feature update scale factor $s_k^{(l)}$ by computing the Frobenius norm of its low-rank weight matrices: $s_k^{(l)} = \|B_k^{(l)} A_k^{(l)}\|_F$, or tracking the running average Frobenius norm of its output activations $s_k^{(l)} = \mathbb{E}_H [ \|H B_k^{(l)} A_k^{(l)}\|_F ]$ over incoming streams. During activation blending, we normalize each expert's feature updates by its corresponding scale factor prior to coefficient weighting:
+\begin{equation}
+  \tilde{X}_k^{(l)} = \frac{1}{s_k^{(l)}} \cdot X_k^{(l)}
+\end{equation}
+Substituting $\tilde{X}_k^{(l)}$ into the blending equation guarantees that all active expert adapters contribute features of equivalent physical magnitude, successfully neutralizing any scale dominance caused by disjoint training configurations or hyperparameter choices. This non-parametric scaling ensures physical scale-balance across heterogeneous multi-tenant registries, providing a highly robust and stable execution layer.
+
+\begin{proposition}[Mathematical Equivalence under Homogeneous Batches]
+  For a batch $X$ of size $B=1$ (or a homogeneous batch where all samples $b$ belong to the same task such that $\alpha_{k, b} = \alpha_k$ for all $b$), activation-space adapter blending is mathematically equivalent to weight-space model merging.
+\end{proposition}
+\begin{proof}
+  Let $H \in \mathbb{R}^{B \times D}$ be the input activations. Under homogeneous routing, the coefficient vector is constant across the batch: $\alpha_{k, b} = \alpha_k$ for all $b$, meaning $\mathbf{diag}(\boldsymbol{\alpha}_k) = \alpha_k I_B$.
+  The output activations under activation blending are:
+  \begin{align*}
+    H^{(l)} &= H W_{base}^{(l)} + \sum_{k=1}^K (\alpha_k I_B) \left( H B_k^{(l)} A_k^{(l)} \right) \\
+    &= H \left( W_{base}^{(l)} + \sum_{k=1}^K \alpha_k B_k^{(l)} A_k^{(l)} \right) \\
+    &= H W^{(l)}_{merged}
+  \end{align*}
+  which is identical to the output obtained by first merging the adapter weights and executing a single forward pass.
+\end{proof}
+
+However, for a heterogeneous mixed batch ($B > 1$), weight-space model merging is forced to choose a single set of weights, which requires averaging coefficients across samples ($\bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}$), causing devastating heterogeneity collapse. In contrast, activation-space blending retains the exact, fine-grained sample-specific coordinates $\alpha_{k, b}$ for each individual sample, completely resolving heterogeneity collapse.
+
+\subsection{The Pipeline Causality Dilemma \& Architectural Pathways}
+\label{sec:causality}
+
+We address a fundamental architectural feedback loop that arises in test-time representation-space routing: \emph{the pipeline causality dilemma}. Our formulation in Section \ref{sec:method} computes sample-specific routing coefficients $\alpha_{k, b}$ using the penultimate representation $z_b$ extracted from the final layer $L$ of the backbone. However, to execute activation-space blending at each intermediate layer $l \in \{1, \dots, L\}$, the model must already possess these coefficients $\alpha_{k, b}$ at Layer 1. This circular dependency creates a causal feedback loop: to compute the routing weights, we need the final activations; but to compute the intermediate activations, we need the routing weights.
+
+We propose two distinct architectural pathways to resolve this circularity cleanly:
+
+\paragraph{1. Base-Only Prototyping Pass (Two-Pass Execution)}
+The most mathematically precise pathway is a two-pass execution strategy. In the first pass (the prototyping pass), the heterogeneous input batch is propagated through the frozen shared base model backbone $\mathcal{M}_{base}$ with all expert adapters deactivated. At the penultimate layer, the base representation $z_b$ is extracted, and the sample-specific routing coefficients $\alpha_{k, b}$ are computed. In the second pass (the execution pass), the input batch is propagated again, this time activating the parallel adapters scaled by the pre-computed coefficients $\alpha_{k,b}$ at each layer. 
+
+Since the adapters are extremely lightweight ($r \ll D$), the computational footprint of the second pass is equivalent to a single backbone pass. The total computational complexity is thus:
+\begin{equation}
+  \mathcal{C}_{Two-Pass} = 2 \cdot \mathcal{C}_{backbone} + K \cdot \mathcal{C}_{adapter}
+\end{equation}
+While this doubles the backbone FLOPs (which cuts serving throughput nearly in half under fully saturated GPU workloads), we provide a formal Queries Per Second (QPS) throughput scaling model and crossover analysis in Appendix \ref{app:throughput}. We demonstrate that for task mixtures of $G \ge 3$ active tasks, this two-pass execution remains highly competitive with (and eventually outperforms) MBH's $G$ sequential passes in both throughput and latency, while completely stripping away the systems serving infrastructure complexity.
+
+We explicitly disclose a core scientific constraint of this two-pass execution pathway: it relies on the \emph{base representation sufficiency} assumption. Specifically, we assume that the pre-trained, frozen shared base model $\mathcal{M}_{base}$ contains sufficient semantic signal within its representation space to identify the correct task domain \emph{before} any specialized expert adapters are active. This is an essential scientific constraint of the two-pass approach: if a task is highly specialized such that the base model cannot distinguish its inputs from other domains, and task-specific features are only exposed by the specialized adapters themselves, the base representations will remain identical across domains. In this scenario, the prototyping pass will yield incorrect, uniform, or highly uncalibrated routing coefficients, causing the second pass to execute the wrong adapters and degrade performance. 
+
+To address and mitigate potential violations of this assumption, we propose a concrete systems-level safeguard: \emph{Entropy-Based Fallback Gating (EBF)}. During the prototyping pass, the system monitors the Shannon entropy of the computed routing coefficients for each sample:
+\begin{equation}
+  H(\boldsymbol{\alpha}_b) = -\sum_{k=1}^K \alpha_{k, b} \log \alpha_{k, b}
+\end{equation}
+If the entropy exceeds a pre-defined safety threshold (e.g., $H(\boldsymbol{\alpha}_b) > \theta_{ebf}$), indicating that the base representations are highly ambiguous or uniform and cannot confidently identify a specific domain, the system dynamically detects a violation of base representation sufficiency. In this event, the system can trigger one of three automated fallback behaviors: (1) fall back to our single-pass \textsc{PFAB-ELC} pathway to leverage early-layer clustering signals; (2) execute a uniform blending of the top-$p$ candidate experts to preserve multi-task coverage; or (3) route the sample to a robust, generalist expert adapter. This safeguard ensures that the two-pass pipeline remains highly robust and fail-safe even under extremely specialized, representation-collapsed multi-task environments.
+
+We provide a brief analytical sensitivity discussion regarding the threshold parameter $\theta_{ebf} \in [0.0, \log K]$. Because the maximum possible entropy for a task mixture of $K$ active experts is $\log(K)$ (which corresponds to a flat, uniform routing probability), $\theta_{ebf}$ acts as a precision-recall trade-off operator for sufficiency violations. If $\theta_{ebf}$ is set too aggressively low (e.g., $\theta_{ebf} < 0.50 \cdot \log K$), the system suffers from high false-positive rates, unnecessarily triggering the fallback pathways even when the base model's representations are reasonably confident and correct. Conversely, setting $\theta_{ebf} > 0.85 \cdot \log K$ (such as $\theta_{ebf} = 1.20$ for $K=4$, where $\log(4) \approx 1.386$) guarantees that only extremely uniform, near-collapsed representation coordinates trigger a fallback, successfully shielding the second pass from routing failures while preserving high execution throughput.
+
+\paragraph{2. Early-Layer Gating with Calibration-Centroids (Single-Pass Execution)}
+Alternatively, to achieve true single-pass execution with constant $O(1)$ backbone complexity, we can perform task identification using activations extracted from an early layer $l_{early}$ (such as Layer 0 or Layer 1). Under this configuration, we extract the early-layer activation $z_{early, b} \in \mathbb{R}^D$ causally from the first layer of the base pass.
+
+We explicitly acknowledge that in deep, complex neural networks, representations undergo massive semantic transitions as they propagate through depths. Early-layer features extract low-level abstractions (such as raw token embeddings, edges, or textures) and live in a completely different semantic subspace than the deep penultimate representations expected by the final classification heads. This represents a severe \emph{semantic representation mismatch} (or abstraction gap): direct projection of early activations $z_{early}$ onto final classification heads $W_{k, c}$ is conceptually and mathematically invalid, resulting in highly uncalibrated, near-uniform routing coordinate distributions that catastrophically destroy task identification accuracy.
+
+To resolve this representation gap while introducing zero trainable parameters, we propose \emph{Calibration-Centroid Early-Layer Gating (PFAB-ELC)}. While this pathway relies on pre-computed offline task centroids, it requires zero active parameter training or gradient updates. We precompute a calibration-based early task centroid vector $\boldsymbol{\mu}_k^{(early)} \in \mathbb{R}^D$ for each specialized expert task $k \in \{1, \dots, K\}$ by running a tiny set of offline, task-labeled calibration samples $S_k$ through the base model up to layer $l_{early}$:
+\begin{equation}
+  \boldsymbol{\mu}_k^{(early)} = \frac{1}{|S_k|} \sum_{s \in S_k} z_{early, s}
+\end{equation}
+At test time, single-pass gating is executed by projecting the Unit-Norm Calibrated early representation $\tilde{z}_{early, b}$ directly onto these pre-computed, unit-normalized early-layer centroids $\tilde{\boldsymbol{\mu}}_k^{(early)}$ via cosine similarity:
+\begin{equation}
+  u_{k, b} = \tilde{\boldsymbol{\mu}}_k^{(early)} \cdot \tilde{z}_{early, b}
+\end{equation}
+This completely resolves the semantic representation mismatch by aligning feature domains within the exact same network depth, enabling single-pass execution with zero trainable parameters and flat $O(1)$ constant-time forward complexity.
+
+\paragraph{The Calibration Data Trade-off}
+We openly and transparently disclose a key trade-off regarding our single-pass execution pathway: \textsc{PFAB-ELC} is \emph{not} strictly calibration-free. Because early-layer task centroids ($\boldsymbol{\mu}_k^{(early)}$) must be computed from a small set of task-specific offline samples $S_k$ beforehand, this pathway introduces a small data-dependent calibration overhead. Practitioners are thus presented with a fundamental architectural choice:
+\begin{itemize}
+  \item \textbf{Mathematical Rigor (PFAB-BOP):} A completely data-free and calibration-free two-pass pathway that achieves mathematically exact penultimate routing at the cost of two base model passes.
+  \item \textbf{Inference Efficiency (PFAB-ELC):} A single-pass hybrid pathway that achieves flat $O(1)$ constant backbone complexity by absorbing a small offline calibration-data requirement.
+\end{itemize}
+
+\paragraph{Layer-Constant Blending and Depth-Wise Specialization}
+We disclose a fundamental structural constraint of our formulation: \textsc{PFAB} applies the exact same sample-specific coefficient vector $\boldsymbol{\alpha}_b$ globally across all $L$ layers of the network. Modern deep neural networks exhibit highly distinct hierarchical feature representations across their depth—where early layers extract general, low-level abstractions (edges, raw syntax), intermediate layers process domain-specific structures, and deep layers capture highly task-specific semantics. Forcing the same blending coefficients globally prevents depth-specific adaptation and forces experts to blend early general-purpose representations needlessly. An interesting direction for future research is to relax this layer-constant constraint by introducing layer-dependent scaling modifiers. For instance, multiplying the global coefficient vector $\boldsymbol{\alpha}_b$ by a layer-dependent scalar weight $w^{(l)} \in [0, 1]$ could allow the system to bypass adapter execution in early generalist layers entirely ($w^{(l)} = 0$) and only activate specialized experts in deeper, semantically specialized layers ($w^{(l)} \ge 0.5$), significantly optimizing FLOP efficiency and representation isolation.
+
+\subsection{Extension to Generative Large Language Models}
+\label{sec:llm_extension}
+
+While our standard formulation relies on task-specific classification heads ($W_{k,c}$) to derive routing coordinates, modern model merging and parameter-efficient expert serving are heavily focused on autoregressive generative Large Language Models (LLMs). Generative LLMs do not feature discrete, low-cardinality classification heads; instead, their final projection layers map penultimate representations to a massive, shared vocabulary space (typically $V \ge 32,000$ tokens). To analyze the potential of generalizing \textsc{PFAB}'s non-parametric activation blending beyond standard classification setups, we present two concrete, theoretical pathways designed for generative LLM multi-task workloads. While these pathways serve as non-empirical proposals in this paper, they outline how our non-parametric formulation can be mathematically mapped to massive shared vocabulary environments:
+
+\paragraph{1. Prompt-Level Semantic Projection (PLSP)}
+In autoregressive text generation, the input sequence is prepended with a system instruction or a prompt $X_{prompt} = [x_1, \dots, x_P]$ of length $P$. Instead of performing expensive token-by-token routing, we extract the penultimate representations of the prompt tokens from the final layer of the base model backbone, and apply a pooling operator (e.g., mean pooling) to obtain a single sequence-level representation $z_{prompt} \in \mathbb{R}^D$:
+\begin{equation}
+  z_{prompt} = \frac{1}{P} \sum_{p=1}^P z_p
+\end{equation}
+We project $z_{prompt}$ onto pre-computed task-domain semantic centroids $\boldsymbol{\theta}_k \in \mathbb{R}^D$, which are derived offline by encoding task-description instructions (e.g., "translate to French", "execute Python code", or "solve math equation") using a frozen, lightweight sentence embedding model:
+\begin{equation}
+  u_k = \frac{\boldsymbol{\theta}_k \cdot z_{prompt}}{\|\boldsymbol{\theta}_k\|_2 \|z_{prompt}\|_2}
+\end{equation}
+The resulting sequence-level task coordinates are passed through a sharp Softmax to obtain sequence-level coefficients $\alpha_k$, which can theoretically be used uniformly to blend the parallel expert adapters across all subsequent autoregressively generated tokens in a single forward pass.
+
+\paragraph{2. Task-Specific Vocabulary-Head Anchoring (TSVHA)}
+Alternatively, to perform token-level dynamic routing in generative LLMs without explicit classification heads, we leverage the semantic properties of the model's massive vocabulary projection matrix $W_{vocab} \in \mathbb{R}^{V \times D}$. Each specialized expert task $k \in \{1, \dots, K\}$ is characterized by a high-frequency token subset $\mathcal{V}_k \subset \{1, \dots, V\}$ (e.g., mathematical symbols and numerals for math experts; code operators and syntax tokens for coding experts; or vocabulary subsets for translation experts). 
+
+We explicitly acknowledge a key semantic challenge of this approach in organic LLMs: modern language models share a massive set of common tokens (such as punctuation, conjunctions, and high-frequency stop-words like "the", "and", "is") across virtually all tasks. Direct anchoring on vocabulary subsets containing these ubiquitous tokens would lead to severe routing noise and coordinate collapse. To resolve this overlap challenge in a robust manner, we must filter out common tokens by intersecting the vocabulary subsets with a stop-word mask or applying a TF-IDF-based term frequency filter. This ensures that the anchor vocabulary $\mathcal{V}_k$ contains only highly task-distinctive, specialized tokens, isolating the task coordinates effectively. Alternatively, instead of a rigid binary subset exclusion, one can apply a soft, probabilistic weighting scheme (e.g., weighting each vocabulary token's projection contribution by its TF-IDF score or class probability distribution) to compute a continuous, soft-weighted anchor. Formally, rather than taking a hard maximum over a binary subset, we can define a soft routing coordinate:
+\begin{equation}
+  u_{k, t} = \sum_{j \in \mathcal{V}_k} w_{j, k} \cdot \frac{W_{vocab, j} \cdot z_t}{\|W_{vocab, j}\|_2 \|z_t\|_2}
+\end{equation}
+where $w_{j, k}$ represents the normalized TF-IDF weight of token $j$ for task $k$. This probabilistic formulation naturally scales down the influence of ubiquitous, low-information words while highlighting highly indicative specialized tokens, preventing coordinate dilution without requiring arbitrary binary exclusion thresholds.
+
+Let $W_{vocab, j} \in \mathbb{R}^D$ be the vocabulary projection weight vector for token $j$. At each generation step $t$, we anchor the task gating coordinates directly to these task-distinctive, filtered vocabulary subsets by finding the maximum similarity (or using the soft weighted formulation):
+\begin{equation}
+  u_{k, t} = \max_{j \in \mathcal{V}_k} \frac{W_{vocab, j} \cdot z_t}{\|W_{vocab, j}\|_2 \|z_t\|_2}
+\end{equation}
+By finding the maximum cosine similarity to the task's anchor vocabulary, we project the high-cardinality vocabulary space back into a low-cardinality task-coordinate space, proposing a pathway to achieve non-parametric token-level routing in generative LLMs with zero parameter or training overhead.
+
+We explicitly address two systems and semantic challenges of TSVHA:
+\begin{itemize}
+  \item \textbf{Inference-Time Operation Overhead and Non-Stationary Transitions:} Performing vocabulary similarity projections token-by-token introduces extra GPU operations that can degrade autoregressive generation speed. To mitigate this token-to-token latency overhead, the gating projection can be executed periodically (e.g., every $H = 5$ tokens) on a cached window of recent tokens, rather than at every single step $t$, which amortizes the projection cost to a negligible $O(1/H)$ fraction of token-to-token generation latency. While periodic evaluation dramatically reduces latency overhead, it introduces a potential risk of representation staleness and routing latency drift at sharp task transitions (e.g., a prompt transitioning abruptly from mathematical equations to natural language explanations). 
+
+  To completely resolve this non-stationary boundary challenge with near-zero overhead, we propose a \textbf{Dynamic Gate Reset (DGR)} safeguard. During periodic execution, the serving engine monitors the \emph{running variance of hidden representations} or the \emph{prediction entropy change} $\Delta H = |H(y_t) - H(y_{t-1})|$ between consecutive autoregressive steps. If a sharp transition occurs, the hidden state manifold experiences a localized spike, causing $\Delta H$ to exceed a predefined threshold $\theta_{transition}$. This instantly triggers an immediate, out-of-period gate reset, re-computing the TSVHA similarities to synchronize the routing coordinates with the new task domain within a single token step. This hybrid approach guarantees that stable, stationary windows are served with full $O(1/H)$ computational savings, while non-stationary boundaries are detected dynamically with sub-token latency.
+
+  We openly and transparently disclose a fundamental physical boundary constraint under single-pass generative sequence serving: the \textbf{one-token physical routing lag}. Because the gating coefficients must be derived from penultimate representations $z_t$, the exact routing coordinates for a newly generated token $t$ are only available \emph{after} the full forward pass of token $t$ has already concluded. Consequently, the intermediate layer-wise blending of step $t$ must be executed using the routing weights computed from the previous token step $t-1$ (or earlier). At a sharp non-stationary transition boundary, this introduces a physical one-token detection lag: the first token of the new domain (token $t$) is necessarily executed using the outdated adapter weights of the old domain, before the representation spike can be physically detected to trigger the DGR and re-align the routing coefficients for token $t+1$. We frame this one-token lag as a fundamental physical limit of test-time sequence routing, and we empirically analyze its downstream impact on generation quality in Section~\ref{sec:lag_discussion}.
+  \item \textbf{Vocabulary Overlaps in Non-Technical Tasks:} While isolating task-distinctive vocabularies $\mathcal{V}_k$ is relatively straightforward for highly technical domains (such as mathematical symbols or coding syntax), it represents a major semantic challenge for non-technical tasks with heavily overlapping natural language vocabularies (such as summary generation vs. creative story writing). In such regimes, where standard stop-word and TF-IDF vocabulary filtering are insufficient to cleanly isolate coordinate signals, TSVHA may suffer from severe routing noise and coordinate collapse. Under these overlapping vocabulary scenarios, we recommend falling back to Prompt-Level Semantic Projection (PLSP) or sequence-level instruction embeddings to extract robust, instruction-based routing coefficients.
+\end{itemize}
+
+\subsection{Memory and Compute Optimization: Bounding the Serving Footprint}
+\label{sec:optimization}
+
+While parallelized activation blending completely prunes heavy databases and scheduling layers from serving stacks, evaluating all $K$ expert adapters in parallel can introduce computational and memory scalability challenges when deploying large task libraries (e.g., $K \ge 64$) or processing long sequences in generative environments. To address these systems-level challenges and show how our framework can scale robustly in production, we propose two elegant, minimalist serving optimization techniques.
+
+\paragraph{1. Sample-Wise Sparse Top-$p$ Expert Filtering}
+To bound the computational complexity of parallelized evaluation, we propose to filter out adapters with negligible similarity coefficients and activate only the top $p \ll K$ experts for each sample. Let $\mathcal{G}_{p, b} \subset \{1, \dots, K\}$ represent the active set of the top-$p$ experts with the largest coefficients in $\boldsymbol{\alpha}_b$. We re-normalize the remaining coefficients to obtain the sparsified, bounded routing coefficients:
+\begin{equation}
+  \alpha'_{k, b} = \begin{cases} 
+    \frac{\alpha_{k, b}}{\sum_{j \in \mathcal{G}_{p, b}} \alpha_{j, b}} & \text{if } k \in \mathcal{G}_{p, b} \\
+    0 & \text{otherwise}
+  \end{cases}
+\end{equation}
+The resulting sparsified activation blending equation at layer $l$ is:
+\begin{equation}
+  H_b^{(l)} = X_{base, b}^{(l)} + \sum_{k \in \mathcal{G}_{p, b}} \alpha'_{k, b} H_b^{(l-1)} B_k^{(l)} A_k^{(l)} \quad \forall b
+\end{equation}
+This formulation guarantees that at each layer, the model only expands activations and evaluates parameters for at most $p$ active expert adapters concurrently. This bounds the parallel adapter computational overhead to a flat $O(p \cdot \mathcal{C}_{adapter})$ and restricts activation-space expansion to $B \cdot p \times D$ elements, ensuring complete memory and computational safety even when serving hundreds of installed tasks.
+
+\paragraph{2. Chunked Layer-Wise Execution}
+To prevent GPU VRAM memory accumulation across the depth of the network under modern sequence length expansions (where intermediate activations must be stored during execution), we propose a sequential layer-wise micro-batching scheduling strategy. We partition the input batch $X$ of size $B$ into smaller, disjoint micro-batches (chunks) $X^{(chunk)}$ of size $M \ll B$. 
+
+At each layer $l$, the forward pass, parallel adapter evaluation, and activation blending are executed sequentially chunk-by-chunk:
+\begin{equation}
+  H^{(l, chunk)} = X^{(l, chunk)}_{base} + \sum_{k=1}^K \mathbf{diag}(\boldsymbol{\alpha}_k^{(chunk)}) X_k^{(l, chunk)}
+\end{equation}
+The intermediate expanded activation tensors are immediately released from GPU memory after each layer's forward pass, constraining the maximum activation memory footprint of parallel evaluation to $O(M \cdot p \cdot D)$ per layer. This completely prevents Out-Of-Memory (OOM) failures under generative sequence generation workloads while preserving mathematically identical execution outputs.
+
+\subsection{Complexity and Systems Analysis}
+\label{sec:complexity}
+
+To demonstrate how \textsc{PFAB} honors Occam's razor, we analyze both the computational complexity (FLOPs) and the systems-level infrastructure requirements compared to prior state-of-the-art implementations.
+
+\paragraph{Computational Complexity (FLOPs)}
+Let $\mathcal{C}_{backbone}$ represent the FLOPs required for a single forward pass of the base model backbone, and let $\mathcal{C}_{adapter}$ represent the FLOPs for a single expert's low-rank adapter layer. Since LoRA adapters have rank $r \ll D$, their computational footprint is extremely small, typically $\mathcal{C}_{adapter} < 0.01 \cdot \mathcal{C}_{backbone}$.
+\begin{itemize}
+  \item \textbf{Micro-Batch Homogenization (MBH):} Since MBH partitions the batch and dispatches tasks sequentially, it requires executing $G \le K$ separate forward passes of the backbone. Its computational cost scales linearly with task diversity:
+    \begin{equation}
+      \mathcal{C}_{MBH} = G \cdot \mathcal{C}_{backbone}
+    \end{equation}
+  \item \textbf{Activation Blending (PFAB):} Our method executes exactly one forward pass of the base backbone and evaluates the lightweight adapters in parallel:
+    \begin{equation}
+      \mathcal{C}_{PFAB} = \mathcal{C}_{backbone} + K \cdot \mathcal{C}_{adapter}
+    \end{equation}
+\end{itemize}
+Since $\mathcal{C}_{adapter}$ is negligible, \textsc{PFAB} achieves a near-$G\times$ FLOP reduction during heterogeneous inference compared to MBH.
+
+\paragraph{Systems Serving Simplicity}
+At the systems level, MBH requires a complex serving infrastructure to handle stream partitioning, dynamic on-the-fly compiling of merged parameters, index tracking, sequential model dispatching, and output scatter-gather re-sorting. This introduces heavy software dependencies and runtime latency overheads. 
+
+In contrast, \textsc{PFAB} completely prunes this serving layer. It executes heterogeneous batches in a single standard forward pass using standard PyTorch tensor broadcasting, which is supported out-of-the-box on any hardware. This eliminates all serving-level complexity, systems compilation dependencies, and dynamic memory allocations, achieving a truly minimalist systems-ML co-design.

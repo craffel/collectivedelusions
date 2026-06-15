@@ -1,0 +1,77 @@
+\section{Methodology: RegCalMerge}
+\label{sec:methodology}
+
+We present \textbf{RegCalMerge} (Calibrated \& Regularized Test-Time Model Merging), a robust optimization framework designed to combine multiple task-specific expert neural networks while actively mitigating the twin failure modes of test-time adaptation: transductive overfitting and sacrificial task bias.
+
+\subsection{Preliminaries and Parameterization}
+Let $\theta_{\text{pre}}$ denote the parameters of a pre-trained base model, and let $\{\theta_1, \theta_2, \dots, \theta_K\}$ represent a set of $K$ expert models fine-tuned from the same pre-trained base on $K$ distinct tasks. For each task $k \in \{1, \dots, K\}$, we extract the parameter-space \emph{task vector} $\tau_k$, defined as:
+\begin{equation}
+\tau_k = \theta_k - \theta_{\text{pre}}
+\end{equation}
+In a multi-layer deep network with $L$ discrete parameter layers (or layer groups), we can represent the weights and task vectors at each layer $l \in \{1, \dots, L\}$ as $\theta^l_{\text{pre}}$ and $\tau^l_k$, respectively.
+
+We parameterize the merging process using a continuous coefficient matrix $\Lambda \in [0, 1]^{K \times L}$, where each element $\lambda^l_k$ represents the merging coefficient of task vector $k$ at layer $l$. The parameters of the merged model at layer $l$, denoted by $\theta^l_{\text{merged}}(\Lambda)$, are constructed differentiably as a linear combination:
+\begin{equation}
+\label{eq:merged_params}
+\theta^l_{\text{merged}}(\Lambda) = \theta^l_{\text{pre}} + \sum_{k=1}^K \lambda^l_k \tau^l_k
+\end{equation}
+This parameterization allows the merged model to dynamically scale the contributions of different tasks across the network's architectural hierarchy.
+
+\subsection{Elastic Spatial Regularization (ESR)}
+In unconstrained adaptive merging (such as standard AdaMerging), the coefficients $\lambda^l_k$ are optimized independently across all layers and tasks, which introduces high-frequency parameter variance and leads to transductive overfitting (as shown in Section~\ref{sec:experiments}). To regulate parameter drift without completely collapsing the layer-wise adaptation capacity, we propose \textbf{Elastic Spatial Regularization (ESR)}. 
+
+For each task $k$, we first compute the spatial average of the merging coefficients across all $L$ layers:
+\begin{equation}
+\bar{\lambda}_k = \frac{1}{L} \sum_{l=1}^L \lambda^l_k
+\end{equation}
+The Elastic Spatial Regularization penalty $\mathcal{R}_{\text{spatial}}(\Lambda)$ is defined as:
+\begin{equation}
+\label{eq:esr}
+\mathcal{R}_{\text{spatial}}(\Lambda) = \frac{\beta}{K L} \sum_{k=1}^K \sum_{l=1}^L (\lambda^l_k - \lambda_{\text{init}})^2 + \frac{\gamma}{K L} \sum_{k=1}^K \sum_{l=1}^L (\lambda^l_k - \bar{\lambda}_k)^2
+\end{equation}
+where:
+\begin{itemize}
+    \item $\lambda_{\text{init}} \in [0, 1]$ is the uniform initialization value (e.g., $0.3$), corresponding to the standard Task Arithmetic configuration.
+    \item $\beta \ge 0$ is the \emph{Proximity Penalty} weight, which penalizes deviation from the robust initialization and prevents coefficients from drifting into unstable parameter regions.
+    \item $\gamma \ge 0$ is the \emph{Spatial Deviation Penalty} weight, which penalizes variance around the task-wise spatial average $\bar{\lambda}_k$, encouraging spatial smoothness across layers and smoothing out high-frequency optimization noise.
+\end{itemize}
+By dividing the sum by the total number of layer-task coordinates $K L$, we normalize the magnitude of the penalty to be scale-invariant ($O(1)$) with respect to network depth and the number of merged domains. This mathematically elegant normalization ensures that the hyperparameters $\beta$ and $\gamma$ remain stable and transferable across larger architectures or deeper networks. In our concrete code implementation, the division by $K L$ is absorbed directly into the scaled hyperparameter values $\beta$ and $\gamma$, while we present the normalized formulation here to maintain architectural generality.
+
+ESR acts as an elastic constraint: when $\gamma \to \infty$, the coefficients are forced to be identical across all layers (recovering the Spatially Averaged mean baseline); when $\beta \to \infty$, they recover uniform Task Arithmetic. Setting moderate values for both parameters allows the optimizer to exploit localized architectural benefits while preventing transductive overfitting.
+
+\subsection{Class-Capacity Normalization (CCN)}
+Different tasks often feature unequal classification capacities (different numbers of categories, $C_k$). In standard test-time adaptation, raw prediction entropy is minimized. However, because the maximum theoretical entropy of a task with $C_k$ classes is $\log C_k$, tasks with larger category sets have a higher entropy ceiling, making raw entropy values incomparable across domains. 
+
+To map prediction entropy onto a uniform, dimensionless interval of $[0, 1]$, we introduce \textbf{Class-Capacity Normalization (CCN)}. For a batch of $N$ unlabeled calibration samples $\{X_i\}_{i=1}^N$ from task $k$, the capacity-normalized prediction entropy $\bar{\mathcal{H}}_k(\Lambda)$ is defined as:
+\begin{equation}
+\label{eq:ccn}
+\bar{\mathcal{H}}_k(\Lambda) = \frac{-1}{N \log C_k} \sum_{i=1}^N \sum_{c=1}^{C_k} P(y=c \mid X_i; \theta_{\text{merged}}(\Lambda)) \log P(y=c \mid X_i; \theta_{\text{merged}}(\Lambda))
+\end{equation}
+where $P(y=c \mid X_i; \theta_{\text{merged}}(\Lambda))$ is the softmax probability of category $c$ for input $X_i$ under the merged model parameters. By scaling the entropy of each task by $1/\log C_k$, we ensure that different task structures are evaluated on a mathematically uniform scale.
+
+\emph{Benchmark Constant Space Limitation}: We note that in our specific experimental benchmark (detailed in Section~\ref{sec:experiments}), the visual task mixture consists of four datasets that all feature exactly $C_k = 10$ categories. Consequently, $\log C_k = \log 10$ remains constant across all tasks, and CCN acts as a global scalar learning rate scaling. While empirically constant on homogeneous classification suites, the theoretical inclusion of CCN remains essential for establishing an architecture-agnostic, uniform bounded interval ($[0, 1]$) for heterogeneous task mixtures (e.g., combining MNIST with ImageNet or DTD). In homogeneous setups, Scale-Normalized Entropy Weighting (SNEW) plays the primary causal role in resolving the sacrificial task bias, while CCN guarantees uniform mathematical compatibility.
+
+\subsection{Scale-Normalized Entropy Weighting (SNEW)}
+Even when normalized to $[0, 1]$, different tasks exhibit vastly different baseline entropy distributions. Easier tasks (e.g., digit classification on MNIST) show low prediction entropy at step $0$, while complex tasks (e.g., SVHN) display much higher initial entropy. In a simple joint objective, the gradients are dominated by the low-entropy, easily optimizable tasks, causing the optimizer to sacrifice the difficult tasks to achieve a lower overall loss.
+
+To resolve this sacrificial task bias, we introduce \textbf{Scale-Normalized Entropy Weighting (SNEW)}. We scale each task-wise entropy objective by the inverse of its baseline uniform task arithmetic entropy, computed at initialization (step $0$ of optimization):
+\begin{equation}
+\label{eq:snew_weight}
+w_k = \frac{1}{\bar{\mathcal{H}}_k(\Lambda_{\text{init}})}
+\end{equation}
+These scale weights $w_k$ are computed once before optimization begins and are held constant throughout test-time adaptation. 
+
+\subsection{Joint Optimization Objective}
+Combining ESR, CCN, and SNEW, we define the complete, regularized test-time model merging optimization problem as:
+\begin{equation}
+\label{eq:joint_loss}
+\min_{\Lambda \in [0, 1]^{K \times L}} \mathcal{L}(\Lambda) = \sum_{k=1}^K w_k \bar{\mathcal{H}}_k(\Lambda) + \mathcal{R}_{\text{spatial}}(\Lambda)
+\end{equation}
+where $w_k$ is defined by Eq.~\eqref{eq:snew_weight}, $\bar{\mathcal{H}}_k(\Lambda)$ is defined by Eq.~\eqref{eq:ccn}, and $\mathcal{R}_{\text{spatial}}(\Lambda)$ is defined by Eq.~\eqref{eq:esr}.
+
+\subsection{Optimization Algorithms}
+We evaluate our joint objective using two primary optimization algorithms to ensure our conclusions are not coupled to a specific optimization paradigm:
+\begin{enumerate}
+    \item \textbf{First-Order Gradient Descent (Adam GD)}: We differentiably propagate gradients from Eq.~\eqref{eq:joint_loss} to update the continuous parameters $\Lambda$ using the Adam optimizer with a learning rate of $10^{-3}$, clamping the updated coefficients to $[0, 1]$ after each step.
+    \item \textbf{Derivative-Free Optimization (1+1 ES)}: We utilize the $(1+1)$ Evolution Strategy \cite{hansen2016cma} to optimize $\Lambda$ through sequential random mutations and selection, providing a derivative-free benchmark that mimics test-time settings where backpropagation through the model is unavailable or expensive.
+\end{enumerate}

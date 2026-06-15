@@ -1,0 +1,127 @@
+\section{Methodology}
+\label{sec:methodology}
+
+In this section, we present the mathematical formulation of our proposed Bounded Classical Router (BC-Router) framework and describe how its two variants, the Bounded Linear Router (BL-Router) and the Global Router with Layer-wise Scaling (GLS-Router), isolate and control the confounding variables of over-scaling and layer-wise specialization.
+
+\subsection{Problem Formulation and Backbone Setup}
+Let $W_{base}^{(l)}$ represent the pre-trained weights of a base model at layer $l \in \{1, \dots, L\}$. Given $K$ specialized task-specific experts fine-tuned from the same base initialization, we define the corresponding task vectors $V_k^{(l)}$ for expert $k \in \{1, \dots, K\}$ at layer $l$ as:
+\begin{equation}
+    V_k^{(l)} = W_k^{(l)} - W_{base}^{(l)}
+\end{equation}
+The backbone architecture is a compact Vision Transformer (\texttt{vit\_tiny\_patch16\_224}) consisting of $L=14$ layer groups (a Patch Embedding layer, $12$ Transformer blocks, and a final Layer Normalization layer) with hidden dimension $D=192$. 
+
+Let $x \in \mathbb{R}^{B \times C \times H \times W}$ be an input batch of size $B$. Passing $x$ through the patch embedding layer of the ViT backbone produces patch tokens $H_0 \in \mathbb{R}^{B \times N \times D}$, where $N$ is the number of tokens. We spatially average these patch tokens across the token dimension to extract a robust global representation $z(x) \in \mathbb{R}^{B \times D}$ for each sample in the batch:
+\begin{equation}
+    z(x)_b = \frac{1}{N} \sum_{n=1}^N H_{0, b, n, :} \in \mathbb{R}^D \quad \forall b \in \{1, \dots, B\}
+\end{equation}
+
+\subsection{The Un-regularized Linear Router Baseline}
+To route weights dynamically based on input, a standard classical Linear Router introduces a single global routing head parameterized by a projection matrix $W_{route} \in \mathbb{R}^{D \times K}$ and bias $b_{route} \in \mathbb{R}^K$. For each sample $b$ in the batch, raw task logits $o(x)_b \in \mathbb{R}^K$ are computed as:
+\begin{equation}
+    o(x)_b = z(x)_b W_{route} + b_{route}
+\end{equation}
+These logits are mapped to relative task probabilities using a standard Softmax activation:
+\begin{equation}
+    p_{k, b} = \text{Softmax}(o(x)_b)_k = \frac{\exp(o(x)_{b, k})}{\sum_{j=1}^K \exp(o(x)_{b, j})} \in [0, 1]
+\end{equation}
+The sample-level routing coefficients $\alpha_{k, b}$ are equal to $p_{k, b}$. To collapse the sample-level routing to a batch-level merging coefficient (analogous to the wavefunction collapse in QWS-Merge), we average the probabilities across the batch dimension:
+\begin{equation}
+    \bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}
+\end{equation}
+Finally, the dynamically assembled weight matrix at layer $l$ is:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k V_k^{(l)}
+\end{equation}
+
+\subsection{Demystifying the Over-Scaling Confounder: BL-Router}
+The un-regularized Linear Router baseline has a critical methodological flaw. Because the Softmax probabilities must sum to $1.0$, if the router correctly identifies that a sample belongs to task $k$, the coefficient $\bar{\alpha}_k$ approaches $1.0$. 
+However, in weight-space Task Arithmetic, adding a task vector with a scale of $1.0$ is extremely destructive. The optimal static scaling coefficient in Task Arithmetic is typically bounded around $\lambda \approx 0.3$. Scaling a task vector by $1.0$ pushes the model weights far outside the local basin of convergence, destroying the representations of other tasks and causing the reported catastrophic collapse on SVHN. 
+
+To isolate and control this **Over-Scaling Confounder**, we propose the **Bounded Linear Router (BL-Router)**. BL-Router applies a strict mathematical ceiling to the maximum scale of any task vector:
+\begin{equation}
+    \alpha_{k, b} = \lambda_{max} \times \frac{\exp(o(x)_{b, k})}{\sum_{j=1}^K \exp(o(x)_{b, j})} \quad \text{with } \lambda_{max} = 0.3
+\end{equation}
+The batch-level collapsed coefficients are computed in the same manner: $\bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}$. The assembled weights at layer $l$ are:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k V_k^{(l)}
+\end{equation}
+By forcing the routing coefficients to be strictly bounded in $[0, 0.3]$, BL-Router isolates the over-scaling variable. If BL-Router resolves the SVHN collapse, it proves that the failure of classical routing is purely a scale-regularization issue rather than an inherent limitation of linear projection.
+
+\paragraph{The Structural Under-Scaling Flaw of Softmax Bounding:}
+Crucially, this standard Softmax-based bounded formulation contains a subtle but severe mathematical design flaw. Because the relative task routing probabilities must sum to $1.0$, the sum of the resulting dynamic coefficients is strictly capped:
+\begin{equation}
+    \sum_{k=1}^K \alpha_{k, b} = \lambda_{max} \sum_{k=1}^K \text{Softmax}(o(x)_b)_k = 0.3
+\end{equation}
+In contrast, the static Uniform Merge (Task Arithmetic) baseline assigns a static, un-shared coefficient of $0.3$ to \textit{each} individual task independently, resulting in a total active parameter scale sum of $0.3 \times 4 = 1.2$. 
+By capping the sum of coefficients at $0.3$, the Softmax-based BL-Router forces a severe, artificial under-scaling bottleneck. Under high uncertainty, where the routing head outputs uniform relative probabilities across tasks, each task is restricted to a meager scale of only $0.075$ ($[0.075, 0.075, 0.075, 0.075]$). A scale of $0.075$ is mathematically too small to transfer specialized expert capabilities, causing the merged model to behave almost identically to the unadapted base model and collapse.
+
+To resolve this under-scaling tension while preserving a Softmax-based framework, one could attempt to scale the Softmax output by $K \times \lambda_{max} = 1.2$, so that $\alpha_{k, b} = 1.2 \times \text{Softmax}(o(x)_b)_k$. This corrected formulation allows the sum of coefficients to reach $1.2$ (and assigns exactly $0.3$ to each task under uniform uncertainty). However, it introduces a severe counter-tension: when the router is highly confident in a single task, it can assign a scale of up to $1.2$ to that task, which violates the individual bounding ceiling of $0.3$ and causes severe representational over-scaling and collapse on that task (since expert task vectors are typically calibrated to operate at around $0.3$, not $1.2$). This exposes a fundamental mathematical conflict in Softmax-based routing: it is structurally impossible to simultaneously enforce an individual task scaling limit while preserving the necessary joint multi-task scale capacity. This structural under-scaling design flaw of Softmax bounding is a crucial, overlooked confounder that we completely resolve with the Softmax-free independent activations of our BSigmoid-Router.
+
+\subsection{Demystifying the Layer-wise Specialization Confounder: GLS-Router}
+Prior works have demonstrated that different layers in a deep neural network exhibit varying degrees of task specialization; for instance, early layers often represent shared, task-agnostic visual features, while deeper layers represent highly task-specific representations. QWS-Merge leverages this by learning distinct parameters for each layer, giving it a massive capacity advantage over a global routing baseline.
+
+To isolate and control this **Layer-wise Specialization Confounder**, we propose the **Global Router with Layer-wise Scaling (GLS-Router)**. GLS-Router maintains a single shared global routing projection ($W_{route}, b_{route}$) to compute sample-level probabilities $p_{k, b}$ across all layers. However, for each layer $l$ and task $k$, we introduce a trainable layer-wise scaling amplitude $R_k^{(l)} \in \mathbb{R}$, initialized to $0.3$. 
+The sample-level dynamic coefficient for task expert $k$ at layer $l$ is the product of the shared global routing probability and the layer-specific amplitude:
+\begin{equation}
+    \alpha_{k, b}^{(l)} = R_k^{(l)} \times p_{k, b}
+\end{equation}
+Collapsing these sample-level coefficients across the batch yields the batch-level layer-wise coefficient $\bar{\alpha}_k^{(l)}$:
+\begin{equation}
+    \bar{\alpha}_k^{(l)} = R_k^{(l)} \times \left( \frac{1}{B} \sum_{b=1}^B p_{k, b} \right)
+\end{equation}
+The dynamically assembled weights for layer $l$ are:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k^{(l)} V_k^{(l)}
+\end{equation}
+By combining a global routing head with trainable layer-wise task-scaling amplitudes, GLS-Router achieves layer-specific weight-routing capabilities with an ultra-compact parameter footprint.
+
+\subsection{Resolving the Zero-Sum Bottleneck: Bounded Sigmoidal Router (BSigmoid-Router)}
+The proposed Softmax-based classical routers (BL-Router and GLS-Router) compute relative task probabilities under a standard Softmax activation. When calibrated on a mixed-task batch, this Softmax formulation forces the tasks to compete in a zero-sum game for a shared "routing budget" (especially in BL-Router where the sum of coefficients is strictly capped at $0.3$). To minimize the joint cross-entropy loss over the calibration set, the optimizer is highly prone to "sacrificing" high-conflict tasks (such as SVHN) to fit simpler tasks (such as MNIST), leading to routing collapse on specific tasks.
+
+To eliminate this zero-sum competitive bottleneck during mixed-batch calibration, we introduce the **Bounded Sigmoidal Router (BSigmoid-Router)**. BSigmoid-Router replaces the Softmax function with independent, Softmax-free Sigmoid activations, allowing the router to assign routing coefficients to task-specific parameter vectors independently:
+\begin{equation}
+    \alpha_{k, b} = \lambda_{max} \times \text{Sigmoid}(o(x)_{b, k}) \quad \text{with } \lambda_{max} = 0.3
+\end{equation}
+These independent, bounded sample-level coefficients are averaged across the batch dimension to obtain the batch collapsed coefficients:
+\begin{equation}
+    \bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}
+\end{equation}
+The dynamically merged weights are then assembled as:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k V_k^{(l)}
+\end{equation}
+By computing independent task coefficients, BSigmoid-Router provides an operationally fair classical comparison against QWS-Merge, which also utilizes independent, Softmax-free projections. 
+
+This formulation draws a direct, explicit parallel to sparse Mixture-of-Experts (MoE) token-level gating mechanisms. In modern sparse MoE networks (such as Mixtral or Switch Transformers), a gating network routing tokens to specialized feed-forward experts frequently utilizes independent, Softmax-free sigmoidal projections or Top-k gating instead of standard Softmax to handle multi-expert routing, prevent expert exclusion, and enable the simultaneous activation of multiple specialized domains \cite{moe, switch_transformers}. 
+By framing dynamic model merging as a lightweight, training-free parameter-space MoE, BC-Router acts as a macro-level MoE: rather than routing individual tokens to separate physical layers (which incurs high memory and communication latency), BC-Router dynamically merges the parameter vectors themselves once per batch or sample. 
+This creates a single, unified set of task-specialized parameters for the forward pass, bypassing the severe routing overhead of token-level MoEs while preserving their mathematical capacity for independent task activation. 
+Contextualizing parameter-space routing within established MoE paradigms highlights that independent activation is a mathematically natural way to decouple expert choices, establishing BC-Router as a computationally efficient bridge between parameter-space model merging and sparse Mixture-of-Experts.
+
+\subsection{Parameter Efficiency and Optimization Protocol}
+To evaluate these methods fairly and avoid the "Overfitting-Optimizer Paradox" associated with online TTA, we optimize the trainable parameters of all models on a tiny, balanced calibration set consisting of only $64$ total samples ($16$ samples per task). 
+
+\textbf{L2 Regularization (Weight Decay):} Since the classical Linear Router and GLS-Router optimize unregularized linear heads ($772$ parameters) on a tiny 64-sample dataset, they are highly susceptible to low-data overfitting. To control for the capacity and regularization confounder, we evaluate regularized variants (denoted by \textbf{Reg}) where we apply standard L2 regularization (weight decay $\gamma = 1\times 10^{-4}$) to the routing projection weights during calibration.
+
+Table~\ref{tab:param_efficiency} highlights the exceptional parameter efficiency of our proposed routers:
+\begin{itemize}
+    \item \textbf{BL-Router} and \textbf{BSigmoid-Router} have only **$772$** parameters ($W_{route} \in \mathbb{R}^{192 \times 4}$ and $b_{route} \in \mathbb{R}^4$).
+    \item \textbf{GLS-Router} has only **$828$** parameters (adding $56$ layer-wise scaling amplitudes $R \in \mathbb{R}^{14 \times 4}$).
+\end{itemize}
+All configurations are optimized for exactly $100$ steps of Adam with a learning rate of $1\times 10^{-2}$. The extremely small parameter footprint guarantees that both classical baselines are highly robust to overfitting during calibration, providing stable and generalizable routing coefficients.
+
+\begin{table}[h]
+\centering
+\caption{Total trainable routing parameters for dynamic merging methods ($L=14$ layers, $D=192$ dimensions, $K=4$ tasks).}
+\label{tab:param_efficiency}
+\begin{tabular}{lc}
+\toprule
+Method & Trainable Parameters \\
+\midrule
+Linear Router (Classical) & 772 \\
+QWS-Merge (SOTA Waveform) & 336 \\
+\textbf{BL-Router (Ours)} & \textbf{772} \\
+\textbf{BSigmoid-Router (Ours)} & \textbf{772} \\
+\textbf{GLS-Router (Ours)} & \textbf{828} \\
+\bottomrule
+\end{tabular}
+\end{table}

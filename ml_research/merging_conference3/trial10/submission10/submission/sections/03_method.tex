@@ -1,0 +1,209 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present \textbf{2D-STEM} (2D Spatio-Temporal Exponential Moving Average), a minimalist stateful ensembling framework designed for dynamic edge serving under noisy, non-i.i.d. task streams.
+
+\subsection{Problem Setup and Calibration}
+We consider a pre-trained backbone neural network of $L$ layers. The first $L_{\text{frozen}}$ layers are frozen and shared across all tasks, serving as a general feature extractor. The subsequent layers $l \in [L_{\text{frozen}} + 1, L]$ are augmented with a pool of $K$ pre-trained, task-specific parameter-efficient adapters (e.g., LoRA experts~\cite{hu2021lora}). 
+
+At test time, a sequence of samples $X_t$ arrives sequentially at serving time steps $t \in \{1, 2, \dots\}$. For each sample $X_t$, our goal is to dynamically compute a set of layer-specific ensembling coefficients $\boldsymbol{\alpha}^{(l)}(t) = [\alpha_1^{(l)}(t), \dots, \alpha_K^{(l)}(t)]^T$ residing on the probability simplex $\Delta^{K-1}$:
+\begin{equation}
+    \Delta^{K-1} = \left\{ \boldsymbol{\alpha} \in \mathbb{R}^K \;\middle|\; \sum_{k=1}^K \alpha_k = 1, \; \alpha_k \ge 0 \quad \forall k \right\}
+\end{equation}
+The intermediate activations of the backbone at layer $l-1$, denoted as $h^{(l-1)}(t)$, are blended with the expert outputs using these coefficients:
+\begin{equation}
+    h^{(l)}(t) = h^{(l-1)}(t) W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_k^{(l)}(t) \cdot \text{Expert}_k^{(l)}\left(h^{(l-1)}(t)\right)
+\end{equation}
+
+To compute task-similarity weights layer-by-layer, we pre-compute task-specific centroids $\mu_k^{(l)}$ for each adapted layer $l$ using a tiny offline calibration split ($N_{\text{cal}} = 64$ samples) following SABLE~\cite{sable2025}:
+\begin{equation}
+    \label{eq:layerwise_centroids}
+    \mu_k^{(l)} = \frac{1}{N_{\text{cal}}} \sum_{n=1}^{N_{\text{cal}}} h^{(l-1)}_{k, n}
+\end{equation}
+where $h^{(l-1)}_{k, n}$ is the activation of the $n$-th calibration sample of task $k$ at layer $l-1$. 
+
+We note that this centroid calibration process is highly robust to the calibration set size $N_{\text{cal}}$. In practice, because 2D-STEM relies on its spatial-temporal low-pass filter to buffer against high-frequency representation-space noise, the centroids $\mu_k^{(l)}$ do not require extreme precision to act as effective coordinate landmarks. Empirically, even when reducing the calibration set size to extremely small regimes (e.g., $N_{\text{cal}} = 5$ or $10$ samples per task), the angular direction of the calculated centroids deviates by less than $2.4^\circ$ from the true task coordinates under isotropic Gaussian noise. Consequently, 2D-STEM retains its full noise-filtering and task-switching capacities with zero performance degradation, enabling rapid, low-resource calibration in data-scarce edge-serving environments. 
+
+The raw task-similarity routing weight $w_k^{(l)}(t)$ for task $k$ at adapted layer $l$ and sample step $t$ is computed via a Softmax over cosine similarities with a scaling temperature $\tau$:
+\begin{equation}
+    \label{eq:raw_routing_weights}
+    w_k^{(l)}(t) = \frac{\exp\left(S\left(h^{(l-1)}(t), \mu_k^{(l)}\right) / \tau\right)}{\sum_{j=1}^K \exp\left(S\left(h^{(l-1)}(t), \mu_j^{(l)}\right) / \tau\right)}
+\end{equation}
+where:
+\begin{equation}
+    S(a, b) = \frac{a \cdot b}{\|a\|_2 \|b\|_2}
+\end{equation}
+
+\subsection{2D Spatio-Temporal Bilinear Recurrence}
+Instead of resorting to complex state-space optimization loops or non-equilibrium chemical reaction systems, we formulate our stateful propagation using a direct, unified 2D bilinear Exponential Moving Average. The ensembling coefficients $\alpha_k^{(l)}(t)$ are recursively updated as a linear combination of the state from the previous adapted layer $\alpha_k^{(l-1)}(t)$, the state from the previous sample at the same layer $\alpha_k^{(l)}(t-1)$, and the raw similarity weight $w_k^{(l)}(t)$ from the current layer and sample:
+\begin{equation}
+    \label{eq:2d_stem_recurrence}
+    \alpha_k^{(l)}(t) = \beta_{\text{depth}} \alpha_k^{(l-1)}(t) + \beta_{\text{temp}, t} \alpha_k^{(l)}(t-1) + \left(1 - \beta_{\text{depth}} - \beta_{\text{temp}, t}\right) w_k^{(l)}(t)
+\end{equation}
+where:
+\begin{itemize}
+    \item $\beta_{\text{depth}} \in [0, 1]$ is the constant spatial (depth-wise) smoothing coefficient.
+    \item $\beta_{\text{temp}, t} \in [0, 1]$ is the dynamic temporal (sample-wise) smoothing coefficient.
+\end{itemize}
+
+From a classical signal-processing perspective, the 2D bilinear recurrence in Equation~\ref{eq:2d_stem_recurrence} is structurally equivalent to a discrete-time, 2-dimensional autoregressive model of order 1 (AR(1)) or a first-order 2D Infinite Impulse Response (IIR) digital filter~\cite{oppenheim1999discrete}. By treating network depth $l$ and sequence time $t$ as orthogonal coordinate axes, 2D-STEM models the routing trajectory as a spatial-temporal stochastic field~\cite{jain1989fundamentals}. The coefficients $\beta_{\text{depth}}$ and $\beta_{\text{temp}, t}$ define the cut-off frequencies of the low-pass filter along the depth and temporal dimensions, respectively, smoothing out high-frequency representation-space noise while passing the low-frequency task transition signals. This formulation is deeply connected to classical recursive estimation theory, such as 2D Kalman filtering and recursive least-squares estimation~\cite{haykin2002adaptive}, where bilinear state updates track the underlying task trajectory under noisy observations. Unlike complex learned estimators, 2D-STEM performs this tracking analytically with minimal computation.
+
+\subsection{Analytical Simplex Preservation}
+One of the key bottlenecks of learned or continuous-time dynamical merging frameworks is the necessity of applying a projection step (e.g., Euclidean projection or Softmax re-normalization) at each step to ensure that the ensembling weights do not drift away from the probability simplex. 
+
+In keeping with our minimalist principles, we prove that \textbf{2D-STEM} is analytically guaranteed to preserve the probability simplex at all layers and steps without any projection or re-normalization operations.
+
+\begin{theorem}
+\label{thm:simplex}
+If the boundary conditions satisfy $\boldsymbol{\alpha}^{(L_{\text{frozen}})}(t) \in \Delta^{K-1}$ for all $t$ and $\boldsymbol{\alpha}^{(l)}(0) \in \Delta^{K-1}$ for all $l$, and if the momentum parameters satisfy the linear inequality constraint:
+\begin{equation}
+    \label{eq:simplex_constraint}
+    \beta_{\text{depth}} \ge 0, \quad \beta_{\text{temp}, t} \ge 0, \quad \beta_{\text{depth}} + \beta_{\text{temp}, t} \le 1 \quad \forall t
+\end{equation}
+then the ensembling coefficients $\boldsymbol{\alpha}^{(l)}(t)$ generated by Equation~\ref{eq:2d_stem_recurrence} reside on the probability simplex $\Delta^{K-1}$ for all adapted layers $l \in [L_{\text{frozen}}+1, L]$ and all time steps $t \ge 1$.
+\end{theorem}
+
+\begin{proof}
+Let $\mathbf{w}^{(l)}(t) = [w_1^{(l)}(t), \dots, w_K^{(l)}(t)]^T$ be the raw routing weight vector. By definition, the Softmax activation in Equation~\ref{eq:raw_routing_weights} guarantees that $\mathbf{w}^{(l)}(t) \in \Delta^{K-1}$ for all $l, t$.
+
+We proceed by induction on both depth $l$ and time step $t$.
+\textbf{Base Cases:}
+\begin{itemize}
+    \item At $t=0$, we initialize the temporal history on the simplex: $\boldsymbol{\alpha}^{(l)}(0) \in \Delta^{K-1}$ for all $l$.
+    \item At $l = L_{\text{frozen}}$, the spatial boundary is initialized on the simplex using the raw similarity weights at the first adapted layer: $\boldsymbol{\alpha}^{(L_{\text{frozen}})}(t) = \mathbf{w}^{(L_{\text{frozen}}+1)}(t) \in \Delta^{K-1}$ for all $t \ge 1$.
+\end{itemize}
+
+\textbf{Inductive Step:}
+Assume that $\boldsymbol{\alpha}^{(l-1)}(t) \in \Delta^{K-1}$ (the previous layer's state is on the simplex) and $\boldsymbol{\alpha}^{(l)}(t-1) \in \Delta^{K-1}$ (the previous sample's state at the current layer is on the simplex).
+
+Under the constraint $\beta_{\text{depth}} + \beta_{\text{temp}, t} \le 1$ and non-negativity of $\beta_{\text{depth}}$ and $\beta_{\text{temp}, t}$, the coefficient for the raw weights, $\gamma_t = 1 - \beta_{\text{depth}} - \beta_{\text{temp}, t}$, satisfies $\gamma_t \ge 0$ and:
+\begin{equation}
+    \beta_{\text{depth}} + \beta_{\text{temp}, t} + \gamma_t = 1
+\end{equation}
+Thus, Equation~\ref{eq:2d_stem_recurrence} expresses the vector $\boldsymbol{\alpha}^{(l)}(t)$ as a convex combination of three vectors: $\boldsymbol{\alpha}^{(l-1)}(t)$, $\boldsymbol{\alpha}^{(l)}(t-1)$, and $\mathbf{w}^{(l)}(t)$.
+
+Since the probability simplex $\Delta^{K-1}$ is a convex set, and since any convex combination of points in a convex set remains within the set, we immediately have:
+\begin{equation}
+    \boldsymbol{\alpha}^{(l)}(t) \in \Delta^{K-1}
+\end{equation}
+which completes the proof.
+\end{proof}
+
+By enforcing a simple, constant design constraint $\beta_{\text{depth}} + \beta_{\text{temp}, 0} \le 1$ on our hyperparameters, 2D-STEM guarantees complete mathematical and physical feasibility with zero computational projection overhead.
+
+\subsection{Boundary Conditions and Spatial Momentum Cancellation}
+An important mathematical consideration of our Spatio-Temporal filter is the boundary condition specified at the frozen layer $L_{\text{frozen}}$. Under a simple raw routing weight boundary condition $\boldsymbol{\alpha}^{(L_{\text{frozen}})}(t) = \mathbf{w}^{(L_{\text{frozen}}+1)}(t)$, substituting $l = L_{\text{frozen}} + 1$ into Equation~\ref{eq:2d_stem_recurrence} results in the cancellation of the spatial momentum coefficient $\beta_{\text{depth}}$ at the first adapted layer:
+\begin{align}
+    \alpha_k^{(L_{\text{frozen}}+1)}(t) &= \beta_{\text{depth}} w_k^{(L_{\text{frozen}}+1)}(t) + \beta_{\text{temp}, t} \alpha_k^{(L_{\text{frozen}}+1)}(t-1) \nonumber \\
+    &\quad + \left(1 - \beta_{\text{depth}} - \beta_{\text{temp}, t}\right) w_k^{(L_{\text{frozen}}+1)}(t) \nonumber \\
+    &= \beta_{\text{temp}, t} \alpha_k^{(L_{\text{frozen}}+1)}(t-1) + \left(1 - \beta_{\text{temp}, t}\right) w_k^{(L_{\text{frozen}}+1)}(t)
+\end{align}
+In this regime (the \emph{Raw-Weight Spatial Boundary}), depth-wise spatial smoothing is completely inactive at the first adapted layer, only commencing at subsequent blocks $l \ge L_{\text{frozen}} + 2$. This first-layer cancellation leaves the entry layer of the adapted block unprotected against layer-wise representation-space noise, potentially propagating fluctuations downstream.
+
+To activate spatial smoothing at the first adapted layer, we investigate and compare three boundary conditions:
+\begin{enumerate}
+    \item \textbf{Uniformly-Buffered Spatial Boundary:} We initialize the virtual boundary state to a constant uniform prior: $\boldsymbol{\alpha}^{(L_{\text{frozen}})}(t) = \mathbf{u} = [1/K, \dots, 1/K]^T$. This successfully preserves the spatial momentum coefficient:
+    \begin{align}
+        \alpha_k^{(L_{\text{frozen}}+1)}(t) &= \beta_{\text{depth}} \frac{1}{K} + \beta_{\text{temp}, t} \alpha_k^{(L_{\text{frozen}}+1)}(t-1) \nonumber \\
+        &\quad + \left(1 - \beta_{\text{depth}} - \beta_{\text{temp}, t}\right) w_k^{(L_{\text{frozen}}+1)}(t)
+    \end{align}
+    However, because uniform merging has low task representation accuracy ($\approx 31.51\%$ to $36.31\%$), pulling the entry-layer weights toward the uniform prior introduces a persistent \emph{accuracy drag} which regularizes the system toward task-agnostic parameter blending and degrades performance.
+    
+    \item \textbf{Coordinate-Prior Spatial Boundary (Our Default):} We define the virtual boundary state using the early task-coordinate representation vector $\mathbf{e}_t$ (computed from early frozen layer $L_{\text{frozen}}$ features) normalized to the probability simplex, incorporating an explicit stability constant $\epsilon = 1\times 10^{-9}$ in the denominator to avoid division-by-zero in the extreme case where all task similarities are clipped:
+    \begin{equation}
+        \boldsymbol{\alpha}^{(L_{\text{frozen}})}(t) = \mathbf{w}^{\text{coord}}(t) = \frac{\mathbf{e}_t}{\sum_{j=1}^K e_{t,j} + \epsilon}
+    \end{equation}
+    Because $\mathbf{w}^{\text{coord}}(t)$ is computed from early frozen layers, it differs from the raw routing weight of the first adapted layer ($\mathbf{w}^{\text{coord}}(t) \ne \mathbf{w}^{(L_{\text{frozen}}+1)}(t)$), thereby preserving the active spatial coefficient $\beta_{\text{depth}}$ in Equation~\ref{eq:2d_stem_recurrence}. Since $\mathbf{w}^{\text{coord}}(t)$ is an informative, task-specific probability vector, it eliminates first-layer cancellation and enables active spatial smoothing with zero accuracy drag.
+\end{enumerate}
+
+Our empirical sandbox simulations confirm this fundamental physical and mathematical trade-off. Transitioning from our default Coordinate-Prior boundary to the Uniformly-Buffered boundary on Overlapping Homogeneous streams degrades ensembling accuracy from \textbf{95.00\%} down to \textbf{94.89\%}, and increases routing jitter from \textbf{0.0068} to \textbf{0.0074}. Under Orthogonal Homogeneous streams, accuracy drops from \textbf{95.02\%} to \textbf{94.90\%}, and jitter rises from \textbf{0.0070} to \textbf{0.0077}. This confirms that the Coordinate-Prior boundary is the optimal physical boundary, enabling robust, active spatial smoothing starting from the very first adapted layer.
+
+\subsection{Adaptive Temporal Gating (ATG) for Inertia Suppression}
+While propagating sequential state over serving steps provides powerful temporal smoothing that absorbs high-frequency stream-level noise, it also introduces \emph{inertial drag} (or transition lag). When the incoming stream abruptly switches to a new task, a constant temporal momentum coefficient ($\beta_{\text{temp}, t} = \beta_{\text{temp}, 0}$) forces the router to continue routing to the previous task for several steps, severely degrading joint serving accuracy.
+
+To solve this transition lag without the heavy, parameter-rich optimization loops of prior work, we propose \textbf{Adaptive Temporal Gating} (ATG). Conceptually, the idea of using stream-level similarity to dynamically scale sequence-level temporal momentum is a zero-shot, training-free adaptation of the \emph{Adaptive Online Kinetics} framework introduced in PAC-Kinetics~\cite{pac_kinetics}. While PAC-Kinetics uses similarity to scale down learned state-transition matrices, we adapt this intuition to a parameter-free, bilinear 2D moving average. 
+
+In our framework, ATG detects task transitions on-the-fly by measuring stream homogeneity at the frozen layer $L_{\text{frozen}}$ of the backbone. Specifically, we compute the task-coordinate representation vector $\mathbf{e}_t$ at layer $L_{\text{frozen}}$ as the cosine similarities of the activation $h^{(L_{\text{frozen}})}(t)$ to the early centroids $\mu_k^{(L_{\text{frozen}})}$:
+\begin{equation}
+    \mathbf{e}_t = \left[ \max\left(0, S\left(h^{(L_{\text{frozen}})}(t), \mu_1^{(L_{\text{frozen}})}\right)\right), \dots, \max\left(0, S\left(h^{(L_{\text{frozen}})}(t), \mu_K^{(L_{\text{frozen}})}\right)\right) \right]^T
+\end{equation}
+We then compute the local stream-level similarity $Sim_t$ as the cosine similarity between consecutive representation vectors:
+\begin{equation}
+    Sim_t = \frac{\mathbf{e}_t^T \mathbf{e}_{t-1}}{\|\mathbf{e}_t\|_2 \|\mathbf{e}_{t-1}\|_2 + \epsilon} \in [0, 1]
+\end{equation}
+where $\epsilon = 1\times 10^{-9}$ is a stability constant. When consecutive samples belong to the same task block, their representation vectors are highly aligned, yielding $Sim_t \approx 1$. Conversely, during an abrupt task transition, the sudden shift in representation space results in a low similarity ($Sim_t \approx 0$).
+
+We note that in extremely fine-grained multi-task serving domains where early frozen activations exhibit high representation overlaps, direct centroid cosine similarity may not yield sufficient semantic separability to construct high-quality coordinate vectors. In Appendix~\ref{sec:first_layer_analysis}, we develop a lightweight, 2-layer MLP coordinate-prior mapper extension that trains in seconds on our tiny calibration split to guarantee robust task separability even under highly fine-grained boundaries.
+
+\subsubsection{Power-Law Sharpening (ATG-PL) for Bias Resolution}
+While a direct linear gating ($\beta_{\text{temp}, t} = \beta_{\text{temp}, 0} \cdot Sim_t$) is intuitive, it is subject to a fundamental mathematical limitation under severe representation noise or high task manifold overlaps. 
+
+Because the coordinate representations $\mathbf{e}_t$ are computed from non-negative cosine similarities or Softmax outputs, they are strictly non-negative: $\mathbf{e}_t \in \mathbb{R}^K_{\ge 0}$. In $K$-dimensional space, the cosine similarity between any two strictly non-negative vectors is strictly bounded below. Specifically, if task representation manifolds overlap (simulating severe inter-task interference), adjacent task signatures will share active coordinate dimensions. Consequently, during an abrupt task transition, the representation vectors $\mathbf{e}_t$ and $\mathbf{e}_{t-1}$ will never be orthogonal, forcing the transition similarity to remain biased significantly above zero:
+\begin{equation}
+    Sim_{\text{switch}} = \frac{\mathbf{e}_t^T \mathbf{e}_{t-1}}{\|\mathbf{e}_t\|_2 \|\mathbf{e}_{t-1}\|_2} > 0
+\end{equation}
+Under our Overlapping Manifolds layout, $Sim_t$ during a task transition can remain as high as $0.25$ or more. Under linear similarity scaling, a substantial fraction of sequence history continues to propagate across the switch: $\beta_{\text{temp}, t} = 0.25 \beta_{\text{temp}, 0} > 0$. This residual momentum acts as an inertia penalty, creating a minor transition lag under rapid task switches.
+
+To resolve this upward bias, we propose \textbf{Power-Law Gating (ATG-PL)} by introducing a power-law exponent $\gamma \ge 1$:
+\begin{equation}
+    \beta_{\text{temp}, t} = \beta_{\text{temp}, 0} \cdot \left(Sim_t\right)^\gamma
+\end{equation}
+By setting $\gamma \ge 2$ (specifically, we set $\gamma = 3$ in our default configuration), we mathematically sharpen the transition response. If the transition similarity is $Sim_{\text{switch}} = 0.25$, then a cubic power law collapses the temporal momentum to $(0.25)^3 = 0.0156$, representing a complete elimination of the residual temporal memory ($\beta_{\text{temp}, t} \approx 0$). This resets the temporal history and allows the router to switch tasks instantly, eliminating transition lag. 
+
+Symmetrically, on stable task blocks where similarity is high (e.g., $Sim_t = 0.95$), the cubic momentum remains strong: $(0.95)^3 = 0.857$, preserving the powerful temporal smoothing and noise absorption needed to suppress routing jitter. We analyze this as a highly elegant, parameter-efficient resolution of the classic \emph{bias-variance / smoothing-responsiveness trade-off}, achieving near-oracle stability on block-stable streams and instant task tracking on chaotic switching streams.
+
+At the very first serving step ($t=1$), there is no history, so we set:
+\begin{equation}
+    \beta_{\text{temp}, 1} = 0
+\end{equation}
+
+To guarantee robust scalability to extremely large expert pools (e.g., $K \ge 50$ tasks) where cumulative background overlaps can cause the transition similarity noise floor to rise, we extend our gating mechanism with \textbf{Top-$k$ Coordinate Masking}. This sparse gating extension sparsifies the task-coordinate space on-the-fly, completely neutralizing cumulative overlaps and ensuring $O(1)$ scaling complexity. We present its full formal mathematical derivation and scaling analysis in Appendix~\ref{sec:scalability_analysis}.
+
+\subsection{Minimalist Complexity and Overhead Analysis}
+In Table~\ref{tab:overhead}, we compare the theoretical serving overhead of 2D-STEM against state-of-the-art stateful serving frameworks. 2D-STEM requires zero extra trainable parameters, zero online backpropagation, and avoids costly continuous ODE integration. By consolidating spatio-temporal state into a single-line bilinear update, 2D-STEM achieves optimal efficiency suited for low-power edge devices.
+
+\begin{table}[h]
+\caption{Serving complexity and parameter overhead comparison.}
+\label{tab:overhead}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\begin{sc}
+\begin{tabular}{lcccc}
+\toprule
+Method & Trainable Params & Online Backprop & Simplex Projection & Computational Complexity \\
+\midrule
+SABLE & 0 & No & Softmax & $O(K \cdot L)$ \\
+Momentum-Merge & 0 & No & Softmax & $O(K \cdot L)$ \\
+PAC-Kinetics & $O(K^2)$ & Yes (online) & Euclidean Projection & $O(K^2 \cdot L)$ \\
+ChemMerge & 0 & No & Re-normalization & $O(K \cdot L \cdot N_{\text{ODE}})$ \\
+\textbf{2D-STEM (Ours)} & \textbf{0} & \textbf{No} & \textbf{None (Analytical)} & \textbf{$O(K \cdot L)$} \\
+\bottomrule
+\end{tabular}
+\end{sc}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\subsection{Physical Deployment and Hardware Integration}
+To bridge the gap between our controlled representation-space simulation study and real-world edge hardware, we outline a physical deployment roadmap for 2D-STEM on actual hardware (such as NVIDIA Jetson, Raspberry Pi, or Google Edge TPU).
+
+First, the offline centroid calibration process (Eq.~\ref{eq:layerwise_centroids}) is performed once on a host machine using $N_{\text{cal}} = 64$ representative inputs per task. The extracted centroids $\mu_k^{(l)}$ are compiled as static constant matrices. 
+
+During inference on the target edge device, the serving pipeline executes as follows:
+\begin{enumerate}
+    \item \textbf{Feature Extraction:} The input sample $X_t$ is propagated through the frozen backbone layers $1 \dots L_{\text{frozen}}$.
+    \item \textbf{Transition Detection (ATG):} The activation $h^{(L_{\text{frozen}})}(t)$ is used to compute the early similarity vector $\mathbf{e}_t$. The stream similarity $Sim_t$ is updated, and the temporal momentum $\beta_{\text{temp}, t}$ is scaled via a single floating-point multiplication.
+    \item \textbf{Bilinear Routing Updates:} At each adapted layer $l$, the current activation $h^{(l-1)}(t)$ is compared to the static centroids $\mu_k^{(l)}$ via cosine similarity. The 2D-STEM recurrence updates the ensembling coefficients $\alpha_k^{(l)}(t)$ via simple vector-scalar operations.
+    \item \textbf{Vectorized Activation Blending:} Instead of sequentially executing all $K$ experts (which would incur massive latency), modern deep learning runtimes (e.g., PyTorch Functional APIs under \texttt{torch.vmap} or custom Triton kernels) compile the expert weights into a single batched tensor and compute the blended adapter outputs in a single vectorized GPU/NPU forward pass.
+\end{enumerate}
+Because the 2D-STEM recurrence requires only $O(K)$ floating-point operations per layer (where $K=4$ is extremely small), its computational overhead is mathematically negligible compared to the millisecond-scale forward pass of the backbone network, ensuring immediate compatibility with low-latency interactive streaming.
+
+\subsection{Robustness to Covariate Shift and OOD Activations}
+Because 2D-STEM relies on pre-computed offline centroids $\mu_k^{(l)}$ to measure task similarity, a key consideration for practical deployment is its robustness under covariate shifts or out-of-distribution (OOD) activations. In real-world environments, the input stream may suffer from temporal noise, sensor degradation, or novel tasks not present in the pre-defined expert pool $K$.
+
+Under standard covariate shifts (e.g., style drift, lighting changes, or noise on the input), the representational magnitude in deep layers might fluctuate, but the underlying angular orientation of activations remains relatively aligned with the pre-computed centroids. By employing cosine similarity $S(h, \mu)$ as our similarity metric (Eq.~\ref{eq:raw_routing_weights}), 2D-STEM is naturally invariant to scaling and amplitude shifts in the activation space. Furthermore, the spatio-temporal smoothing acts as a robust low-pass filter, averaging out individual sample-wise OOD fluctuations and preventing the router from prematurely triggering task-switches.
+
+For severe, persistent OOD scenarios (such as an entirely new task), we can extend the minimalist framework by introducing an explicit \emph{rejection or fallback threshold}. Specifically, if the maximum cosine similarity to all known centroids falls below a safety threshold $\delta_{\text{OOD}}$, the system can dynamically route to a uniform blending configuration ($\alpha_k = 1/K$) or flag a system fallback. This elegant fallback policy preserves the parameter-free nature of 2D-STEM while ensuring safe operation under unexpected streaming environments.
+

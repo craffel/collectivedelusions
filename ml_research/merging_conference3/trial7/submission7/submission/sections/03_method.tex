@@ -1,0 +1,190 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the mathematical formulation and architectural details of \textbf{ELATI} (\textbf{E}arly-\textbf{L}ayer \textbf{A}daptive \textbf{T}ask \textbf{I}dentification).
+The main goal of ELATI is to execute high-fidelity, dynamic multi-task weight-merging in a single, cohesive, forward-propagation pass, completely bypassing the redundant throw-away computation of prior penultimate-layer routing systems.
+
+\subsection{Theoretically Modeled Target Architecture}
+Let the shared base network backbone have a total of $L$ layers. In our target theoretical modeling and experimental evaluation, we consider a hierarchical backbone with $L = 14$ sequential layers, an intermediate hidden representation dimension of $D = 192$, feedforward inner dimension $D_{\text{ff}} = 768$, and multi-head self-attention with $H = 3$ attention heads.
+To ensure absolute scientific honesty and clarity, we note that in our experimental validation (Section \ref{sec:experiments}), we evaluate these sequential multi-layer behaviors directly using a high-fidelity \textbf{Hierarchical 14-Layer Sandbox} implemented in PyTorch, which mimics deep residual-like features and sequential parameter transformations with standard non-linear activations (GeLU) and skip connections.
+Let $\mathcal{T} = \{1, 2, \dots, K\}$ represent a set of $K$ distinct target expert tasks. For each task $k \in \mathcal{T}$, we model a parameter-efficient adapter (e.g., LoRA \cite{hu21lora}). Let $V_k^{(l)}$ denote the parameter update (LoRA weights) for task $k$ at layer $l \in \{1, \dots, L\}$.
+The base model weight at layer $l$ is denoted as $W_{\text{base}}^{(l)}$.
+Therefore, if we were to serve task $k$ in isolation, the specialized weight at layer $l$ would be:
+\begin{equation}
+    W_k^{(l)} = W_{\text{base}}^{(l)} + V_k^{(l)}
+\end{equation}
+
+Under a physical serving setup, all $K$ task adapters are loaded concurrently in host storage/VRAM.
+The system allocates a single, dedicated scratch buffer in VRAM to perform sequential on-the-fly materialization, constraining the active peak memory footprint to a strict maximum of $\approx 1.04\times$ the base model size.
+
+We emphasize that our experimental validation evaluates this routing and sequential downstream merging methodology through full physical multi-layer activation propagation, as detailed in Section \ref{sec:experiments}.
+
+\subsection{Early-Layer Representative Mapping (ELRM)}
+Because ELATI routes activations at an early layer $l_{\text{route}} \ll L$ (specifically, $l_{\text{route}} = 2$), we cannot rely on final task-specific classification heads for projection, as the representations have not yet reached the semantic classifier.
+To enable training-free routing, we introduce \textbf{Early-Layer Representative Mapping (ELRM)}.
+
+Prior to deployment, we perform unsupervised offline profiling on a tiny calibration split $X_{\text{cal}} = \bigcup_{k=1}^K X_{\text{cal}}^{(k)}$, containing only $|X_{\text{cal}}^{(k)}| = 16$ samples per task (totaling 64 samples).
+For each task expert $k \in \mathcal{T}$, we propagate its calibration samples $X_{\text{cal}}^{(k)}$ through the first $l_{\text{route}}$ layers of the shared base model backbone and compute the mean activation centroid:
+\begin{equation}
+    W'_{k} = \frac{1}{|X_{\text{cal}}^{(k)}|} \sum_{x \in X_{\text{cal}}^{(k)}} \Psi\left(\text{Backbone}_{1 \dots l_{\text{route}}}(x)\right) \quad \in \mathbb{R}^D
+\end{equation}
+These early expert centroids $\{W'_k\}_{k=1}^K$ capture the characteristic manifold centers of each task in early representation space. They are stored as frozen, lightweight $D$-dimensional projection keys, requiring zero trainable parameters.
+
+While computing task centroids $\{W'_k\}$ offline using a fixed calibration split is exceptionally fast and data-efficient, this static approach can be sensitive to severe, unforeseen domain shifts at deployment time. To enhance the dynamic generalizability of early routing, practitioners can employ a \textbf{Hybrid Online Centroid Adaptation} mechanism. In this framework, the static offline centroids $W'_k$ act as a robust prior, and are continuously updated on-the-fly using incoming stream samples. Specifically, when a test sample's activation $z_b^{(l_{\text{route}})}$ is routed to task $k$ with exceptionally high confidence (e.g., routing coefficient $\alpha_{k, b} \ge 1 - \gamma$ where $\gamma = 0.05$ is a confidence tolerance), its representation is integrated into a running online centroid $\hat{W}'_k$:
+\begin{equation}
+    \hat{W}'_k \leftarrow (1 - \nu) \hat{W}'_k + \nu \Psi(z_b^{(l_{\text{route}})})
+\end{equation}
+where $\nu \in (0, 1)$ is an online learning rate (e.g., $\nu = 0.01$). This hybrid approach combines the zero-training advantage of offline calibration with the adaptive wild-generalizability of online streaming learning, ensuring absolute alignment even under non-stationary task shifts.
+
+\paragraph{Confirmation Bias and Centroid Anchoring Mitigations}
+A fundamental challenge in self-trained online adaptation is the risk of \emph{confirmation bias}. Because the online updates are guided by the model's own routing confidence ($\alpha_{k, b} \ge 1 - \gamma$), any high-confidence misrouting of an out-of-distribution (OOD) sample or noisy input will mistakenly integrate a corrupted activation vector into the target task centroid $\hat{W}'_k$. Over time, this recursive self-contamination causes the centroids to drift arbitrarily far from their true semantic subspaces, eventually resulting in complete routing collapse. To mitigate confirmation bias under severe stream noise or non-stationary drift, we propose three key systems stabilizers:
+\begin{enumerate}
+    \item \textbf{Centroid Anchoring:} We anchor the running online centroid to its clean, offline-profile prior $W'_k$ (computed on the trusted calibration split). We formulate an anchored update rule:
+    \begin{equation}
+        \hat{W}'_k \leftarrow (1 - \nu - \lambda_{\text{anchor}}) \hat{W}'_k + \nu \Psi(z_b^{(l_{\text{route}})}) + \lambda_{\text{anchor}} W'_k
+    \end{equation}
+    where $\lambda_{\text{anchor}} \in (0, 1)$ is an anchoring coefficient (e.g., $\lambda_{\text{anchor}} = 0.05$). This acts as an elastic spatial spring that forces the online key to remain structurally bounded near the trusted manifold center, allowing local tracking of domain drift while preventing arbitrary, noise-induced key drift.
+    \item \textbf{Dynamic Margin Filtering (Soft-Updating):} Instead of a flat threshold $\alpha_{k, b} \ge 1 - \gamma$, centroid updates can be gated by a dynamic margin constraint $\alpha_{k,b} - \max_{j \neq k} \alpha_{j,b} \ge \delta_{\text{margin}}$, or by computing the Mahalanobis distance of the sample against the active centroid, rejecting outliers whose distance exceeds a statistical significance threshold.
+    \item \textbf{Periodic Recalibration:} For infinite-horizon deployment streams, the serving engine can schedule periodic recalibration sweeps. During low-load cycles, the online centroids are soft-updated or reset back to their anchored priors using a compact queue of cached, verified multi-task samples, neutralizing any accumulated representational drift.
+\end{enumerate}
+
+\subsubsection{Dimensionality Reduction and Sequence Pooling for 3D Tensors}
+\label{subsec:pooling_comparison}
+In actual pre-trained Transformer architectures (e.g., Vision Transformers or large autoregressive language models), the intermediate activation at layer $l_{\text{route}}$ is represented as a three-dimensional sequence tensor $Z \in \mathbb{R}^{B \times S \times D}$, where $B$ is the batch size, $S$ is the sequence/token length, and $D$ is the hidden dimension. To project these representations against our $D$-dimensional centroids, we must apply a sequence pooling operator $\Psi: \mathbb{R}^{S \times D} \to \mathbb{R}^D$ to map each sample's sequence of token activations to a flat, task-informative feature vector. We analyze the mathematical and systems properties of three primary pooling operators:
+
+\paragraph{1. Global Mean-Pooling ($\Psi_{\text{mean}}$):}
+Global mean-pooling computes the average activation across all sequence positions:
+\begin{equation}
+    \Psi_{\text{mean}}(Z_b) = \frac{1}{S} \sum_{s=1}^S Z_{b, s, \cdot} \quad \in \mathbb{R}^D
+\end{equation}
+Statistically, if token activations are modeled as a task-specific signal perturbed by independent, zero-mean token-wise noise, $Z_{b, s, \cdot} = P_{k} + \epsilon_s$ where $\epsilon_s \sim \mathcal{N}(0, \sigma^2 I)$, mean-pooling acts as a strong spatial smoothing filter. The expected value $\mathbb{E}[\Psi_{\text{mean}}(Z_b)] = P_k$ remains unbiased, while the noise variance is suppressed by a factor of $S$: $\text{Var}(\Psi_{\text{mean}}(Z_b)) = \frac{\sigma^2}{S} I$.
+This makes global mean-pooling exceptionally robust to local token-level noise or punctuation variance. However, if the task-specific signal is highly localized (e.g., concentrated in a single prompt keyword), mean-pooling can dilute the signal-to-noise ratio in long sequences.
+
+\paragraph{2. Class Token Extraction ($\Psi_{\text{cls}}$):}
+For encoder models (e.g., ViT, BERT), a special class token ($[\text{CLS}]$) is prepended to the input sequence at index $s = 0$. The representation is extracted directly:
+\begin{equation}
+    \Psi_{\text{cls}}(Z_b) = Z_{b, 0, \cdot} \quad \in \mathbb{R}^D
+\end{equation}
+Because self-attention layers aggregate semantic task context into the $[\text{CLS}]$ token, $\Psi_{\text{cls}}(Z_b)$ contains a highly synthesized semantic representation of the input. However, at early layers (e.g., $l_{\text{route}} \le 2$), the attention heads have not yet fully propagated global context, leaving the $[\text{CLS}]$ token vulnerable to "attention sinks" or primitive local biases, which can increase the variance of routing coordinates.
+
+\paragraph{3. Causal/Final Token Selection ($\Psi_{\text{final}}$):}
+For autoregressive decoder-only LLMs, we select the activation of the final generated or prompt token:
+\begin{equation}
+    \Psi_{\text{final}}(Z_b) = Z_{b, S, \cdot} \quad \in \mathbb{R}^D
+\end{equation}
+While highly compatible with causal masking, the final token representation at early layers can be extremely noisy, highly sensitive to trailing punctuation (e.g., periods or newlines), and subject to high local variance.
+
+\paragraph{4. Attention-Weighted Sequence Pooling ($\Psi_{\text{attn}}$):}
+To suppress early-layer token-wise noise without discarding sequence context, we can define an attention-weighted pooling operator:
+\begin{equation}
+    \Psi_{\text{attn}}(Z_b) = \sum_{s=1}^S \beta_{b, s} Z_{b, s, \cdot} \quad \in \mathbb{R}^D
+\end{equation}
+where the attention weights $\beta_{b, s}$ are computed dynamically using a lightweight, unoptimized query vector $q \in \mathbb{R}^D$ (e.g., set to the average representation of the calibration splits):
+\begin{equation}
+    \beta_{b, s} = \frac{\exp\left( \frac{Z_{b, s, \cdot} q^T}{\sqrt{D}} \right)}{\sum_{j=1}^S \exp\left( \frac{Z_{b, j, \cdot} q^T}{\sqrt{D}} \right)}
+\end{equation}
+By computing similarity against a task-informative query vector, $\Psi_{\text{attn}}$ dynamically highlights highly diagnostic semantic tokens (such as task-specific keywords or visual object patches) and down-weights noisy non-semantic tokens (such as punctuation, padding, or high-norm attention sinks at sequence beginnings). This provides an exceptionally robust, causally-compliant, and training-free method to extract early-layer task representations under severe sequence noise.
+
+To guarantee absolute scientific honesty, we explicitly clarify that while these pooling operators are of paramount importance for physical sequence-based serving, they are theoretical extensions; in our high-fidelity Sandbox evaluation (Section \ref{sec:experiments}), activations are processed directly in their flat, representational vector space.
+
+\subsection{One-Pass Subspace Routing (OPSR)}
+During online serving, the model ingests a shuffled, heterogeneous batch of $B$ samples $X = \{x_1, \dots, x_B\}$.
+The inference pipeline proceeds in three main stages:
+
+\paragraph{Stage 1: Early-Layer Propagations}
+The heterogeneous batch $X$ is propagated through the first $l_{\text{route}}$ shared layers of the base model backbone to extract the intermediate representation matrix $Z^{(l_{\text{route}})} \in \mathbb{R}^{B \times D}$:
+\begin{equation}
+    z_b^{(l_{\text{route}})} = \text{Backbone}_{1 \dots l_{\text{route}}}(x_b), \quad \forall b \in \{1, \dots, B\}
+\end{equation}
+This first-stage propagation is executed exactly once for the entire batch.
+
+\paragraph{Stage 2: Unsupervised Cosine-Similarity Projection}
+For each sample's intermediate activation $z_b^{(l_{\text{route}})}$, we calculate its cosine similarity against the $K$ pre-computed task centroids $\{W'_k\}$ to extract task-space coordinates:
+\begin{equation}
+    u_{k, b} = \frac{W'_{k} \cdot z_b^{(l_{\text{route}})}}{\|W'_{k}\|_2 \|z_b^{(l_{\text{route}})}\|_2}, \quad \forall k \in \mathcal{T}
+\end{equation}
+This projects the high-dimensional hidden activations into a highly informative $K$-dimensional task coordinate vector $u_b = [u_{1,b}, \dots, u_{K,b}]^T \in \mathbb{R}^K$.
+Crucially, projecting against $K$ early centroids requires only $O(B \cdot K \cdot D)$ scalar operations, whereas penultimate-layer PFSR projects against all rows of the expert classification heads ($K \times C$ rows, where $C$ is the number of task classes), requiring $O(B \cdot K \cdot C \cdot D)$ operations.
+By bypassing class-level projection, ELATI achieves a substantial theoretical and empirical complexity reduction of $\approx C\times$ (where $C = 10$ in our simulated visual classification tasks).
+
+\paragraph{Stage 3: Temperature-Scaled Routing}
+To map task coordinates into soft interpolation coefficients, we apply a temperature-scaled Softmax operator:
+\begin{equation}
+    \alpha_{k, b} = \frac{\exp(u_{k, b} / \tau)}{\sum_{j=1}^K \exp(u_{j, b} / \tau)}
+\end{equation}
+where $\tau > 0$ is a pre-defined routing temperature parameter controlling the entropy of the routing distribution.
+
+\subsection{Downstream-Only Micro-Batch Homogenization (DO-MBH)}
+Under heterogeneous batching, sample-specific dynamic weight interpolation would require materializing distinct weights for every single sample, which is computationally prohibitive.
+To address this, we introduce \textbf{Downstream-Only Micro-Batch Homogenization (DO-MBH)}.
+
+First, we assign each sample in the batch to its dominant expert task:
+\begin{equation}
+    k_b^* = \arg\max_{k \in \mathcal{T}} u_{k, b}
+\end{equation}
+We then dynamically partition the batch indices $\{1, \dots, B\}$ into $G \le K$ homogeneous micro-batches:
+\begin{equation}
+    I^{(g)} = \{b \in \{1, \dots, B\} \mid k_b^* = g\}
+\end{equation}
+For each active micro-batch $g$ containing indices $I^{(g)}$, we compute the batch-average routing coefficient vector $\bar{\alpha}^{(g)} = [\bar{\alpha}_1^{(g)}, \dots, \bar{\alpha}_K^{(g)}]^T$:
+\begin{equation}
+    \bar{\alpha}_k^{(g)} = \frac{1}{|I^{(g)}|} \sum_{b \in I^{(g)}} \alpha_{k, b}
+\end{equation}
+
+For each active group $g$, we dynamically interpolate and materialize the downstream parameters for layers $l > l_{\text{route}}$:
+\begin{equation}
+    W_{\text{merged}}^{(l), (g)} = W_{\text{base}}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k^{(g)} V_k^{(l)}, \quad \forall l \in \{l_{\text{route}}+1, \dots, L\}
+\end{equation}
+These interpolated weights are materialized into the active scratch weight buffer.
+Next, we propagate the grouped activations $z_{I^{(g)}}^{(l_{\text{route}})}$ through the merged downstream layers:
+\begin{equation}
+    Y^{(g)} = \text{Backbone}_{l_{\text{route}}+1 \dots L}\left( z_{I^{(g)}}^{(l_{\text{route}})}; \{W_{\text{merged}}^{(l), (g)}\}_{l=l_{\text{route}}+1}^L \right)
+\end{equation}
+Note that the early layers $l \le l_{\text{route}}$ are completely bypassed during this step, avoiding any redundant forward computation on early layers.
+
+\paragraph{Output Scatter Re-assembly}
+Finally, we instantiate an output tensor $Y$ of size $B$ and scatter the micro-batch prediction outputs $Y^{(g)}$ back to their original index positions:
+\begin{equation}
+    Y[I^{(g)}] = Y^{(g)}, \quad \forall g \in \{1, \dots, G\}
+\end{equation}
+This ensures that the output is returned in its correct original sequence, providing a transparent, low-latency, and zero-overhead serving pipeline for multi-tenant applications.
+The complete online execution process is summarized in Algorithm~\ref{alg:elati}.
+
+\begin{algorithm}[tb]
+\caption{ELATI: Online Inference Pipeline}
+\label{alg:elati}
+\begin{algorithmic}[1]
+\STATE {\bf Input:} Heterogeneous batch $X = \{x_1, \dots, x_B\}$, early-layer centroids $\{W'_k\}_{k=1}^K$, base model weights $\{W_{\text{base}}^{(l)}\}_{l=1}^L$, adapter weights $\{V_k^{(l)}\}$, routing index $l_{\text{route}}$, temperature $\tau$.
+\STATE {\bf Output:} Prediction outputs $Y$.
+\STATE // {\bf Step 1: Early-Layer Forward Pass}
+\STATE $Z^{(l_{\text{route}})} \leftarrow \text{Backbone}_{1 \dots l_{\text{route}}}(X; \{W_{\text{base}}^{(l)}\}_{l=1}^{l_{\text{route}}})$
+\STATE // {\bf Step 2: Cosine Similarity Projection \& Gating}
+\FOR{$b = 1$ \textbf{to} $B$}
+    \FOR{$k = 1$ \textbf{to} $K$}
+        \STATE $u_{k, b} \leftarrow \frac{W'_{k} \cdot z_b^{(l_{\text{route}})}}{\|W'_{k}\|_2 \|z_b^{(l_{\text{route}})}\|_2}$
+    \ENDFOR
+    \FOR{$k = 1$ \textbf{to} $K$}
+        \STATE $\alpha_{k, b} \leftarrow \frac{\exp(u_{k, b} / \tau)}{\sum_{j=1}^K \exp(u_{j, b} / \tau)}$
+    \ENDFOR
+    \STATE $k_b^* \leftarrow \arg\max_{k \in \{1, \dots, K\}} u_{k, b}$
+\ENDFOR
+\STATE // {\bf Step 3: Stream Partitioning \& Grouping}
+\STATE Initialize $G$ empty index groups $I^{(1)}, \dots, I^{(G)}$
+\FOR{$b = 1$ \textbf{to} $B$}
+    \STATE Append $b$ to $I^{(k_b^*)}$
+\ENDFOR
+\STATE Initialize output tensor $Y$ of size $B$
+\STATE // {\bf Step 4: Downstream Merge \& Forward Dispatch}
+\FOR{each active group $g \in \{1, \dots, G\}$ with non-empty $I^{(g)}$}
+    \STATE $\bar{\alpha}^{(g)} \leftarrow \text{Mean of } \{\alpha_{b}\}_{b \in I^{(g)}}$
+    \STATE // {\it Materialize merged downstream weights}
+    \FOR{$l = l_{\text{route}}+1$ \textbf{to} $L$}
+        \STATE $W_{\text{merged}}^{(l), (g)} \leftarrow W_{\text{base}}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k^{(g)} V_k^{(l)}$
+    \ENDFOR
+    \STATE $Y^{(g)} \leftarrow \text{Backbone}_{l_{\text{route}}+1 \dots L}(Z^{(l_{\text{route}})}[I^{(g)}]; \{W_{\text{merged}}^{(l), (g)}\})$
+    \STATE // {\it Scatter results back to output tensor}
+    \STATE $Y[I^{(g)}] \leftarrow Y^{(g)}$
+\ENDFOR
+\STATE \textbf{return} $Y$
+\end{algorithmic}
+\end{algorithm}

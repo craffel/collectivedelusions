@@ -1,0 +1,21 @@
+# 2. Novelty and Delta Assessment
+
+## Key Novel Aspects
+The paper introduces several highly novel insights and methodological contributions to the model-merging literature:
+1. **The "Task Suite Bias" Critique:** Prior works (like AdaMerging and PolyMerge) claim state-of-the-art multi-task performance based almost exclusively on a single combination of four visual datasets (MNIST, FashionMNIST, CIFAR-10, SVHN). The systematic decomposition and multi-suite analysis of these tasks is a novel, critical audit that exposes how this single suite masks major failures.
+2. **Identification and Formulation of "Transductive Overfitting":** The paper formalizes how unconstrained online Test-Time Adaptation (TTA) overfits to stream-level noise. By introducing a single, correlated stream noise offset once per adaptation session, the authors simulate a realistic local batch bias, proving mathematically and empirically that online entropy minimization over-parameters on local noise.
+3. **The "Privilege Trap" and Multi-Head Routing:** The paper exposes a hidden, unrealistic assumption in prior online TTA papers: that sequential single-task streams are presented at test-time. They highlight that in realistic interleaved streams, online methods either suffer from "joint entropy collapse" or must rely on oracle task-routing labels (Privileged TTA) to backpropagate gradients correctly.
+4. **Offline Few-Shot Validation Tuning (OFS-Tune) as an Analytical Filter:** While offline calibration is a simple concept, the systematic formulation of low-degree polynomial constraints ($d=1, d=2$) as a low-pass filter that rejects validation sampling noise and transductive shift is highly original.
+
+## Delta from Prior Work
+- **From Online TTA (AdaMerging & PolyMerge):** Rather than blindly accepting the "no-data" premise of online TTA, this paper introduces a crucial paradigm shift: in physical engineering workflows, a tiny validation set ($M=10$ stratified samples) is almost always available. The delta is demonstrating that shifting parameter optimization from *online deployment* to an *offline pre-deployment calibration* completely eliminates test-time backpropagation latency, compute cost, and edge energy consumption.
+- **From Traditional Few-Shot Calibration:** The paper provides alternative localized trajectory formulations (such as piecewise linear splines with attention-MLP boundaries and block-wise parameter sharing) that allow developers to capture localized non-smooth sensitivity spikes while maintaining low optimization dimensionality. It also provides a robust Nelder-Mead solver configuration tailored for extremely low-dimensional trajectory search.
+
+## Characterization of Novelty: Significant and Practical
+The novelty in this work is **highly significant and of immense practical value**. 
+While some theoretical reviewers might view offline calibration as conceptually simple, from an engineering and deployment standpoint, this paper is a breath of fresh air. It exposes that online TTA—which appears elegant in academic simulations—is actually a massive liability in production because of:
+1. **Compute and Energy Overhead:** Online TTA requires running both forward and backward passes (with gradient computation) on the edge device during inference. This is a non-starter for low-power, resource-constrained edge systems.
+2. **The "Privilege Trap":** The need for oracle task-routing labels at test-time to direct gradients correctly defeats the unsupervised assumption of TTA.
+3. **Catastrophic Failure Modes:** In actual physical weight spaces where the unsupervised entropy surface is rugged and prone to degenerate shortcuts, online methods collapse catastrophically, sometimes performing worse than naive Uniform averaging.
+
+By demonstrating that a simple, highly regularized offline tuning step using just 10 samples per task completely resolves these three critical bottlenecks while matching or exceeding simulated performance, the paper provides a highly actionable and robust solution for real-world deployment. The novelty lies not in complex mathematical equations, but in a rigorous, reality-grounded audit that fundamentally shifts the practical design space of model merging.

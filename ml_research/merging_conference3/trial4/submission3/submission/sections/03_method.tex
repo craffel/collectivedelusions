@@ -1,0 +1,217 @@
+\section{Methodology}
+\label{sec:method}
+
+We now formulate the mathematical specifics of QLoRA adapter merging, deconstruct the mechanism of Re-Quantization Collapse (the ``Re-Quantization Silence''), and introduce our two proposed mitigations: Scale-Adaptive Weight Shifting (SAWS) and Quantization-Aware Adapter Coefficient Search (QA-ACS).
+
+\subsection{QLoRA Merging \& Naive Re-Quantization}
+Let $W_0 \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ denote the pre-trained weights of a base model layer. Under QLoRA \cite{Dettmers2023QLoRA}, $W_0$ is stored in a compressed $b$-bit quantized format $Q_b(W_0)$ (e.g., NF4 or INT4) to save memory. 
+Suppose we fine-tune $K$ independent task-specific low-rank (LoRA) experts in high-precision (e.g., FP16):
+\begin{equation}
+  \Delta W_k = A_k B_k, \quad A_k \in \mathbb{R}^{d_{\text{out}} \times r}, \, B_k \in \mathbb{R}^{r \times d_{\text{in}}}
+\end{equation}
+where $r \ll \min(d_{\text{out}}, d_{\text{in}})$ is the LoRA rank. 
+During model merging, we must dequantize the base model back to high-precision to enable weight-space summation:
+\begin{equation}
+  \tilde{W}_0 = \text{Dequantize}\left(Q_b(W_0)\right)
+\end{equation}
+The continuous merged weight matrix at layer $l$ under blending coefficients $\Lambda = \{\lambda_k^l\}_{k=1}^K$ is:
+\begin{equation}
+  W^l_{\text{merged}}(\Lambda) = \tilde{W}^l_0 + \sum_{k=1}^K \lambda^l_k (A^l_k B^l_k)
+\end{equation}
+To deploy the merged model back under low-bit memory constraints, the naive pipeline re-quantizes the fused weight matrix:
+\begin{equation}
+  W^l_{\text{re-quant}}(\Lambda) = Q_b\left(W^l_{\text{merged}}(\Lambda)\right)
+\end{equation}
+Under a uniform symmetric quantizer, the dynamic scale factor $s$ is computed as:
+\begin{equation}
+  s = \frac{\max\left(|W^l_{\text{merged}}(\Lambda)|\right)}{2^{b-1} - 1}
+\end{equation}
+The quantized discrete weights are obtained via:
+\begin{equation}
+  W_{\text{quant}} = \left[ \left\lfloor \frac{W^l_{\text{merged}}(\Lambda)}{s} \right\rceil \right]_{-2^{b-1}+1}^{2^{b-1}-1}
+\end{equation}
+and the dequantized weights used during inference are:
+\begin{equation}
+  \tilde{W}^l_{\text{final}}(\Lambda) = s \cdot W_{\text{quant}}
+\end{equation}
+
+\subsection{The Mechanism of Re-Quantization Collapse}
+The ``Re-Quantization Silence'' occurs due to a severe magnitude discrepancy. Typically, the dequantized base weight matrix has a standard deviation several orders of magnitude larger than that of the low-rank updates:
+\begin{equation}
+  \sigma(\tilde{W}_0) \gg \sigma\left(\sum_{k=1}^K \lambda_k A_k B_k\right)
+\end{equation}
+Consequently, the maximum magnitude $\max(|W^l_{\text{merged}}(\Lambda)|)$ is dominated entirely by the base weight. The resulting quantization step size $s$ is too large to resolve the tiny variations introduced by the adapter updates:
+\begin{equation}
+  \left| \frac{\sum_{k=1}^K \lambda^l_k A^l_k B^l_k}{s} \right| \ll 0.5
+\end{equation}
+Thus, when passed through the rounding operator $\lfloor \cdot \rceil$, the task-specific updates are rounded to zero. This silently strips the model of its adapted multi-task capabilities, reducing the deployed model back to the unadapted base performance (or worse, introducing quantization noise that actively degrades base performance).
+
+\subsubsection{The Confounding Role of Double Quantization}
+In addition to the magnitude-based silencing mechanism, we must identify a significant confounding variable inherent in standard QLoRA merging audits: \textbf{Double Quantization Noise}. In the standard QLoRA training pipeline, the pre-trained base model weights $W_0$ are initially quantized to 4-bit NormalFloat (NF4). NF4 is a symmetric quantization format by design, optimized for zero-mean, unit-variance normal distributions. During the subsequent merging and evaluation pipeline, these base weights are dequantized back to FP16, combined with the continuous adapter updates, and then \emph{re-quantized} to a different target format, such as 4-bit uniform symmetric (or asymmetric) INT4. 
+
+This transition from a symmetric, non-linear density-based grid (NF4) to a uniform linear grid (INT4, which can be symmetric or asymmetric) shifts the quantization bin boundaries. Because NF4 utilizes quantile-based spacing, it allocates extremely high resolution (denser bins) around zero where the pre-trained weights are highly concentrated, while uniform INT4 uses equal step sizes across the entire dynamic range. Transitioning between these formats shifts the bin boundaries and introduces a systematic directional bias: it selectively increases the discretization error of small-magnitude base weights near zero (the bulk of the parameters), while mapping outliers to coarser bins. This mismatch inflates the noise floor and causes systematic representation degradation in the base model, completely independent of the adapter weights.
+
+\begin{table}[h]
+\centering
+\caption{\textbf{Empirical Analysis of Double Quantization Noise on Base Weights.} We report the mean relative weight-space reconstruction error (Relative Frobenius error $\frac{\|W - \tilde{W}\|_F}{\|W\|_F}$) across the 12 attention $QKV$ base model layers for both \texttt{vit\_tiny} (5.7M parameters) and \texttt{vit\_base} (86M parameters). We compare direct target format quantization against double quantization format-shift (first quantizing the pristine weights to 4-bit NormalFloat (NF4), dequantizing, and then re-quantizing to the target format).}
+\label{tab:double_quantization_error}
+\vskip 0.1in
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+& \multicolumn{3}{c}{\textbf{\texttt{vit\_tiny} (5.7M parameters)}} & \multicolumn{3}{c}{\textbf{\texttt{vit\_base} (86M parameters)}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7}
+Target Quantization Configuration & Direct Error & Double Error & Absolute Increase & Direct Error & Double Error & Absolute Increase \\
+\midrule
+INT8 Symmetric Per-Channel & 0.745\% & 17.211\% & \textbf{+16.465\%} & 0.965\% & 30.395\% & \textbf{+29.429\%} \\
+INT4 Symmetric Per-Channel & 13.520\% & 20.502\% & \textbf{+6.982\%} & 17.170\% & 32.158\% & \textbf{+14.988\%} \\
+INT4 Asymmetric Per-Channel & 11.465\% & 19.876\% & \textbf{+8.410\%} & 14.583\% & 32.276\% & \textbf{+17.693\%} \\
+INT4 Symmetric Per-Tensor & 27.299\% & 35.079\% & \textbf{+7.779\%} & 51.005\% & 66.309\% & \textbf{+15.304\%} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+To provide concrete empirical proof of this phenomenon, we measured the relative reconstruction error of the 12 attention $QKV$ projection layers of our base model under both direct quantization and double quantization format-shift (NF4 $\to$ Target) for both \texttt{vit\_tiny} and \texttt{vit\_base}, where the relative Frobenius norm reconstruction error is defined as $\mathcal{E}_{\text{fro}}(W, \tilde{W}) = \frac{\|W - \tilde{W}\|_F}{\|W\|_F}$. As reported in Table~\ref{tab:double_quantization_error}, the format transition introduces a highly substantial representation error that worsens significantly as the backbone scales up:
+\begin{itemize}
+  \item For \textbf{INT8 Symmetric Per-Channel}, while the direct quantization error is practically negligible ($0.745\%$ for \texttt{vit\_tiny} and $0.965\%$ for \texttt{vit\_base}), the Double Quantization format transition error skyrockets to \textbf{$17.211\%$} and \textbf{$30.395\%$} respectively (representing massive absolute increases of \textbf{$16.465\%$} and \textbf{$29.429\%$}). This demonstrates that even when deploying in a highly precise 8-bit per-channel format, the pre-training format shift from NF4 to INT8 introduces severe, silent weight-space distortion completely independent of any adapter updates, and this degradation scales up as model dimension expands.
+  \item For \textbf{INT4 configurations}, the format shift increases the Relative Frobenius error by \textbf{$6.982\%$ to $8.410\%$} on \texttt{vit\_tiny}, and by \textbf{$14.988\%$ to $17.693\%$} on \texttt{vit\_base} (e.g., reaching \textbf{$32.158\%$} error under INT4 Per-Channel for \texttt{vit\_base}, compared to $17.170\%$ for direct quantization).
+\end{itemize}
+This empirical audit deconstructs and validates our theoretical claims: the target format itself degrades the base model's representation capabilities. It highlights the methodological necessity of isolating base-model representation degradation (due to double quantization format mismatch) from the actual erasure of adapter updates.
+
+\subsubsection{Alternative Baseline: Native-Format Co-existence}
+The reviewer points out a natural alternative deployment strategy: rather than merging adapters in weight space and re-quantizing the combined tensor, one can maintain the base model in its native low-bit format (NF4) and keep the task-specific adapters as separate parameters. This dual-path inference baseline (equivalent to our ``Quantize-then-Merge'' strawman) avoids both re-quantization collapse and double quantization noise. 
+
+However, this co-existence alternative comes at the cost of significantly increased memory footprint and multi-path inference latency under multi-task workloads. Specifically, for $K$ active tasks, co-existence requires storing the base model in NF4 ($O(D \cdot \frac{b}{8})$ bytes) and $K$ separate sets of LoRA parameters in high-precision ($O(K \cdot 2 \cdot d_{\text{in}} \cdot r)$ bytes). At inference time, either the input must be routed through $K$ sequential adapter forward paths (leading to a latency that scales linearly as $O(K \cdot L \cdot r)$), or the adapters must be dynamically swapped into cache, incurring severe GPU memory bandwidth and scheduling overheads on edge devices. 
+
+To mitigate this multi-path latency on edge devices, a promising compiler-level strategy is the development of specialized fused GPU kernels (e.g., implemented in CUDA or Triton). Such fused kernels can theoretically merge the dequantization of base weights and the low-rank projection of multiple active adapters into a single, unified thread block, thereby minimizing global memory roundtrips and sharing input activations. However, implementing and maintaining these specialized fused kernels is non-trivial, highly hardware-dependent, and constrained by GPU SRAM capacity. Even with advanced kernel fusion, the hardware must still load the parameters of all active adapters into registers or shared memory, which limits register availability and bounds batch-size scalability. Thus, while custom kernel fusion represents an important optimization for co-existence, it does not bypass the fundamental linear scaling penalties of dual-path inference, preserving weight-space merging as a fundamentally superior structural solution.
+
+In contrast, weight-space merging yields a single unified model ($O(D \cdot \frac{b}{8})$ bytes for INT4) that performs inference in a single forward pass with $O(1)$ scaling with respect to $K$. This comparison highlights why weight-space merging and re-quantization are highly preferred in throughput-critical and memory-constrained scenarios. Thus, the weight-space merging and re-quantization pipeline remains a highly desirable but theoretically challenging paradigm that requires active mitigations like SAWS.
+
+\subsubsection{Intermediate Quantization Granularities: Group-Wise \& Block-Wise Quantization}
+In addition to the extreme configurations of per-tensor (one scale factor $s$ per entire weight matrix) and per-channel (one scale factor $s_i$ per row), modern LLM quantization packages (e.g., AWQ, GPTQ) frequently employ intermediate granularities such as \emph{group-wise} or \emph{block-wise} quantization. 
+Under group-wise quantization, each row $i$ of the weight matrix $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ is divided into contiguous sub-vectors of size $G$ (typically $G \in \{64, 128, 256\}$). A separate scale factor $s_{i,j}$ is then computed for each block $j \in \{1, \dots, \lceil d_{\text{in}} / G \rceil\}$:
+\begin{equation}
+  s_{i,j} = \frac{\max_{k \in [(j-1)G+1, \, \min(jG, d_{\text{in}})]} |W_{i,k}|}{2^{b-1} - 1}
+\end{equation}
+This intermediate granularity provides a compelling trade-off between the extreme compression of per-tensor quantization and the near-lossless accuracy of per-channel quantization. For instance, group-wise quantization with a block size of $G=128$ is highly prevalent in modern LLM compression packages (e.g., AWQ). From a memory standpoint, while per-channel quantization requires storing $d_{\text{out}}$ scales per matrix, group-wise quantization with $G=128$ requires storing $\lceil d_{\text{in}} / 128 \rceil$ scales per row (amounting to a tiny $1/128 \approx 0.78\%$ scale-factor memory overhead relative to the weight matrix parameters). Despite this extremely low memory footprint, a block size of 128 is sufficiently small to isolate local high-magnitude outliers to a single group, preventing them from corrupting the dynamic range of adjacent weights. Consequently, group-wise quantization offers a highly compelling middle ground that achieves near-lossless per-channel representation accuracy while preserving the compact memory footprint necessary for resource-constrained edge devices.
+From a methodological standpoint, group-wise quantization naturally mitigates the ``Re-Quantization Silence.'' Because the dynamic scale $s_{i,j}$ is computed over a local block of size $G$, it is only sensitive to outliers within that specific local group, rather than being dominated by a distant, high-magnitude base-weight outlier elsewhere in the row. As a result, the local quantization step size remains fine enough to resolve and preserve task-specific adapter updates $\Delta W_k$ in blocks that lack base outliers. 
+
+When applying SAWS to a group-wise quantized model, the formulation can either be applied globally (using the global layer norm ratio $\gamma^l$ to boost task vectors uniformly) or adapted locally by computing a group-wise norm ratio $\gamma^l_{i,j}$ based on the local Frobenius norm of the base weights and the adapter updates inside each block $j$ of row $i$:
+\begin{equation}
+  \gamma^l_{i,j} = \alpha \cdot \frac{\| \tilde{W}^l_{0, i, j} \|_F}{\| \sum_{k=1}^K \lambda^l_k A^l_{k, i, j} B^l_{k, i, j} \|_F}
+\end{equation}
+where $A^l_{k, i, j} B^l_{k, i, j}$ represents the sub-vector slice of length $G$ corresponding to group $j$ of row $i$ for task $k$. This local scaling factor aligns perfectly with the local quantization scale $s_{i,j}$. To preserve the original output, a corresponding row-wise and block-wise output correction factor $c^l_{i,j}$ is applied dynamically at inference. This localized adaptation represents a highly promising avenue for further optimizing low-bit adapter merging in ultra-low-bit (e.g., 2-bit or 3-bit) group-wise settings. Crucially, regarding hardware and resource overhead, storing these localized correction factors $c^l_{i,j}$ on edge devices introduces a negligible memory footprint of exactly $1/G$ (e.g., only $1/128 \approx 0.78\%$ overhead, which perfectly matches the scale-factor overhead of the group-wise quantization format itself). In terms of compute, while a naive implementation would require block-wise split GEMMs, a production-grade deployment would fuse the correction factors $c^l_{i,j}$ directly into the GPU's custom dequantization and matrix-multiplication kernels (such as Triton or CUDA). Specifically, in a fused Triton or CUDA kernel, each thread block loads a tile of the quantized weights and the corresponding block-wise scale factors $s_{i,j}$ and correction factors $c^l_{i,j}$ into Shared Memory (SRAM) using vectorized 128-bit loads. During dequantization, the quantized integer weights are unpacked and multiplied by their scale factor $s_{i,j}$ and the correction factor $c^l_{i,j}$ at the register level before being passed to the Tensor Cores for matrix multiplication. Because this scale correction is combined with the dequantization scale as $\tilde{s}_{i,j} = s_{i,j} \cdot c^l_{i,j}$ inside the registers, it avoids any additional memory access or floating-point instructions in the main GEMM loop. Specifically, the thread loop registers allocated for the scale factor $s_{i,j}$ are directly overwritten with the pre-multiplied blended scale $\tilde{s}_{i,j}$, which is loaded from SRAM into registers during block-level prologue execution, avoiding any register pressure increases or main-loop arithmetic stalls, thereby achieving mathematically lossless fusion with identical latency and throughput to standard quantized inference. While empirical evaluation of group-wise SAWS under AWQ/GPTQ configurations on multi-billion parameter LLMs is beyond the scope of this paper, it represents an active, highly prioritized direction for our own subsequent investigations.
+
+\subsection{Scale-Adaptive Weight Shifting (SAWS)}
+To prevent the low-rank updates from being crushed to zero by the quantization step size, we propose a zero-data, closed-form scaling mitigation. We define the layer-wise adaptation norm ratio $\gamma^l$:
+\begin{equation}
+  \gamma^l = \alpha \cdot \frac{\| \tilde{W}^l_0 \|_F}{\| \sum_{k=1}^K \lambda^l_k A^l_k B^l_k \|_F}
+\end{equation}
+where $\| \cdot \|_F$ is the Frobenius norm and $\alpha \in \mathbb{R}^+$ is a hyperparameter scaling constant (typically $\alpha \in [0.05, 0.2]$). This shifts the scale of the low-rank updates, projecting them into a range where their elements are large enough to cross the rounding thresholds of the quantizer.
+We scale up the adapter updates before merging:
+\begin{equation}
+  W^l_{\text{saws}}(\Lambda) = \tilde{W}^l_0 + \gamma^l \sum_{k=1}^K \lambda^l_k A^l_k B^l_k
+\end{equation}
+and re-quantize $W^l_{\text{saws}}(\Lambda)$ to obtain the final dequantized weights $\tilde{W}^l_{\text{final, saws}}(\Lambda)$. 
+
+To align the output scale with the original unquantized merged model, we compute a weight alignment factor $c^l$. We derive $c^l$ by finding the scalar factor that minimizes the squared Frobenius norm distance between the original unquantized merged weight tensor $W^l_{\text{merged}}(\Lambda)$ and the scaled, re-quantized weight tensor $\tilde{W}^l_{\text{final, saws}}(\Lambda)$:
+\begin{equation}
+  c^l = \arg\min_{c} \| W^l_{\text{merged}}(\Lambda) - c \tilde{W}^l_{\text{final, saws}}(\Lambda) \|^2_F
+\end{equation}
+By expanding this quadratic objective and taking the partial derivative with respect to $c$:
+\begin{equation}
+  \begin{split}
+    \frac{\partial}{\partial c} \Big( \|W^l_{\text{merged}}(\Lambda)\|^2_F &- 2 c \langle W^l_{\text{merged}}(\Lambda), \tilde{W}^l_{\text{final, saws}}(\Lambda) \rangle \\
+    &+ c^2 \|\tilde{W}^l_{\text{final, saws}}(\Lambda)\|^2_F \Big) = 0
+  \end{split}
+\end{equation}
+which yields the elegant, closed-form alignment factor:
+\begin{equation}
+  c^l = \frac{\langle W^l_{\text{merged}}(\Lambda), \tilde{W}^l_{\text{final, saws}}(\Lambda) \rangle}{\|\tilde{W}^l_{\text{final, saws}}(\Lambda)\|^2_F}
+\end{equation}
+This represents the scalar projection of the continuous merged tensor onto the quantized scaled tensor. At inference, we apply $c^l$ to the output activation $Y$ for an input activation $X$:
+\begin{equation}
+  Y = c^l \left( X \cdot \tilde{W}^l_{\text{final, saws}}(\Lambda)^T \right)
+\end{equation}
+Because both $W^l_{\text{merged}}(\Lambda)$ and $\tilde{W}^l_{\text{final, saws}}(\Lambda)$ are heavily dominated by the pre-trained base weight $W_0$, this inner product ratio evaluates to $c^l \approx 1.0$ (typically $\approx 0.99$ in practice).
+
+\subsubsection{The Representation Scale Preservation Dilemma}
+We must explicitly address a crucial mathematical tension in the formulation of SAWS. One might naively assume that to preserve the mathematical scale of the original unquantized model, an inverse scalar correction $1/\gamma^l$ must be applied to the entire layer output $Y$. However, we show that this attempt is fundamentally self-defeating. If we scale the entire merged output by $1/\gamma^l$:
+\begin{equation}
+  \begin{split}
+    Y &\approx X \cdot \left( \tilde{W}^l_0 + \gamma^l \Delta W^l_{\text{merged}} \right)^T \cdot \frac{1}{\gamma^l} \\
+    &= \frac{1}{\gamma^l} \left( X \tilde{W}_0^T \right) + X \Delta W_{\text{merged}}^T
+  \end{split}
+\end{equation}
+Since $\gamma^l \gg 1$ is derived from the ratio of base weights to adapter updates, it is typically very large (ranging from $10$ to $100$ in practice). Dividing the entire layer output by $\gamma^l$ during inference **scales down the pre-trained base features $W_0$ by a factor of 10 to 100**, completely obliterating the base model's representations and causing catastrophic performance collapse.
+
+Thus, true, simultaneous scale preservation for both base and adapter representations is mathematically impossible in a unified single-path merged model. Instead, we clarify that the success of SAWS is driven by **selective task-vector boosting**. Because the weight alignment factor evaluates to $c^l \approx 1.0$, the adapter updates—which were scaled up by $\gamma^l$—are left boosted relative to $W_0$ during inference:
+\begin{equation}
+  Y_{\text{actual}} \approx X \tilde{W}_0^T + \gamma^l X \Delta W_{\text{merged}}^T
+\end{equation}
+This boosting acts as a regularizer, amplifying the adapter's task vector updates and helping them cross the rounding thresholds of the low-bit quantization grid.
+
+\subsubsection{Global vs. Channel-Wise Scaling in SAWS}
+Since per-channel quantization is the industry standard for edge deployment (due to row-wise spatial variance), a natural question arises: why is SAWS formulated using a global, layer-wise norm ratio $\gamma^l$ rather than a channel-wise (row-specific) norm ratio $\gamma^l_i$? 
+
+While computing a row-specific ratio $\gamma^l_i = \alpha \frac{\|\tilde{W}^l_{0, i}\|_F}{\|\Delta W^l_{\text{merged}, i}\|_F}$ would align perfectly with per-channel quantization scales, it introduces a severe \textbf{representation geometry warp}. The relative magnitude of adapter updates across different channels encodes crucial structural information about the multi-task representational space. Scaling task vectors row-by-row with different $\gamma^l_i$ distorts the directional orientation of the weight vectors in high-dimensional space, disrupting the fine-grained semantic features learned by the adapter. Furthermore, it alters the relative channel activations, changing the internal representation geometry of the network. In contrast, our global layer-wise scaling $\gamma^l$ acts as a uniform homothety, preserving the exact angular and relative magnitude relationships of the adapter updates across all channels. This preserves the representation geometry of the task vectors while boosting them uniformly to survive rounding, which we find is empirically superior and more robust than row-wise warping under per-tensor constraints. Crucially, as we empirically evaluate in Appendix~\ref{app:saws_ablation} (Table~\ref{tab:saws_global_vs_channel}), while this geometry warping collapses performance under per-tensor grids, Channel-wise SAWS achieves substantial gains (+2.95\% to +3.70\% accuracy) over Global SAWS under standard per-channel configurations by aligning perfectly with the row-wise quantization scales.
+
+\subsubsection{Methodological Comparison with Activation-Weight Scaling (SmoothQuant)}
+To position our proposed SAWS within the broader literature of deployment-aware quantization mitigations, we must contrast it with joint weight-activation scaling approaches, most notably SmoothQuant \cite{xiao2023smoothquant}. SmoothQuant addresses the challenge of quantizing activation outliers in large language models by migrating the quantization difficulty from activations to weights. It applies a mathematically exact scale factor $s$ to scale down activations and inversely scales up the corresponding weights:
+\begin{equation}
+  Y = \left( X \cdot \text{diag}(s)^{-1} \right) \cdot \left( \text{diag}(s) \cdot W^T \right)
+\end{equation}
+Because the scale factors are applied inversely, SmoothQuant preserves the exact linear mathematical equivalence of the original unquantized model. 
+
+In contrast, SAWS is designed to solve a fundamentally different deployment problem: the quantization erasure of low-rank adapter updates ($\Delta W$) when merged into pre-trained base models ($W_0$). This difference manifests in three core methodological distinctions:
+\begin{itemize}
+  \item \textbf{Exact Equivalence vs. Selective Boosting:} SmoothQuant preserves exact mathematical equivalence by scaling activations and weights inversely. In contrast, SAWS cannot apply an inverse activation scaling factor $1/\gamma^l$ during inference because doing so scales down the pre-trained base features $W_0$, obliterating base representations (as proved in the Representation Scale Preservation Dilemma). Thus, SAWS operates via selective task-vector boosting, intentionally altering the mathematical representation geometry of the merged space to favor low-rank updates.
+  \item \textbf{Mitigation Target:} SmoothQuant mitigates activation quantization noise by reducing the dynamic range of outlier activation channels. SAWS mitigates weight quantization silence by boosting the scale of tiny adapter weights so that they cross the rounding grid of the target post-training quantizer.
+  \item \textbf{Calibration Dependencies:} SmoothQuant requires a representative calibration dataset to observe activation outliers and compute the channel-wise scales $s$. SAWS is entirely data-free and calibration-free, computing the scaling factor $\gamma^l$ on-the-fly using only the closed-form Frobenius norms of the pre-trained weights and task-specific updates.
+\end{itemize}
+This highlights that SAWS represents a distinct, data-free paradigm of weight-only regularizing scale adjustments tailored specifically to low-rank model merging under quantization constraints.
+
+\subsection{Quantization-Aware Adapter Coefficient Search (QA-ACS)}
+As an alternative to data-free scaling, we evaluate QA-ACS, which optimizes layer-wise blending coefficients $\Lambda \in [0, 1]^{K \times L}$ directly \emph{through} the quantization operator on a tiny calibration set of $N=16$ unlabeled samples. We minimize prediction entropy:
+\begin{equation}
+  \mathcal{L}_{\text{entropy}}(\Lambda) = -\frac{1}{N \cdot K} \sum_{k=1}^K \sum_{i=1}^N \sum_{c=1}^C p_{k, i}(c) \log p_{k, i}(c)
+\end{equation}
+where $p_{k, i}(c)$ represents predictions on task $k$ using $\tilde{W}^l_{\text{final}}(\Lambda)$. We backpropagate gradients through the rounding operator using the Straight-Through Estimator (STE) \cite{Jacob2018Quantization}:
+\begin{equation}
+  \frac{\partial \lfloor x \rceil}{\partial x} \approx 1
+\end{equation}
+and update coefficients via:
+\begin{equation}
+  \Lambda^{(t+1)} = \Lambda^{(t)} - \eta \cdot \text{Adam}\left(\nabla_{\Lambda} \mathcal{L}_{\text{entropy}}(\Lambda^{(t)})\right)
+\end{equation}
+
+\subsubsection{The Risk of Entropy Collapse under High Discretization Noise}
+We must critically discuss a major failure mode in the optimization of QA-ACS. While STE enables gradient flow through discrete steps, the prediction entropy objective $\mathcal{L}_{\text{entropy}}$ is unsupervised. Under aggressive low-bit constraints (such as 4-bit per-channel or per-tensor formats), the network operates under severe discretization noise. 
+
+In this noisy, highly non-smooth optimization landscape, minimizing entropy can easily drive the low-capacity network (\texttt{vit\_tiny}) into collapsed regions of \textbf{entropy collapse}. In these regions, the model confidently outputs the same incorrect class for all inputs, yielding zero entropy but catastrophic accuracy (for instance, see Table~\ref{tab:int4_sym_pc} and Table~\ref{tab:int4_sym_pt} where MNIST accuracy drops from over $41\%$ down to $33.80\%$ and $31.60\%$, respectively, under QA-ACS optimization). This highlights the high risk of utilizing unconstrained, unsupervised optimization objectives under low-bit quantization constraints without proper label-based regularization. Crucially, we evaluate several constrained supervised and regularized variants of QA-ACS in Appendix~\ref{app:hyperparameters} (specifically Section A.5) to demonstrate how basic coefficient regularization and ground-truth supervision successfully stabilize the test-time adaptation and completely resolve this entropy collapse failure mode.
+
+\subsubsection{Straight-Through Estimator Gradient Mismatch and Noise under Low-Bit Constraints}
+In QA-ACS, the continuous merging coefficients $\Lambda$ are optimized using gradients propagated through the rounding operator via the Straight-Through Estimator (STE) \cite{bengio2013estimating}. While STE is a standard practice, we must critically evaluate its fundamental limitations under low-bit (e.g., 4-bit) constraints. The STE replaces the zero-derivative of the rounding step function with an identity mapping ($\frac{\partial \lfloor x \rceil}{\partial x} \approx 1$). This introduces a severe \textbf{gradient mismatch} because the forward pass experiences a highly non-smooth, step-like loss landscape with dense flat regions and sharp boundary jumps, while the backward pass assumes a perfectly smooth identity landscape.
+
+Under aggressive quantization (like 4-bit per-tensor grids), the quantization bins are wide, and a tiny update in $\Lambda$ may produce zero change in the quantized weights $W_{\text{quant}}$ and zero change in the loss, yet the STE backward pass still propagates a non-zero gradient update. This mismatch results in highly noisy and inaccurate gradients that can cause standard gradient descent algorithms to stall or oscillate wildly across rounding boundaries. 
+
+We identify the choice of optimizer as a critical architectural mitigation for this STE gradient noise. Standard Stochastic Gradient Descent (SGD) is highly sensitive to gradient noise and struggles to converge under STE approximation in tight test-time budgets ($T=40$). Conversely, the Adam optimizer \cite{kingma2014adam} employs adaptive second-moment scaling, which acts as a robust temporal filter. By tracking running averages of the gradients and their variance, Adam naturally dampens high-frequency gradient noise and smooths the oscillatory updates caused by the STE mismatch, allowing the optimizer to successfully navigate the highly non-smooth discretization boundaries of post-training rounding grids.
+
+\begin{algorithm}[t]
+  \caption{Quantization-Aware Adapter Coefficient Search (QA-ACS)}
+  \label{alg:qa-acs}
+  \begin{algorithmic}[1]
+    \REQUIRE Calibration set $\mathcal{D}_{\text{cal}} = \{X_i\}_{i=1}^N$, dequantized base weights $\tilde{W}_0$, LoRA updates $\{A_k, B_k\}_{k=1}^K$, step size $\eta$.
+    \STATE Initialize continuous coefficients $\Lambda^{(0)} \in [0, 1]^{K \times L}$
+    \FOR{step $t = 0$ to $T-1$}
+      \STATE $W_{\text{merged}}(\Lambda^{(t)}) \leftarrow \tilde{W}_0 + \sum_{k} \lambda_k^{(t)} A_k B_k$
+      \STATE $s \leftarrow \max(|W_{\text{merged}}(\Lambda^{(t)})|) / (2^{b-1} - 1)$
+      \STATE $W_{\text{quant}} \leftarrow \lfloor W_{\text{merged}}(\Lambda^{(t)}) / s \rceil$ \COMMENT{With STE gradient approximation}
+      \STATE $\tilde{W}_{\text{final}} \leftarrow s \cdot W_{\text{quant}}$
+      \STATE Compute $\mathcal{L}_{\text{entropy}}(\Lambda^{(t)})$ using predictions from $\tilde{W}_{\text{final}}$ on $\mathcal{D}_{\text{cal}}$
+      \STATE $\Lambda^{(t+1)} \leftarrow \text{OptimizerStep}(\Lambda^{(t)}, \nabla_{\Lambda} \mathcal{L}_{\text{entropy}})$
+    \ENDFOR
+    \STATE \textbf{return} Optimized coefficients $\Lambda^{(T)}$
+  \end{algorithmic}
+\end{algorithm}

@@ -1,0 +1,95 @@
+\section{Methodology}
+\label{submission:sec:method}
+
+In this section, we formally outline our proposed \textbf{Norm-Preserved Budgeted Task-Vector Pruning (NP-BTVP)} framework. We first define task-vector extraction and merging. Then, we formulate the flatness-aware fine-tuning of experts via Sharpness-Aware Minimization (SAM). Finally, we detail our two pruning strategies: Uniform Pruning (NP-BTVP-U) and our novel Adaptive Saliency-Based Budget Allocation (NP-BTVP-S), and introduce the mathematical formulation of norm-preserving weight rescaling.
+
+\subsection{Task Vector Extraction and Multi-Task Merging}
+Let $\theta_{\text{base}} \in \mathbb{R}^d$ represent the weights of a pre-trained base backbone (e.g., a CLIP vision encoder). For $K$ independent downstream classification tasks, let $\theta_1, \theta_2, \dots, \theta_K \in \mathbb{R}^d$ be the weights of $K$ fine-tuned task-specific experts. 
+
+The task-specific update, or \emph{task vector}, for task $k \in \{1, \dots, K\}$ is isolated in parameter space via weight subtraction relative to the base model:
+\begin{equation}
+\tau_k = \theta_k - \theta_{\text{base}}
+\end{equation}
+Under standard Task Arithmetic \cite{ilharco2022editing}, a dense multi-task model is constructed by linearly combining the task vectors and adding them back to the base model:
+\begin{equation}
+\theta_{\text{MTL}} = \theta_{\text{base}} + \sum_{k=1}^K \lambda_k \tau_k
+\end{equation}
+where $\lambda_k > 0$ is the merging coefficient representing the scaling factor for task $k$.
+
+\subsection{Flatness-Aware Expert Fine-tuning}
+Rather than fine-tuning experts using standard stochastic gradient descent or AdamW, which can lead to convergence in narrow and brittle loss valleys, we fine-tune experts using Sharpness-Aware Minimization (SAM) \cite{foret2021sharpness}. Let $L_k$ be the loss function of task $k$. SAM seeks to find a parameter configuration $\theta_k$ whose neighborhood has both low loss and low sharpness. The SAM optimization objective is formulated as:
+\begin{equation}
+\min_{\theta_k} L_k(\theta_k + \epsilon^*(\theta_k))
+\end{equation}
+where the adversarial parameter perturbation $\epsilon^*(\theta_k)$ is solved within a Euclidean ball of radius $\rho$:
+\begin{equation}
+\epsilon^*(\theta_k) = \arg\max_{\//\epsilon\|_2 \le \rho} L_k(\theta_k + \epsilon)
+\end{equation}
+Using a first-order Taylor expansion, this perturbation is approximated as:
+\begin{equation}
+\epsilon^*(\theta_k) \approx \rho \frac{\nabla_{\theta_k} L_k(\theta_k)}{\|\nabla_{\theta_k} L_k(\theta_k)\|_2}
+\end{equation}
+The expert weights are then updated using the gradient computed at this perturbed point: $\nabla_{\theta_k} L_k(\theta_k + \epsilon^*(\theta_k))$. Training experts under this objective ensures they converge to wide, flat minima. Geometrically, it has been hypothesized that these flat basins can better tolerate coordinate-wise zeroing (pruning) since the surrounding loss landscape rises gradually compared to sharp AdamW basins; we systematically test this geometric hypothesis in our experiments.
+
+\subsection{Task Vector Sparsification and Norm-Preserving Rescaling}
+Given a global retention budget $p \in (0, 1]$ (where $p=0.10$ signifies keeping only 10\% of the delta parameters, achieving 90\% sparsity), we evaluate two sparsification strategies. Crucially, to prevent update norm shrinkage when setting a large portion of parameters to zero (which would otherwise weaken the total signal of the task vectors and cause the model to collapse back to the base model's performance), we incorporate \textbf{norm-preserving rescaling} into our pruning. 
+
+\subsubsection{Uniform Pruning (NP-BTVP-U)}
+Under uniform pruning, we independently sparsify each task vector globally to retain exactly the top $p\%$ absolute updates and scale the remaining elements by $1/p$:
+\begin{equation}
+\tilde{\tau}_k^{(p)} = \tau_k \odot M_k^{(p)} \times \frac{1}{p}
+\end{equation}
+where $\odot$ is the Hadamard product, and $M_k^{(p)} \in \{0, 1\}^d$ is a binary mask defined element-wise by:
+\begin{equation}
+M_{k, i}^{(p) } = \begin{cases} 1 & \text{if } |\tau_{k, i}| \ge \text{Percentile}(|\tau_k|, 100(1-p)) \\ 0 & \text{otherwise} \end{cases}
+\end{equation}
+
+\subsubsection{Adaptive Saliency-Based Budget Allocation (NP-BTVP-S)}
+Recognizing that different layers in a deep neural network undergo different degrees of adaptation, we propose a layer-wise budget allocation scheme. For a model with $L$ parameter tensors (or layers), let $\tau_{k, l}$ correspond to the task vector slice for task $k$ at layer $l \in \{1, \dots, L\}$, and let $N_l$ be the number of parameters (size) of layer $l$.
+
+To measure the average update intensity per parameter in layer $l$ rather than raw absolute magnitude (which is biased towards larger layers), we define the normalized layer-wise update saliency $S_l$ as the average $L_1$-norm of the updates across all tasks, divided by the layer size $N_l$:
+\begin{equation}
+S_l = \frac{1}{K \cdot N_l} \sum_{k=1}^K \|\tau_{k, l}\|_1
+\end{equation}
+The relative layer budget weight $w_l$ is then normalized by the mean layer-wise saliency:
+\begin{equation}
+w_l = \frac{S_l}{\frac{1}{L} \sum_{j=1}^L S_j}
+\end{equation}
+To obtain the layer-specific retention budget $p_l \in [0, 1]$, we scale the relative weight $w_l$ by a global scaling factor $\alpha > 0$, clipped to the valid range:
+\begin{equation}
+p_l = \min(\max(\alpha \cdot w_l, 0.0), 1.0)
+\end{equation}
+To strictly preserve the global retention budget $p$ (guaranteeing that the sparse model has exactly a fraction $p$ of total parameters), we solve for the unique scaling factor $\alpha$ via binary search such that:
+\begin{equation}
+\sum_{l=1}^L p_l N_l = p \sum_{l=1}^L N_l
+\end{equation}
+Using the solved $p_l$, we compute a local layer-wise pruning mask $M_{k, l}^{(p_l)}$ for each expert:
+\begin{equation}
+M_{k, l, i}^{(p_l)} = \begin{cases} 1 & \text{if } |\tau_{k, l, i}| \ge \text{Percentile}(|\tau_{k, l}|, 100(1-p_l)) \\ 0 & \text{otherwise} \end{cases}
+\end{equation}
+The sparse task vector slice for layer $l$ is then computed as:
+\begin{equation}
+\tilde{\tau}_{k, l}^{(p)} = \tau_{k, l} \odot M_{k, l}^{(p_l)} \times \text{Scale}(p_l, p)
+\end{equation}
+where $\text{Scale}(p_l, p)$ represents a norm-preserving scale factor. We consider two natural formulations for this scale factor:
+\begin{enumerate}
+    \item \textbf{Layer-wise Rescaling:} $\text{Scale}(p_l, p) = 1/p_l$, which preserves the exact update norm of each layer individually (i.e., $\|\tilde{\tau}_{k, l}^{(p)}\|_1 \approx \|\tau_{k, l}\|_1$).
+    \item \textbf{Global Rescaling:} $\text{Scale}(p_l, p) = 1/p$, which uses the global retention rate to scale all active parameters uniformly across the model.
+\end{enumerate}
+We evaluate Saliency Pruning under the global rescaling configuration, matching the primary implementation, but formally analyze the trade-offs of both scaling settings in Section 4. By shifting parameter budget toward layers that have higher update intensity, NP-BTVP-S preserves vital high-adaptation features across all layers while strictly enforcing the global parameter budget.
+
+\textbf{Theoretical Foundations of Norm-Preserving Rescaling.} 
+Pruning methods like DARE \cite{yu2023language} utilize a stochastic Bernoulli mask to drop parameters randomly and scale the remaining ones by $1/(1-p_{\text{drop}})$ to preserve the mathematical expectation of the update vector sum, i.e., $\mathbb{E}[\tilde{\tau}] = \tau$. However, in deterministic sparsification (such as our magnitude-based pruning), the mask $M^{(p)}$ is computed strictly using sorting and percentile thresholding. Because the mask is deterministic and coordinate-aligned rather than stochastic, the scaling factor $1/p$ (or $1/p_l$) cannot be formally justified as a probabilistic expectation.
+
+Instead, we frame our rescaling method as a \textbf{Norm-Preserving Heuristic} or \textbf{Update Signal-Strength Preservation}. By scaling the remaining active task-vector updates by the reciprocal of their retention rates, we counteract the severe update norm shrinkage that otherwise occurs when zeroing out parameters. To prevent any mathematical confusion, we explicitly acknowledge that while the framework is conceptually motivated by preventing norm shrinkage (hence the name "Norm-Preserved"), applying the $1/p$ scale factor to these deterministically pruned coordinates actually amplifies the expected $L_1$ update norm mathematically, i.e., $\|\tilde{\tau}_k^{(p)}\|_1 > \|\tau_k\|_1$ (see Appendix Section~\ref{sec:appendix_formal_analysis} for formal Laplace and Gaussian derivations). 
+
+Thus, rather than keeping the $L_1$ norm strictly constant, the $1/p$ scaling factor acts as a highly beneficial \textbf{Signal-Strength Boost}. This boost is empirically crucial: since we discard 90\% of the parameters, the over-scaling of the remaining 10\% of coordinates provides sufficient magnitude to effectively steer the shared base model weights, preventing the task experts from being drowned out by the base model during multi-task fusion. We analyze the comparison of $1/p$ with strict $L_1$-preserving scaling factors in Section 4.3 and Appendix Section~\ref{sec:appendix_formal_analysis}.
+
+We note that while the overall framework is named Norm-Preserved Budgeted Task-Vector Pruning (NP-BTVP) due to its emphasis on signal-strength preservation, we evaluate both standard AdamW and SAM experts to study the intersection of training-stage geometry and post-hoc sparsification. To make the framework highly practical, the layer-wise budget allocation metric $S_l$ is deliberately designed as a first-order magnitude-based heuristic. This is a highly practical design choice: by keeping the post-hoc sparsification entirely training-free and based on easily computed $L_1$ update magnitudes, we avoid the massive computational and memory overhead of calculating second-order curvature matrices (such as Hessian or Fisher Information matrices) across tens of millions of parameters. This aligns perfectly with resource-constrained edge environments where compute and memory during weight fusion are extremely limited.
+
+\subsection{Sparse Multi-Task Merging}
+The final compressed multi-task model is reconstructed on-the-fly via sparse Task Arithmetic:
+\begin{equation}
+\theta_{\text{MTL}}^{(p)} = \theta_{\text{base}} + \sum_{k=1}^K \lambda_k \tilde{\tau}_k^{(p)}
+\end{equation}
+Since $\tilde{\tau}_k^{(p)}$ is highly sparse, it can be loaded from edge storage in compressed sparse formats (such as CSR), yielding huge savings in both storage footprint and load-time memory bandwidth.

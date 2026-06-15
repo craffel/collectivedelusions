@@ -1,0 +1,92 @@
+\section{Methodology: Pruned Gradient Merging (PG-Merge)}
+\label{sec:method}
+
+In this section, we present the mathematical formulation and conceptual foundation of \textbf{Pruned Gradient Merging (PG-Merge)}. PG-Merge is designed as a minimalist, training-free, and non-parametric regularizer specifically tailored to mitigate the Overfitting-Optimizer Paradox in active, test-time parameter-space model fusion.
+
+\subsection{Parameter-Space Model Fusion}
+Let $W_{base}^{(l)}$ represent the pre-trained base network weights at layer $l \in \{1, \dots, L\}$, where $L$ is the total number of structural layers or layer groups. Let $\{W_k\}_{k=1}^K$ denote a set of $K$ independent task-specific expert models, each fine-tuned from the same shared base model $W_{base}$ on a distinct specialized domain (e.g., MNIST, CIFAR-10). Following the task-vector paradigm~\cite{ilharco2022editing}, we define the task vector $V_k^{(l)}$ of expert $k$ at layer $l$ as:
+\begin{equation}
+    V_k^{(l)} = W_k^{(l)} - W_{base}^{(l)}
+\end{equation}
+
+The merged model parameters $W_{merged}^{(l)}(\alpha)$ at layer $l$, parameterized by the layer-wise merging coefficients $\alpha \in \mathbb{R}^{K \times L}$, are defined as:
+\begin{equation}
+    W_{merged}^{(l)}(\alpha) = W_{base}^{(l)} + \sum_{k=1}^K \alpha_{k, l} V_k^{(l)}
+    \label{eq:merging_defn}
+\end{equation}
+
+Under this parameterization, the search space consists of $M = L \times K$ individual merging coefficients. In our experiments with a compact Vision Transformer backbone containing $L=14$ layer groups and $K=4$ task experts, the coefficient optimization search space contains $M = 14 \times 4 = 56$ parameters.
+
+\subsection{Active Test-Time Adaptation via Entropy Minimization}
+During online test-time adaptation (TTA), the model receives an unlabeled stream of inputs. For an incoming local test batch $X_t = \{x_1, \dots, x_b, \dots, x_B\}$ of size $B$, the goal of active model merging is to adapt the merging coefficients $\alpha$ to the local task distribution on-the-fly. Following standard active model merging practices~\cite{adamerging}, we employ the unsupervised Shannon entropy of predictions as the adaptation objective. The test-time adaptation loss $\mathcal{L}_{\text{TTA}}$ is defined as:
+\begin{equation}
+    \mathcal{L}_{\text{TTA}}(X_t; \alpha) = -\frac{1}{B} \sum_{b=1}^B \sum_{c=1}^C p_c(x_b) \log p_c(x_b)
+    \label{eq:entropy}
+\end{equation}
+where $p_c(x_b) = \text{Softmax}(f(x_b; W_{merged}(\alpha)))_c$ is the predicted probability of class $c \in \{1, \dots, C\}$ for test sample $x_b$, and $f(\cdot; W_{merged}(\alpha))$ represents the forward pass through the merged neural network.
+
+\subsection{The Overfitting-Optimizer Paradox}
+In unconstrained active model merging (e.g., standard layer-wise AdaMerging), the raw gradients of the adaptation loss with respect to all $M$ merging coefficients are computed at each adaptation step $t$:
+\begin{equation}
+    g_{k, l}^{(t)} = \frac{\partial \mathcal{L}_{\text{TTA}}(X_t; \alpha^{(t)})}{\partial \alpha_{k, l}}
+\end{equation}
+
+An optimizer (e.g., Adam or SGD) then updates the entire coefficient tensor $\alpha^{(t)}$ in the direction of the gradient. However, because $X_t$ is typically a very small, unlabeled, and highly localized sample batch, the unconstrained optimization of $M$ parameters easily falls prey to the \emph{Overfitting-Optimizer Paradox}. Since there are no ground-truth labels, the optimizer minimizes entropy by driving the coefficients to extreme, unstable values that fit local statistical noise rather than generalizable task boundaries. This transductive overfitting causes severe out-of-distribution representational collapse, ruining the model's multi-task capabilities on subsequent batches.
+
+Prior methods combat this collapse by wrapping the optimization in complex mathematical scaffolds. RegCalMerge~\cite{regcalmerge} adds a spatial distance penalty:
+\begin{equation}
+    \mathcal{L}_{\text{reg}} = \mathcal{L}_{\text{TTA}} + \lambda \sum_{k=1}^K \sum_{l=1}^L (\alpha_{k, l} - \bar{\alpha}_k)^2
+\end{equation}
+which introduces the delicate hyperparameter $\lambda$. PolyMerge~\cite{polymerge} restricts the parameters geometrically:
+\begin{equation}
+    \alpha_{k, l} = \theta_{k, 0} + \theta_{k, 1} l + \theta_{k, 2} l^2
+\end{equation}
+which reduces parameters to a fixed quadratic subspace but prevents the network from learning fine-grained layer-wise routing patterns.
+
+\subsection{Pruned Gradient Masking: Occam's Filter}
+Rather than introducing auxiliary loss terms, extra hyperparameter tuning, or restrictive global trajectories, PG-Merge applies a non-parametric, training-free, and dynamic sparse gradient mask. 
+
+Let $\mathbf{g} \in \mathbb{R}^M$ represent the flattened vector of all raw gradients $g_{k, l}$ computed via backpropagation on the test batch $X_t$. We sort the absolute values of the elements in $\mathbf{g}$ in descending order:
+\begin{equation}
+    |\mathbf{g}|_{(1)} \ge |\mathbf{g}|_{(2)} \ge \dots \ge |\mathbf{g}|_{(M)}
+\end{equation}
+
+Given a target sparsity ratio $p \in (0, 1]$, we determine the threshold rank index $k_{th} = \lceil p \times M \rceil$. The $p$-th percentile gradient threshold value is given by:
+\begin{equation}
+    \tau = |\mathbf{g}|_{(k_{th})}
+\end{equation}
+
+We then construct a binary sparse gradient mask $M_{k, l} \in \{0, 1\}$ defined as:
+\begin{equation}
+    M_{k, l} = \begin{cases}
+        1 & \text{if } |g_{k, l}| \ge \tau \\
+        0 & \text{otherwise}
+    \end{cases}
+    \label{eq:mask}
+\end{equation}
+
+The pruned gradient vector $\tilde{\mathbf{g}}$ is obtained by applying the sparse mask to the raw gradients:
+\begin{equation}
+    \tilde{g}_{k, l} = g_{k, l} \odot M_{k, l}
+    \label{eq:pruning_op}
+\end{equation}
+where $\odot$ denotes coordinate-wise multiplication.
+
+Finally, the merging coefficients are updated using only the pruned gradients via a standard optimizer:
+\begin{equation}
+    \hat{\alpha}_{k, l}^{(t+1)} = \alpha_{k, l}^{(t)} - \eta \cdot \text{Optimizer}(\tilde{g}_{k, l}^{(t)})
+    \label{eq:update}
+\end{equation}
+
+When using advanced optimizers like Adam, historical momentum buffers can cause non-zero updates even when the current gradient is zero ($\tilde{g}_{k, l}^{(t)} = 0$). To prevent momentum leakage and keep the unselected $(100-p)\%$ coefficients strictly frozen, we apply a post-update projection step:
+\begin{equation}
+    \alpha_{k, l}^{(t+1)} = \alpha_{k, l}^{(t)} \odot (1 - M_{k, l}) + \hat{\alpha}_{k, l}^{(t+1)} \odot M_{k, l}
+    \label{eq:projection}
+\end{equation}
+
+Under this formulation, at any given adaptation step, only the top-$p\%$ coefficients that exhibit the highest sensitivity (largest absolute gradient magnitude) are allowed to adapt to the local test stream. The remaining $(100-p)\%$ of the coefficients are guaranteed to be kept strictly frozen, completely eliminating momentum-driven parameter drift and anchoring them to their exact previous values.
+
+\subsection{Theoretical Justification: Simplicity as a Low-Pass Filter}
+From a minimalist perspective, PG-Merge's efficacy lies in its extreme simplicity. By freezing $(100-p)\%$ of the parameters at each step, we severely restrict the optimizer's active search space. The gradient magnitude $|g_{k, l}|$ acts as a natural proxy for a layer's local sensitivity. Only layers that receive strong, coherent optimization signals are allowed to adjust, while other layers---which might otherwise drift and fit high-frequency transductive noise---remain securely anchored to their initial states.
+
+In essence, PG-Merge acts as an analytical, dynamic low-pass filter on the parameter updates. It completely bypasses the need for auxiliary distance-penalty terms, scale normalization factors, or multi-parameter geometric projections. It requires zero training, introduces zero extra parameters, and operates with a single intuitive hyperparameter $p$ (the sparsity ratio) for which we identify a highly stable, task-agnostic "sweet spot" across diverse domains. This makes PG-Merge a highly robust, clean, and elegant solution to the Overfitting-Optimizer Paradox in test-time deep model fusion.

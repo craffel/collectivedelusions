@@ -1,0 +1,208 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present our proposed framework: \textbf{Spectral Model Merging via Singular Value Slicing (SVS)}, coupled with \textbf{Barycentric Weight Normalization (BWN)}. SVS is designed as a non-parametric, closed-form framework that leverages standard linear algebra rather than overparameterized auxiliary networks or iterative optimization loops.
+
+\subsection{Mathematical Formulation of Task Vectors}
+Let $W_0 \in \mathbb{R}^{m \times n}$ denote the pre-trained base weight matrix of a given layer in a neural network backbone. Let $W_t \in \mathbb{R}^{m \times n}$ denote the fine-tuned expert weight matrix corresponding to task $t \in \{1, \dots, N\}$, obtained by fine-tuning $W_0$ on task $t$.
+
+Following Ilharco et al. \cite{ilharco2022editing}, we define the task vector (weight delta) for task $t$ as the coordinate difference:
+\begin{equation}
+    T_t = W_t - W_0
+\end{equation}
+The task vector $T_t$ represents the continuous trajectory of parameter updates that shift the pre-trained weights from their general-purpose state to a task-specific expert state.
+
+In standard Task Arithmetic (TA), the merged model weights $W_{TA}$ are computed as a linear combination of these task vectors:
+\begin{equation}
+    W_{TA} = W_0 + \sum_{t=1}^N \lambda_t T_t
+\end{equation}
+where $\lambda_t > 0$ represents the merging coefficient for task $t$. Under flat uniform merging, we set $\lambda_t = \lambda$.
+
+\subsection{Singular Value Slicing (SVS)}
+While Task Arithmetic is simple, it is highly vulnerable to destructive parameter interference, as fine-tuning updates for different tasks often pull parameters in conflicting directions. We hypothesize that the fundamental, generalizable semantic knowledge acquired during fine-tuning concentrates on a low-dimensional spectral manifold, while the remaining high-dimensional space represents sequential fine-tuning noise and overfitting artifacts.
+
+To isolate this core manifold, SVS performs a standard Singular Value Decomposition (SVD) on each task vector $T_t$:
+\begin{equation}
+    T_t = U_t \Sigma_t V_t^T
+\end{equation}
+where:
+\begin{itemize}
+    \item $U_t \in \mathbb{R}^{m \times m}$ is an orthogonal matrix of left-singular vectors.
+    \item $\Sigma_t \in \mathbb{R}^{m \times n}$ is a diagonal matrix containing the singular values sorted in descending order: $\sigma_{t, 1} \ge \sigma_{t, 2} \ge \dots \ge \sigma_{t, \min(m, n)} \ge 0$.
+    \item $V_t \in \mathbb{R}^{n \times n}$ is an orthogonal matrix of right-singular vectors.
+\end{itemize}
+
+To filter out the high-frequency spectral noise, we define the low-rank projection operator—which we refer to as \emph{Singular Value Slicing}—at rank $k \ll \min(m, n)$:
+\begin{equation}
+    \mathcal{S}_k(T_t) = \tilde{T}_t = U_{t, :k} \Sigma_{t, :k} V_{t, :k}^T
+\end{equation}
+where $U_{t, :k} \in \mathbb{R}^{m \times k}$ contains the first $k$ columns of $U_t$, $\Sigma_{t, :k} \in \mathbb{R}^{k \times k}$ is the diagonal matrix of the top $k$ singular values, and $V_{t, :k} \in \mathbb{R}^{n \times k}$ contains the first $k$ columns of $V_t$.
+
+By the Eckart-Young-Mirsky Theorem \cite{eckart1936approximation, mirsky1960symmetric}, the sliced task vector $\tilde{T}_t$ is the unique, optimal low-rank matrix approximation of $T_t$ of rank $k$ under any unitarily invariant norm (such as the Frobenius norm $\|\cdot\|_F$):
+\begin{equation}
+    \tilde{T}_t = \arg\min_{X \in \mathbb{R}^{m \times n}, \text{rank}(X) \le k} \|T_t - X\|_F
+\end{equation}
+By keeping only the highest-energy singular vectors, SVS strips away the redundant parameter adjustments that cause interference when combined. We then integrate the noise-filtered task vectors to form the raw merged matrix:
+\begin{equation}
+    W_{merged} = W_0 + \sum_{t=1}^N \lambda_t \tilde{T}_t
+\end{equation}
+
+\textbf{Computational Complexity and Scalability.} Computing the exact SVD of a matrix $T_t \in \mathbb{R}^{m \times n}$ has a computational complexity of $\mathcal{O}(\min(m^2 n, m n^2))$. While this computation is highly efficient and completes in less than a second for the parameter dimensions of the CLIP-ViT-B/32 backbone, it can scale poorly for extremely large layers, such as those in multi-billion parameter Large Language Models (LLMs). To scale SVS to larger architectures without computational bottlenecks, SVS can be naturally adapted to use \emph{Randomized SVD} algorithms \cite{halko2011randomizedsvd}. Randomized SVD leverages probabilistic matrix approximation to find a near-optimal low-rank projection in $\mathcal{O}(m n \log k)$ time, providing a highly scalable linear-time approximation that allows spectral slicing to be applied to multi-billion parameter matrices in milliseconds. Furthermore, applying SVS to modern LLMs requires specific structural considerations: while standard causal self-attention weights (query, key, value, and projection) are straightforwardly merged, gated Feed-Forward Networks (such as SwiGLU layers \cite{shazeer2020glu}) introduce non-linear, element-wise multiplicative gates ($\mathbf{x} \mapsto \text{Swish}(\mathbf{x} W_{gate}) \odot (\mathbf{x} W_{up})$) where weight updates have coupled non-linear interaction effects. Nevertheless, because SVS operates post-hoc on the linear task vectors prior to any non-linear activation, and because the outputs of these FFN blocks are subsequently stabilized by RMSNorm, SVS can be applied to $W_{gate}$, $W_{up}$, and $W_{down}$ independently to successfully filter fine-tuning noise without violating architectural integrity.
+
+\textbf{Spectral Analysis of Higher-Dimensional Tensors.} Singular Value Decomposition is mathematically defined for two-dimensional matrices, whereas deep neural network architectures frequently contain higher-dimensional parameter tensors (e.g., four-dimensional convolutional kernels $W \in \mathbb{R}^{C_{out} \times C_{in} \times K_1 \times K_2}$ or patch embedding projections). To apply SVS to these tensors, we flatten each higher-dimensional task vector $T_t$ into a two-dimensional matrix before performing SVD. Specifically, we group the first dimension (representing the output channels or projection dimensions, $m = C_{out}$) and flatten all remaining input and spatial dimensions into a single second dimension (representing the flattened receptive field, $n = C_{in} \times K_1 \times K_2$). SVS is then applied to this flattened matrix $T_t \in \mathbb{R}^{m \times n}$ to obtain the optimal low-rank approximation $\tilde{T}_t$, which is subsequently reshaped back to its original multi-dimensional tensor structure. This grouping choice preserves the channel-wise structural output relationships while allowing SVD to be performed on the parameter update trajectory. We note that alternative flattening axis choices (e.g., grouping by input channels $C_{in}$ or fully flattening all spatial and channel dimensions) can alter the resulting singular value spectrum and its corresponding Shannon entropy. In our pilot evaluations on convolutional layers, grouping by the output channel dimension provided the most stable multi-task accuracy and robust scale alignment, though fully characterizing the sensitivity of spectral slicing to alternative flattening axes is an important and interesting direction for future geometric analysis.
+
+\subsection{Barycentric Weight Normalization (BWN)}
+Discarding singular values and linearly combining weight matrices can alter the overall Frobenius norm (energy scale) of the final weight matrix. When the scale of the weights shrinks or expands, the variance of the activations shifts. In deep networks without normalization layers, this scale shift cascades across layers, potentially leading to representation collapse (e.g., vanishing or exploding activations).
+
+To address this issue in general neural architectures without introducing iterative training or hyperparameter tuning, we propose \textbf{Barycentric Weight Normalization (BWN)}. BWN is an analytical, non-parametric scale-preservation operator. It calculates the weighted Frobenius norm barycenter of the individual experts and rescales the raw merged matrix to match this target magnitude:
+\begin{equation}
+    W_{final} = \alpha W_{merged}
+\end{equation}
+where the closed-form scaling coefficient $\alpha$ is defined as:
+\begin{equation}
+    \alpha = \frac{\sum_{t=1}^N \mu_t \|W_t\|_F}{\|W_{merged}\|_F}
+\end{equation}
+Here, $\mu_t = \frac{\lambda_t}{\sum_{j=1}^N \lambda_j}$ represents the normalized task weights, and $\|\cdot\|_F$ is the Frobenius norm of the weight matrix. 
+
+BWN ensures that the overall energy scale of the merged weights is mathematically preserved at the barycenter of the original expert models:
+\begin{equation}
+    \|W_{final}\|_F = \sum_{t=1}^N \mu_t \|W_t\|_F
+\end{equation}
+This simple, training-free adjustment provides a theoretical scale-matching guarantee across layers in deep architectures.
+
+\textbf{Dimensionality and Bias Constraints.} We note that BWN and SVS are applied exclusively to parameter matrices of dimension $\ge 2$ (representing linear projections, multi-head attention weights, or convolutional filters). For one-dimensional parameters (such as bias vectors $\mathbf{b} \in \mathbb{R}^d$ or layer normalization scale/bias parameters), we merge them via standard linear Task Arithmetic: $\mathbf{b}_{final} = \mathbf{b}_0 + \sum_t \lambda_t T_t^{\mathbf{b}}$. Since one-dimensional vectors do not represent weight transformation operators and constitute a tiny fraction of the model's capacity (typically less than $0.05\%$), their contribution to activation scale propagation is negligible. Omitting them from Frobenius norm scale averaging simplifies the merging pipeline while maintaining complete theoretical alignment and execution speed.
+
+\subsection{Scale-Invariance and Global Scaling Cancellation in Modern Architectures}
+\label{sec:scale_invariance_proof}
+
+While BWN provides a scale-preservation formulation for general, un-normalized neural layers, we observe an elegant mathematical property when SVS and BWN are applied to modern deep architectures. In models such as Transformers (e.g., LLMs and ViTs) and joint vision-language encoders (e.g., CLIP), representation layers are universally followed by explicit feature normalization layers. 
+
+In this section, we mathematically prove that under three of the most widely used normalization operators—L2-normalization, LayerNorm, and RMSNorm—any positive global weight scaling factor $\alpha > 0$ (such as the scaling coefficient computed by BWN) is completely neutralized. This scale-invariance has profound implications for model merging methods that modify weight scaling.
+
+\subsubsection{Case 1: L2-Normalization Layers}
+In joint embedding spaces such as CLIP \cite{radford2021learning}, representation features are projected and then explicitly L2-normalized to project activations onto the unit hypersphere. Let $X \in \mathbb{R}^{d \times m}$ be the input activation matrix, and $W \in \mathbb{R}^{n \times m}$ be the weight matrix. The projected linear features are:
+\begin{equation}
+    \mathbf{h} = X W^T + \mathbf{b}
+\end{equation}
+where $\mathbf{b}$ is the bias. Immediately following this, L2-normalization is applied:
+\begin{equation}
+    \mathbf{h}_{norm} = \frac{\mathbf{h}}{\|\mathbf{h}\|_2} = \frac{X W^T + \mathbf{b}}{\|X W^T + \mathbf{b}\|_2}
+\end{equation}
+
+If we scale the weight matrix by the positive scalar $\alpha > 0$ (such as the BWN scaling factor), and assuming the bias update is negligible or zero (standard in linear projection tuning), the scaled projected activations become:
+\begin{equation}
+    \mathbf{h}_{BWN} = X (\alpha W)^T = \alpha (X W^T)
+\end{equation}
+Substituting this scaled representation back into the L2-normalization step:
+\begin{align}
+    \mathbf{h}_{norm, BWN} &= \frac{\mathbf{h}_{BWN}}{\|\mathbf{h}_{BWN}\|_2} = \frac{\alpha (X W^T)}{\|\alpha (X W^T)\|_2} \nonumber \\
+    &= \frac{\alpha (X W^T)}{\alpha \|X W^T\|_2} = \frac{X W^T}{\|X W^T\|_2} = \mathbf{h}_{norm}
+\end{align}
+Because $\alpha > 0$, it factors out of both the numerator and the norm in the denominator, and **mathematically cancels out** entirely.
+
+\subsubsection{Case 2: LayerNorm Layers}
+In standard Transformer blocks, projection layers (such as key, query, value, or feed-forward layers) are followed by LayerNorm (LN) \cite{vaswani2017attention}. Let the layer output be $\mathbf{h} = \mathbf{x} W^T$. Under a positive global weight scaling factor $\alpha > 0$, the scaled output is $\mathbf{h}_{scaled} = \alpha \mathbf{h}$. Applying LayerNorm to this scaled output:
+\begin{equation}
+    \text{LN}(\alpha \mathbf{h}) = \gamma \odot \frac{\alpha \mathbf{h} - \mu_{\alpha \mathbf{h}}}{\sigma_{\alpha \mathbf{h}}} + \beta
+\end{equation}
+where $\mu$ is the mean, $\sigma$ is the standard deviation across the hidden dimension, and $\gamma, \beta$ are learnable affine parameters. Since expectation and standard deviation are linear operators with respect to positive constant scaling:
+\begin{equation}
+    \mu_{\alpha \mathbf{h}} = \alpha \mu_{\mathbf{h}}
+\end{equation}
+\begin{equation}
+    \sigma_{\alpha \mathbf{h}} = \sqrt{\frac{1}{d} \sum_{i=1}^d (\alpha h_i - \alpha \mu_{\mathbf{h}})^2 + \epsilon} \approx \alpha \sigma_{\mathbf{h}}
+\end{equation}
+*(where the approximation holds exactly when the stabilization parameter $\epsilon = 0$, or is negligible relative to the activation scale)*. Substituting these back:
+\begin{align}
+    \text{LN}(\alpha \mathbf{h}) &\approx \gamma \odot \frac{\alpha \mathbf{h} - \alpha \mu_{\mathbf{h}}}{\alpha \sigma_{\mathbf{h}}} + \beta \nonumber \\
+    &= \gamma \odot \frac{\alpha (\mathbf{h} - \mu_{\mathbf{h}})}{\alpha \sigma_{\mathbf{h}}} + \beta \nonumber \\
+    &= \gamma \odot \frac{\mathbf{h} - \mu_{\mathbf{h}}}{\sigma_{\mathbf{h}}} + \beta = \text{LN}(\mathbf{h})
+\end{align}
+The global scaling factor $\alpha$ again cancels out, leaving the normalized activations completely invariant to the weight magnitude.
+
+\subsubsection{Case 3: RMSNorm Layers}
+Many modern high-performance architectures (e.g., LLaMA, Mistral, Gemma) replace LayerNorm with Root Mean Square Normalization (RMSNorm) to save compute. RMSNorm normalizes only by the root-mean-square of the activations without centering:
+\begin{equation}
+    \text{RMSNorm}(\mathbf{h}) = \gamma \odot \frac{\mathbf{h}}{\text{RMS}(\mathbf{h})}
+\end{equation}
+Under weight scaling $\alpha > 0$, the scaled output is $\mathbf{h}_{scaled} = \alpha \mathbf{h}$. Applying RMSNorm:
+\begin{align}
+    \text{RMSNorm}(\alpha \mathbf{h}) &= \gamma \odot \frac{\alpha \mathbf{h}}{\sqrt{\frac{1}{d} \sum_{i=1}^d (\alpha h_i)^2 + \epsilon}} \nonumber \\
+    &\approx \gamma \odot \frac{\alpha \mathbf{h}}{\alpha \sqrt{\frac{1}{d} \sum_{i=1}^d h_i^2}} = \text{RMSNorm}(\mathbf{h})
+\end{align}
+Just as with LayerNorm and L2-normalization, the positive scaling factor $\alpha$ is factored out and mathematically eliminated\footnote{In the extreme mathematical boundary case where the activations $\mathbf{h}$ are virtually zero (i.e., $\|\mathbf{h}\|^2 \approx 0$), the numerical stabilization constant $\epsilon > 0$ dominates the denominator. In this singular regime, the cancellation is not exact, and $\text{RMSNorm}(\alpha \mathbf{h}) \approx (\alpha / \sqrt{\epsilon}) \mathbf{h}$. However, since neural networks are trained such that normal operating activations are significantly larger than typical stabilization limits (e.g., $\epsilon \in [10^{-5}, 10^{-6}]$), this boundary case is practically never encountered during model inference.}.
+
+\subsubsection{The Residual Block Boundary Condition}
+We note a critical theoretical boundary condition when global scale-invariance is applied to residual (skip) connections, which are ubiquitous in modern Transformer architectures. A standard Transformer block with a residual connection is formulated as:
+\begin{equation}
+    \mathbf{y} = \mathbf{x} + \mathcal{F}(\text{LN}(\mathbf{x}))
+\end{equation}
+where $\mathcal{F}$ represents a parameterized block (such as an attention head or Feed-Forward layer) and $\mathbf{x}$ is the block input. 
+
+Under global weight scaling by the BWN factor $\alpha > 0$, let $\mathcal{F}$'s weights be scaled to $\alpha W$. Since $\mathcal{F}$ consists of linear projections followed by layer normalization, the output of $\mathcal{F}$ scales linearly: $\mathcal{F}_{\alpha}(\text{LN}(\mathbf{x})) = \alpha \mathcal{F}(\text{LN}(\mathbf{x}))$. Substituting this into the residual block:
+\begin{equation}
+    \mathbf{y}_{scaled} = \mathbf{x} + \alpha \mathcal{F}(\text{LN}(\mathbf{x}))
+\end{equation}
+Because the additive identity path $\mathbf{x}$ is not scaled, the global factor $\alpha$ cannot be factored out across the residual block boundary. Thus, global weight scaling \emph{is not} mathematically neutral in residual networks; instead, it modifies the relative ratio between the identity path (original features) and the task-specific update path. 
+
+In SVS model merging on CLIP-ViT-B/32, SVS with and without BWN achieve virtually identical performances primarily because the computed scaling factor is extremely close to 1.0 (mean $\alpha = 0.998$ across layers). Because $\alpha \approx 1.0$, the relative residual path update ratio remains unchanged, making the scale correction empirically redundant. However, in larger networks or settings where fine-tuning trajectories are large, this residual boundary condition indicates that weight scaling acts as a structural hyperparameter regulating update path intensity.
+
+\subsubsection{Theoretical Implications for Model Merging}
+This general mathematical scale-invariance leads to a profound theoretical insight: **for almost all modern Transformer and normalized architectures, explicit weight scale-preservation algorithms are fundamentally redundant.** 
+
+While previous model merging works have spent considerable effort designing complex, iterative test-time optimization loops or test-time weight-scaling parameters to "preserve representation scale," they have overlooked the fact that the underlying network architectures are naturally and mathematically scale-invariant. The forward-pass normalization layers (L2, LN, or RMS) act as natural scale stabilizers that neutralize scale shifts. 
+
+Consequently, we can draw two core conclusions:
+\begin{enumerate}
+    \item We can completely discard global weight-scaling parameters and scale-tuning steps, simplifying the merging pipeline even further.
+    \item SVS can be deployed in its purest, most stripped-down low-rank form without any scale-preservation logic, since the architecture's inherent normalization acts as a natural stabilizer.
+\end{enumerate}
+
+\subsection{Information-Theoretic Spectral Capacity: Entropy-Based Rank Allocation}
+\label{sec:entropy_rank_allocation}
+
+While applying a uniform spectral rank $k$ across all layers of a deep network is simple, it assumes that all parameter matrices acquire task-specific information with equal complexity. In reality, different layers of a deep neural network serve distinct functions: early layers project raw pixel inputs into low-level representations, while deeper attention layers capture high-level semantic dependencies. Consequently, some layers may experience dense, high-complexity parameter updates, while others undergo highly concentrated, low-rank adjustments.
+
+To address this structural discrepancy without introducing training parameters, we propose an analytical, training-free, and information-theoretic rank allocation scheme based on \emph{singular value entropy}.
+
+For a given task-specific update matrix (task vector) $T_t \in \mathbb{R}^{m \times n}$ at a specific layer, let $d = \min(m, n)$ be its maximum possible rank, and let $\Sigma_t = \text{diag}(\sigma_{t, 1}, \sigma_{t, 2}, \dots, \sigma_{t, d})$ be its singular values sorted in descending order. We define the normalized singular value probability distribution as:
+\begin{equation}
+    p_i = \frac{\sigma_{t, i}}{\sum_{j=1}^d \sigma_{t, j}}
+\end{equation}
+where $p_i$ represents the proportion of total spectral energy captured by the $i$-th singular component.
+
+The Shannon spectral entropy of this layer, which measures the complexity and dispersion of the parameter fine-tuning trajectory, is defined as:
+\begin{equation}
+    H(T_t) = -\sum_{i=1}^d p_i \log(p_i + \epsilon)
+\end{equation}
+where $\epsilon > 0$ is a small stabilization constant (e.g., $10^{-10}$) to handle zero singular values. 
+
+The maximum possible spectral entropy occurs when the singular values are completely uniform, representing a flat, full-rank parameter shift across the layer:
+\begin{equation}
+    H_{max} = \log(d)
+\end{equation}
+Using these quantities, we define the \emph{normalized spectral complexity} $\bar{H}(T_t) \in [0, 1]$ as:
+\begin{equation}
+    \bar{H}(T_t) = \frac{H(T_t)}{H_{max}}
+\end{equation}
+
+The normalized entropy $\bar{H}(T_t)$ serves as an elegant measure of the layer's informational density. If $\bar{H}(T_t)$ is close to 1, the parameter updates are highly distributed and complex, meaning any aggressive truncation would lead to severe information loss. Conversely, if $\bar{H}(T_t)$ is close to 0, the updates are highly concentrated in a low-rank subspace, meaning the layer can be pruned extremely aggressively.
+
+We use this spectral complexity to dynamically allocate the slicing rank $k_l$ for layer $l$:
+\begin{equation}
+    k_l = \max\left(1, \text{round}\left(k_{base} \times \bar{H}(T_t) \times m_{\text{entropy}}\right)\right)
+\end{equation}
+where $k_{base}$ is the global user-specified base rank (e.g., $128$), and $m_{\text{entropy}} \geq 0$ is a global scaling multiplier that controls the intensity of spectral compression. By varying $m_{\text{entropy}}$, we can trace a continuous Pareto frontier of accuracy versus rank compression. 
+
+Under this scheme, layers with high spectral complexity are allocated higher rank capacity (approaching $k_{base}$), while spectrally simple layers are pruned more aggressively to a smaller rank. This provides an analytical, training-free, and locally adaptive low-rank projection that respects the structural hierarchy of the model backbone.
+
+\subsection{Zero-Overhead Post-Synthesis Deployment}
+A major benefit of SVS is its complete lack of inference overhead. The SVD, slicing, linear consensus, and barycentric normalization are performed entirely offline (post-synthesis). Once the merged weight matrix $W_{final}$ is computed, it is directly injected back into the target layer of the model backbone.
+
+During inference, downstream multi-task samples pass through the standard, unmodified network architecture. Consequently, SVS introduces:
+\begin{itemize}
+    \item \textbf{0} additional trainable parameters,
+    \item \textbf{0} extra test-time adaptation latency, and
+    \item \textbf{0} extra inference-time FLOPs or latency.
+\end{itemize}
+SVS achieves multi-task consolidation with low computational overhead.

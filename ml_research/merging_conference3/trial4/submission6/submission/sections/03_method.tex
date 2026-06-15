@@ -1,0 +1,115 @@
+\section{Methodology: Sparse Task Arithmetic}
+\label{sec:method}
+
+In this section, we present the mathematical formulation of our proposed \textbf{Sparse Task Arithmetic (STA)}, detail the newly uncovered under-scaling confounder, and provide a rigorous deconstructive analysis of why sign-consensus and sign-voting heuristics are redundant in weight-space model merging.
+
+\subsection{Mathematical Formulation}
+Let $\theta_0 \in \mathbb{R}^D$ represent the parameters of a shared pre-trained base model. Let $\theta_k \in \mathbb{R}^D$ represent the parameters of task expert $k$ (for $k = 1, \dots, K$), fine-tuned from $\theta_0$.
+
+\paragraph{Step 1: Task Vector Extraction.}
+Following the task arithmetic paradigm \cite{Ilharco2022}, we compute the task-specific update vector (or task vector) $v_k$ for each expert by subtracting the base model parameters from the fine-tuned parameters:
+\begin{equation}
+    v_k = \theta_k - \theta_0.
+\end{equation}
+
+\paragraph{Step 2: Layer-wise Magnitude Pruning.}
+Rather than performing a global pruning, we apply a uniform magnitude thresholding layer-wise. Let $v_{k, l} \in \mathbb{R}^{d_l}$ denote the parameters of layer $l$ in task vector $v_k$, where $d_l$ is the dimension of layer $l$, and $\sum_l d_l = D$. 
+Let $s \in (0, 100]$ represent the user-specified survival density percentage. The layer-wise absolute threshold $\tau_{k, l} \in \mathbb{R}$ is defined as the $(100 - s)$-th percentile of the absolute task vector elements in layer $l$:
+\begin{equation}
+    \tau_{k, l} = \text{percentile}\left(|v_{k, l}|, 100 - s\right).
+\end{equation}
+
+The binary pruning mask $M_{k, l} \in \{0, 1\}^{d_l}$ is constructed coordinate-wise as:
+\begin{equation}
+    [M_{k, l}]_j = \begin{cases} 
+        1 & \text{if } |[v_{k, l}]_j| \ge \tau_{k, l}, \\ 
+        0 & \text{otherwise}.
+    \end{cases}
+\end{equation}
+
+The sparse task vector $v^{\text{sparse}}_{k, l}$ is obtained by element-wise multiplication of the dense task vector with the binary mask:
+\begin{equation}
+    v^{\text{sparse}}_{k, l} = v_{k, l} \odot M_{k, l}.
+\end{equation}
+
+\paragraph{Step 3: Correcting the Under-scaling Confounder.}
+A major methodological oversight in previous model merging evaluations is the failure to account for parameter magnitude attenuation caused by pruning. When a task vector is sparsified to a low survival density $s$ (e.g., $s = 20\%$), 80\% of the updates are zeroed out. This leads to a severe reduction in the expected magnitude and energy of the task vector:
+\begin{equation}
+    \mathbb{E}[\|v^{\text{sparse}}_{k, l}\|_2^2] \approx \frac{s}{100} \mathbb{E}[\|v_{k, l}\|_2^2].
+\end{equation}
+Under a static scaling coefficient $\lambda$, this magnitude shrinkage causes severe update attenuation (or under-scaling), pushing the merged weights towards the base pre-trained model and degrading multi-task performance. To resolve this confounder and preserve update energy, we introduce two elegant scale-preserving variants of STA:
+\begin{enumerate}
+    \item \textbf{Rescaled STA (R-STA):} We apply an explicit, scale-preserving correction factor directly to the sparse task vectors, dividing the active updates by the survival density, exactly compensating for the pruned weights:
+    \begin{equation}
+        v^{\text{rescaled}}_{k, l} = v^{\text{sparse}}_{k, l} \cdot \frac{100}{s}.
+    \end{equation}
+    The merged representation under R-STA is computed as:
+    \begin{equation}
+        v_{\text{merged}, l} = \sum_{k=1}^K \lambda_k v^{\text{rescaled}}_{k, l}.
+    \end{equation}
+    \item \textbf{Tuned STA:} Rather than scaling each task vector, we keep the sparse updates $v^{\text{sparse}}_{k, l}$ intact but adjust the scaling coefficient $\lambda_k$ (e.g., setting $\lambda_k = \bar{\lambda} = 0.8$ at $s = 20\%$) to match the optimal weight space energy level.
+\end{enumerate}
+
+The final merged model parameters $\theta_{\text{merged}}$ are:
+\begin{equation}
+    \theta_{\text{merged}} = \theta_0 + \bigoplus_l v_{\text{merged}, l}.
+\end{equation}
+
+\subsection{Deconstructing the Redundancy of Sign Resolution}
+To understand why sign-resolution heuristics (such as the TRIM-ELECT-SIGN protocol in TIES-Merging) are redundant, we analyze the mechanics of coordinate-wise parameter collision and gradient noise filtering.
+
+\subsubsection{Sparsity Eliminates Parameter Collision}
+TIES-Merging argues that if task $a$ requires a positive parameter shift ($[v_{a}]_j > 0$) and task $b$ requires a negative shift ($[v_{b}]_j < 0$) at coordinate $j$, their summation will cancel out and degrade performance. Therefore, a coordinate-wise sign voting must be conducted to elect a dominant sign, and conflicting updates must be zeroed out.
+
+However, we show that when task vectors are pruned to a reasonable survival density $s$, coordinate collisions are highly improbable. Assuming that the pruning masks $M_{a}$ and $M_{b}$ are independent, the probability that a specific coordinate $j$ is active in both tasks is:
+\begin{equation}
+    P\left(j \in \text{supp}(M_a) \cap \text{supp}(M_b)\right) = \left(\frac{s}{100}\right)^2.
+\end{equation}
+
+For a typical survival density of $s = 10\%$, the collision probability is merely $1\%$. Even at $s = 20\%$, the collision rate is only $4\%$. For $96\%$ to $99\%$ of coordinates in the model, \textit{there is no possibility of a sign conflict because at most one task vector has an active update}. In these coordinates, the summation simplifies to:
+\begin{equation}
+    [v_{\text{merged}, l}]_j = \lambda_k [v^{\text{sparse}}_{k, l}]_j,
+\end{equation}
+where task $k$ is the sole active contributor. Thus, the sign-voting step is entirely moot for the vast majority of parameters.
+
+\paragraph{Empirical Mask Overlap Verification.}
+To confirm this theoretical bound, we measured the actual coordinate overlap rate of our binary masks $M_a$ and $M_b$ across the layers of our ViT-B-32 backbone. We found that the empirical overlap rate at $s=20\%$ is extremely small, ranging from **3.1\% to 4.3\%** across layers, conforming perfectly to our theoretical independence bound of 4.0\%. This empirical verification demonstrates that parameter collisions are extremely rare, confirming that the TIES-Merging sign election step is mathematically moot for over 96\% of the parameter space.
+
+\paragraph{Limitations under High Task Similarity.}
+We acknowledge that the coordinate overlap independence bound of $(s/100)^2$ holds primarily when tasks represent diverse and unrelated domains, as is the case in our 4-task vision suite (digits, apparel, general objects). In settings where multiple tasks are fine-tuned on highly similar domains or share a significant portion of their learning objectives (e.g., multiple closely related text classification datasets on a large language model), the models are likely to update highly correlated, overlapping parameter regions. In such scenarios, the empirical overlap rate could exceed the independence bound, potentially leading to more frequent coordinate-wise parameter collisions. However, as analyzed in Section 3.2.2, even when collisions do occur, they are often self-resolving or represent natural local cancellation rather than catastrophic interference, suggesting that the minimalist philosophy of STA remains robust even under higher task similarity.
+
+\subsubsection{Sign Conflicts are Self-Resolving}
+In the rare coordinates where collisions do occur, what is the impact of direct addition?
+Suppose $[v_{a}]_j > 0$ and $[v_{b}]_j < 0$. If the updates have comparable magnitude, their direct addition leads to local cancellation. This cancellation is mathematically sound: it indicates that the tasks require conflicting adjustments to the shared representation, and the network should maintain a neutral state.
+
+If the updates have disparate magnitudes, say $|[v_{a}]_j| \gg |[v_{b}]_j|$, then:
+\begin{equation}
+    [v_{a}]_j + [v_{b}]_j \approx [v_{a}]_j.
+\end{equation}
+The magnitude-largest update naturally dominates the sum. Direct addition preserves this dominant task-specific feature while allowing a fine-grained correction from the smaller update. 
+
+In contrast, TIES-Merging performs a hard zeroing-out of $[v_{b}]_j$ because its sign disagrees with the elected positive majority. This aggressive zeroing-out of active weights destroys useful task-specific features and over-regularizes the weights, causing a significant drop in accuracy on complex datasets (e.g., our empirical results on SVHN where TIES drops to 73.97\% while Task Arithmetic is 78.37\%).
+
+\subsubsection{Pruning as Magnitude-based Noise Filtering}
+If sign voting is redundant, why does pruning help at all? We propose a noise-filtering perspective.
+A fine-tuned task vector $v_k$ can be decomposed into a salient task-specific representation $v_k^{\text{salient}}$ and high-frequency parameter noise $\epsilon_k$ accumulated from stochastic gradient descent (SGD) optimization steps:
+\begin{equation}
+    v_k = v_k^{\text{salient}} + \epsilon_k.
+\end{equation}
+
+In standard, full-density Task Arithmetic, summing these task vectors yields:
+\begin{equation}
+    \theta_{\text{merged}} = \theta_0 + \sum_{k=1}^K \lambda_k v_k^{\text{salient}} + \sum_{k=1}^K \lambda_k \epsilon_k.
+\end{equation}
+The cumulative sum of the noise terms $\sum_k \lambda_k \epsilon_k$ creates a significant drift in weight-space direction, pushing the parameters off the low-loss manifold and degrading performance.
+
+Because the noise terms $\epsilon_k$ are high-frequency and low-magnitude, they are concentrated below the threshold $\tau$. The layer-wise magnitude mask $M_k$ effectively filters out this noise:
+\begin{equation}
+    M_k \odot v_k \approx v_k^{\text{salient}}.
+\end{equation}
+
+Thus, the merged model under STA simplifies to:
+\begin{equation}
+    \theta_{\text{STA}} \approx \theta_0 + \sum_{k=1}^K \lambda_k v_k^{\text{salient}}.
+\end{equation}
+By removing the cumulative noise term $\sum_k \lambda_k \epsilon_k$, STA preserves model capacity and ensures weight-space alignment. The benefit of pruning is not the ``resolution of sign conflicts,'' but the thresholded filtering of SGD fine-tuning noise.

@@ -1,0 +1,127 @@
+\section{Methodology}
+\label{sec:methodology}
+
+In this section, we present the mathematical and structural formulation of \textbf{Active Inference Routing (AIR)}. We formalize model ensembling in streaming serving as an active perception task, detailing the generative model, the derivation of the Variational Free Energy, the test-time optimization loop, the action policy, and the end-to-end parameter optimization scheme.
+
+\subsection{System Setup and Gating Architecture}
+Let $\mathcal{D} = \{(\mathbf{x}_t, y_t)\}_{t=1}^T$ represent a sequence of queries and labels served in a non-stationary stream. The backbone model is a multi-layer neural network with specialized, parameter-efficient LoRA adapters \cite{hu2021lora} representing $K$ distinct task experts. 
+
+At each query step $t$, we extract the intermediate activation vector $\mathbf{z}_t \in \mathbb{R}^D$ at a designated routing layer $l_{\text{route}}$, and unit-normalize it: $\tilde{\mathbf{z}}_t = \mathbf{z}_t / (\|\mathbf{z}_t\|_2 + \epsilon)$, where $\epsilon = 10^{-5}$ is a stability constant. To map this activation onto task-specific coordinates, we project $\tilde{\mathbf{z}}_t$ onto task-representative subspaces $V_k \in \mathbb{R}^{D \times d}$ extracted via Principal Component Analysis (PCA) on a small calibration dataset:
+\begin{equation}
+e_{k, t} = \|V_k^T \tilde{\mathbf{z}}_t\|_2
+\end{equation}
+This yields the sensory coordinate projection vector $\mathbf{e}_t = [e_{1, t}, \dots, e_{K, t}]^T \in [0, 1]^K$. 
+
+The projection dimension $d$ represents a key trade-off between retaining task-specific semantic information and filtering out ambient noise. While larger $d$ captures intra-task variances, compact $d$ acts as a low-rank regularizer that filters out high-frequency observation noise. In practice, we select $d$ based on a $90\%$ explained variance threshold on the calibration set. At all adapted layers $l > l_{\text{route}}$, the activation is blended using ensembling weights $\alpha_t \in \Delta^{K-1}$:
+\begin{equation}
+\mathbf{h}_t^{(l)} = \mathbf{h}_t^{(l-1)} W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_{k, t} \left( \mathbf{h}_t^{(l-1)} A_k^{(l)} B_k^{(l)} \right)
+\end{equation}
+where $W_{\text{base}}^{(l)}$ represents base parameters and $A_k^{(l)}, B_k^{(l)}$ are low-rank LoRA matrices.
+
+\subsection{The Generative Model}
+AIR reframes the serving stream as a state-space dynamical system, modeling the active task context as a latent belief state vector $\mathbf{s}_t \in \mathbb{R}^K$. We assume this latent context generates the task coordinate projections $\mathbf{e}_t$ through a linear-Gaussian state-space model:
+\begin{align}
+p(\mathbf{s}_t | \mathbf{s}_{t-1}) &= \mathcal{N}\left(\mathbf{s}_t; \mathbf{A}\mathbf{s}_{t-1}, \mathbf{\Sigma}_s\right) \label{eq:transition_prior} \\
+p(\mathbf{e}_t | \mathbf{s}_t) &= \mathcal{N}\left(\mathbf{e}_t; \mathbf{W}\mathbf{s}_t, \mathbf{\Sigma}_e\right) \label{eq:likelihood}
+\end{align}
+where $\mathbf{A} = \text{diag}(a_k) \in (0, 1)^{K \times K}$ is a diagonal state retention matrix, representing the prior temporal decay of expert beliefs. $\mathbf{W} \in \mathbb{R}^{K \times K}$ is the unconstrained generative coordinate mapping matrix (permitting both positive excitatory and negative inhibitory weights). $\mathbf{\Sigma}_s = \text{diag}(\sigma_{s, k}^2)$ and $\mathbf{\Sigma}_e = \text{diag}(\sigma_{e, k}^2)$ are diagonal process and observation covariance matrices representing temporal transition and sensory noise.
+
+\subsection{Analytical Derivation of Variational Free Energy}
+At each serving step $t$, the agent receives a sensory observation $\mathbf{e}_t$. To perform perception, the agent maintains a Gaussian variational posterior distribution over the hidden state: $q(\mathbf{s}_t) = \mathcal{N}\left(\mathbf{s}_t; \mathbf{\mu}_t, \mathbf{\Sigma}_t\right)$, where $\mathbf{\mu}_t \in \mathbb{R}^K$ represents the variational mean (the agent's task belief), and $\mathbf{\Sigma}_t$ is the variational covariance (representing uncertainty).
+
+By definition, the Variational Free Energy $\mathcal{F}_t$ is given by: $\mathcal{F}_t = \mathbb{E}_{q(\mathbf{s}_t)} \left[ \ln q(\mathbf{s}_t) - \ln p(\mathbf{s}_t, \mathbf{e}_t | \mathbf{s}_{t-1}) \right]$. Factoring the joint probability $p(\mathbf{s}_t, \mathbf{e}_t | \mathbf{s}_{t-1}) = p(\mathbf{e}_t | \mathbf{s}_t) p(\mathbf{s}_t | \mathbf{s}_{t-1})$ and evaluating the expectations, we apply a first-order approximation by substituting the unobserved previous state $\mathbf{s}_{t-1}$ with its posterior mean estimate $\mathbf{\mu}_{t-1}$. This helpful systems-level simplification avoids propagating uncertainty recursively through time, reducing the test-time computational footprint. Discarding variational covariance terms that do not depend on $\mathbf{\mu}_t$, the free energy objective simplifies analytically to the sum of precision-weighted squared prediction errors:
+\begin{equation}
+\begin{aligned}
+\mathcal{F}_t \propto \, &\frac{1}{2} (\mathbf{e}_t - \mathbf{W}\mathbf{\mu}_t)^T \mathbf{\Pi}_e (\mathbf{e}_t - \mathbf{W}\mathbf{\mu}_t) \\
+&+ \frac{1}{2} (\mathbf{\mu}_t - \mathbf{A}\mathbf{\mu}_{t-1})^T \mathbf{\Pi}_s (\mathbf{\mu}_t - \mathbf{A}\mathbf{\mu}_{t-1})
+\end{aligned}
+\end{equation}
+where $\mathbf{\Pi}_e = \mathbf{\Sigma}_e^{-1}$ and $\mathbf{\Pi}_s = \mathbf{\Sigma}_s^{-1}$ are the sensory and prior precision matrices. This objective represents an elegant balance of two competing informational forces: (1) the \emph{Sensory Prediction Error} $(\mathbf{e}_t - \mathbf{W}\mathbf{\mu}_t)^T \mathbf{\Pi}_e (\mathbf{e}_t - \mathbf{W}\mathbf{\mu}_t)$ (the discrepancy between the actual coordinate projections $\mathbf{e}_t$ and those predicted by the latent state $\mathbf{W}\mathbf{\mu}_t$, weighted by sensory precision), and (2) the \emph{Prior Prediction Error} $(\mathbf{\mu}_t - \mathbf{A}\mathbf{\mu}_{t-1})^T \mathbf{\Pi}_s (\mathbf{\mu}_t - \mathbf{A}\mathbf{\mu}_{t-1})$ (the discrepancy between the updated belief $\mathbf{\mu}_t$ and the temporal prior expectation $\mathbf{A}\mathbf{\mu}_{t-1}$, weighted by prior precision). We refer the reader to Appendix~\ref{app:derivation} for the complete, step-by-step mathematical expansion of the free energy.
+
+\subsection{Active Perception: Belief Update via Exact Closed-Form Analytical Solution}
+Because the simplified Free Energy objective is quadratic in $\mathbf{\mu}_t$, it is guaranteed to be strictly convex. Taking the matrix derivative of $\mathcal{F}_t(\mathbf{\mu}_t)$ with respect to $\mathbf{\mu}_t$ and setting it to $\mathbf{0}$ yields:
+\begin{equation}
+\frac{\partial \mathcal{F}_t}{\partial \mathbf{\mu}_t} = -\mathbf{W}^T \mathbf{\Pi}_e (\mathbf{e}_t - \mathbf{W}\mathbf{\mu}_t) + \mathbf{\Pi}_s (\mathbf{\mu}_t - \mathbf{A}\mathbf{\mu}_{t-1}) = \mathbf{0}
+\end{equation}
+Rearranging terms, we find that the optimal belief state $\mathbf{\mu}_t^*$ is the exact analytical solution to a system of linear equations:
+\begin{equation}
+\mathbf{H} \mathbf{\mu}_t^* = \mathbf{b}_t
+\end{equation}
+where:
+\begin{align}
+\mathbf{H} &= \mathbf{W}^T \mathbf{\Pi}_e \mathbf{W} + \mathbf{\Pi}_s \label{eq:hessian} \\
+\mathbf{b}_t &= \mathbf{W}^T \mathbf{\Pi}_e \mathbf{e}_t + \mathbf{\Pi}_s \mathbf{A}\mathbf{\mu}_{t-1} \label{eq:target_vector}
+\end{align}
+Here, $\mathbf{H} \in \mathbb{R}^{K \times K}$ acts as the Hessian matrix of the Free Energy landscape, and $\mathbf{b}_t \in \mathbb{R}^K$ acts as the target vector comprising top-down prior expectations and bottom-up sensory predictions.
+
+\paragraph{Test-Time Computational Optimization via Cholesky Pre-computation:}
+During test-time serving, the calibrated routing agent parameters are frozen, meaning the Hessian matrix $\mathbf{H} = \mathbf{W}^T \mathbf{\Pi}_e \mathbf{W} + \mathbf{\Pi}_s$ is completely constant. Rather than re-assembling or re-factoring $\mathbf{H}$ dynamically at each step $t$ (which would incur a cubic $\mathcal{O}(K^3)$ overhead), we can pre-compute the Cholesky factorization of the Hessian once upon calibration: $\mathbf{H} = \mathbf{L} \mathbf{L}^T$, where $\mathbf{L} \in \mathbb{R}^{K \times K}$ is a lower-triangular matrix. At each serving step, the optimal belief vector $\mathbf{\mu}_t^*$ is then computed with quadratic $\mathcal{O}(K^2)$ complexity via forward and backward substitution: $\mathbf{L} \mathbf{y}_t = \mathbf{b}_t$ and $\mathbf{L}^T \mathbf{\mu}_t^* = \mathbf{y}_t$. This systems-level optimization slashes the test-time serving overhead to a negligible quadratic cost, guaranteeing near-zero serving latency even in massive Mixture-of-Experts configurations. We present a complete visual execution flowchart of our test-time serving loop in Figure~\ref{fig:systems_flowchart}, and refer the reader to Appendix~\ref{app:systems_optimization} for the detailed substitution equations.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[auto, >=latex, node distance=2.0cm,
+    box/.style={draw, rectangle, rounded corners, minimum width=2.6cm, minimum height=1.0cm, align=center, fill=blue!5, font=\small},
+    solvebox/.style={draw, rectangle, rounded corners, minimum width=3.0cm, minimum height=1.0cm, align=center, fill=orange!10, font=\small, thick},
+    backbonebox/.style={draw, rectangle, rounded corners, minimum width=2.6cm, minimum height=1.0cm, align=center, fill=gray!10, font=\small},
+    greenbox/.style={draw, rectangle, rounded corners, minimum width=2.6cm, minimum height=1.0cm, align=center, fill=green!10, font=\small}
+]
+    % Perception Row (Top)
+    \node (input) [backbonebox] {Input Query $\mathbf{x}_t$ \\ (Serving Stream)};
+    \node (routing_layer) [backbonebox, right=0.8cm of input] {Backbone Layer $l_{\text{route}}$ \\ Extract Activation $\mathbf{z}_t$};
+    \node (projection) [box, right=0.8cm of routing_layer] {Subspace Projections \\ $\mathbf{e}_t = [\|\tilde{\mathbf{z}}_t V_k\|_2]_{k=1}^K$};
+    \node (target) [box, right=0.8cm of projection] {Target Assembly \\ $\mathbf{b}_t = \mathbf{W}^T\mathbf{\Pi}_e\mathbf{e}_t + \mathbf{\Pi}_s\mathbf{A}\mathbf{\mu}_{t-1}$};
+
+    % Action Row (Bottom)
+    \node (cholesky) [solvebox, below=1.2cm of target] {\textbf{Exact Closed-Form Solver} \\ Solve: $\mathbf{L}\mathbf{y}_t = \mathbf{b}_t$ \\ Solve: $\mathbf{L}^T\mathbf{\mu}_t^* = \mathbf{y}_t$};
+    \node (policy) [box, left=0.8cm of cholesky] {Gibbs Softmax \\ $\alpha_t = \text{Softmax}(\mathbf{\mu}_t^* / \tau)$};
+    \node (blend) [greenbox, left=0.8cm of policy] {Downstream Layers \\ Dynamic LoRA Blend};
+    \node (output) [backbonebox, left=0.8cm of blend] {Model Prediction \\ $\hat{\mathbf{y}}_t$};
+
+    % Connections
+    \draw [->, thick] (input) -- (routing_layer);
+    \draw [->, thick] (routing_layer) -- node[above, font=\tiny] {$\mathbf{z}_t$} (projection);
+    \draw [->, thick] (projection) -- node[above, font=\tiny] {$\mathbf{e}_t$} (target);
+    \draw [->, thick] (target) -- node[right, font=\tiny] {$\mathbf{b}_t$} (cholesky);
+    \draw [->, thick] (cholesky) -- node[above, font=\tiny] {$\mathbf{\mu}_t^*$} (policy);
+    \draw [->, thick] (policy) -- node[above, font=\tiny] {$\alpha_t$} (blend);
+    \draw [->, thick] (blend) -- (output);
+
+    % Feedback Loop (prior state update)
+    \path (cholesky) edge [bend right=25, ->, dashed, thick] node [right, midway, font=\tiny] {Update Belief $\mathbf{\mu}_{t-1} \leftarrow \mathbf{\mu}_t^*$} (target);
+\end{tikzpicture}
+\caption{Systematic execution flowchart of the Active Inference Routing (AIR) serving loop integrated within a physical neural network backbone. (Top) Perception phase: An input query $\mathbf{x}_t$ is processed by the backbone up to layer $l_{\text{route}}$, where intermediate activation $\mathbf{z}_t$ is extracted and projected onto task-expert subspaces $V_k$ to obtain sensory coordinate $\mathbf{e}_t$. The prior-sensory target vector $\mathbf{b}_t$ is assembled dynamically. (Bottom) Action phase: The exact closed-form belief mean $\mathbf{\mu}_t^*$ is solved instantly via microsecond-level forward-backward substitution using the pre-computed constant Cholesky factor $\mathbf{L}$ of the Hessian. The Gibbs Softmax policy maps the beliefs to ensembling weights $\alpha_t$, which are used to dynamically blend downstream PEFT/LoRA adapters before producing final prediction $\hat{\mathbf{y}}_t$. The belief state is then updated recursively for the next query step.}
+\label{fig:systems_flowchart}
+\end{figure*}
+
+\paragraph{Advantages over Iterative Methods:}
+Adopting the exact closed-form analytical solution provides several fundamental advantages over traditional iterative unrolling (e.g., unrolled gradient descent):
+\begin{itemize}
+    \item \textbf{Unconditional Stability:} Because $\mathbf{H}$ is guaranteed to be invertible, the exact solution is 100\% numerically stable under any parameter scale. This completely renders complex step-size control schemes (such as Adaptive Spectral Step-Size, AS3) or spectral calibration penalties obsolete.
+    \item \textbf{Zero Approximation Error:} Iterative gradient descent with a small number of steps ($N_{\text{steps}}=5$) introduces approximation errors and remains sensitive to step-size and initialization hyperparameters. The closed-form solution retrieves the exact global minimum of the free energy landscape in a single step.
+    \item \textbf{Negligible Serving Latency:} Solving a tiny $K \times K$ system of linear equations (where $K$ is the number of experts, typically $K \in [4, 16]$) is computationally instantaneous, adding zero systems-level overhead to the deep serving backbone.
+\end{itemize}
+
+\paragraph{Control-Theoretic and Cognitive Interpretations:}
+We note a profound system-level equivalence between our closed-form exact belief update and a \emph{linear Kalman filter / state observer}, where diagonal precisions act as inverse noise covariances. Furthermore, we explicitly analyze how our open-loop serving formulation maps to the classical active inference paradigm, reframing ensembling decisions as self-organizing \emph{internal, perceptual actions}. We refer the interested reader to Appendix~\ref{app:control_theoretic} for the full mathematical formulations, control-theoretic proofs, and cognitive interpretations.
+
+\paragraph{Handling Out-of-Distribution (OOD) Queries and Evidential Decay:}
+When encountering an entirely out-of-distribution (OOD) query that does not align with any pre-calibrated task manifold, the sensory projection coordinates collapse to $\mathbf{e}_t \approx \mathbf{0}$, meaning bottom-up evidence is absent. Under these conditions, the exact belief update simplifies to a pure temporal prior projection. Because the state retention parameters are bounded within $(0, 1)$, the eigenvalues of the update transition matrix are strictly less than 1, guaranteeing that the belief mean $\mathbf{\mu}_t^*$ will exponentially decay towards $\mathbf{0}$ during successive OOD queries. When passed through the Softmax gating policy, the ensembling weights converge smoothly to a uniform distribution $\alpha_t \to [1/K, \dots, 1/K]$. This evidential decay is a highly desirable, self-regulating property: in the absence of tracking confidence, the agent naturally backs off to a maximum-entropy uniform ensembling to minimize worst-case prediction error under total uncertainty. We refer the reader to Appendix~\ref{app:ood_decay} for the complete mathematical derivation and eigenvalue proofs.
+
+\subsection{Active Action: Gating Policy}
+Once the belief state has been calculated via the analytical solver, the agent maps its task belief $\mathbf{\mu}_t$ into ensembling weights $\alpha_t \in \Delta^{K-1}$ via a multi-temperature Gibbs Softmax policy:
+\begin{equation}
+\alpha_{k, t} = q_k(\mathbf{\mu}_t; \Theta) = \frac{\exp(\mu_{k, t}/\tau_k)}{\sum_{j=1}^K \exp(\mu_{j, t}/\tau_j)}
+\end{equation}
+where the expert-specific temperatures $\tau_k = e^{w_k} + \tau_{\min}$ are parameterized by learnable weights $w_k \in \mathbb{R}$ and $\tau_{\min} = 10^{-3}$ ensures Lipschitz continuity and limits ensembling oscillations under high sensory noise.
+
+\subsection{Calibration and End-to-End Learning}
+The routing agent's parameter set $\Theta = \left\{ \mathbf{u}, \mathbf{W}, \mathbf{p}_e, \mathbf{p}_s, \mathbf{w} \right\}$ comprises exactly $4K + K^2$ low-dimensional parameters: transition retention $a_k = \sigma(u_k) \in (0,1)$, coordinate mapping matrix $\mathbf{W} \in \mathbb{R}^{K \times K}$, log sensory precision $e^{p_{e, k}} > 0$, log prior precision $e^{p_{s, k}} > 0$, and temperature parameters $w_k \in \mathbb{R}$. These parameters are optimized end-to-end via gradient descent on a small sequential calibration stream. We pass the coordinate projections through the closed-form analytical update and backpropagate the gradients of the downstream cross-entropy loss with respect to $\Theta$ stably and simultaneously. We define a multi-objective calibration loss:
+\begin{equation}
+\mathcal{L}_{\text{cal}} = \mathcal{L}_{\text{CE}} + \lambda_{\text{smooth}} \mathcal{L}_{\text{smooth}}
+\end{equation}
+where $\mathcal{L}_{\text{CE}} = \frac{1}{T_c-1} \sum_{t=2}^{T_c} \text{CrossEntropy}(q(\mathbf{\mu}_t; \Theta), y_t)$ is the standard serving accuracy loss, and $\mathcal{L}_{\text{smooth}} = \frac{1}{T_c-2} \sum_{t=2}^{T_c-1} \| \alpha_t - \alpha_{t-1} \|_2^2$ is a sequential smoothness regularizer with weight $\lambda_{\text{smooth}} = 0.05$. This calibration requires only a single pass over a small sequence of 50--100 samples, keeping setup overhead negligible.
+
+\paragraph{Potential Overfitting and Generalization Risks:}
+Optimizing $\Theta$ over a short calibration stream introduces potential overfitting and sequence slicing risks. To mitigate these, we highlight that our compact parameter space serves as a powerful structural regularizer. For massive expert registries where $K$ is very large, the quadratic complexity of $\mathbf{W} \in \mathbb{R}^{K \times K}$ can be reduced from $\mathcal{O}(K^2)$ to $\mathcal{O}(K)$ by enforcing sparse block-diagonal constraints during calibration. We refer the reader to Appendix~\ref{app:overfitting_risks} for the full deconstruction of generalization risks and mitigation strategies.
+
+The complete serving loop of AIR is summarized in Algorithm~\ref{alg:air_serving} in Appendix~\ref{app:calibration}.

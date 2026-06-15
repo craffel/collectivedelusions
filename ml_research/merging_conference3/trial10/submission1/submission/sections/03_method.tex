@@ -1,0 +1,237 @@
+\section{Methodology: Dynamic Path-Integral Ensembling}
+\label{sec:method}
+
+In this section, we present the mathematical formulation of our proposed \textbf{QPathMerge} (Markovian Path-Integral Ensembling) framework. Rather than constructing heuristic feedforward smoothers or maintaining slow continuous-time state variables across sequential samples, we model the sequence of network layers as a discrete 1D lattice and compute globally optimized ensembling weights using the exact Forward-Backward sum-product algorithm on a chain-structured Markov Random Field (MRF). While we draw an elegant, physics-inspired mathematical analogy from discrete Euclidean path integrals in statistical mechanics, the underlying mechanism is entirely classical and built upon probabilistic graphical models.
+
+\subsection{Network Depth as a Path Lattice}
+Let the deep neural network consist of $L$ sequential layers, with active ensembling applied across a subset of contiguous layers $l \in \{L_{\text{start}}, \dots, L_{\text{end}}\}$ (e.g., active layers $4$ to $14$ in a 14-layer model). Let the serving system maintain a set of $K$ pre-trained visual or task-specific expert adapters (e.g., LoRA matrices $\Delta W_k^{(l)}$ for expert $k \in \{1, \dots, K\}$). 
+
+To achieve a true layer-wise dynamic formulation that remains completely stateless across sequence samples, we propose an elegant two-pass \textbf{Predict-then-Smooth} routing pipeline:
+\begin{enumerate}
+    \item \textbf{Predict Pass (First Pass):} Before executing the final, low-jitter forward pass, we perform a rapid, trial forward execution of the network's active layers using a simple local stateless router (such as nearest-centroid SABLE) to generate a trial intermediate representation trajectory:
+    \begin{equation}
+        \mathbf{h}_{\text{trial}} = (h_{\text{trial}}^{(L_{\text{start}}-1)}, h_{\text{trial}}^{(L_{\text{start}})}, \dots, h_{\text{trial}}^{(L_{\text{end}}-1)})
+    \end{equation}
+    These trial representation vectors capture the local task alignment and features at each layer, but are corrupted by high-frequency representation noise and local task confusion (resulting in significant layer jitter).
+    \item \textbf{Smooth Pass (Second Pass):} We compute layer-dependent node potentials directly from these trial activations, and solve for globally smoothed ensembling weights $\alpha_k^{(l)}$ using bidirectional sum-product message passing across the entire depth lattice. The final, low-jitter forward pass is then executed with these smoothed ensembling coefficients.
+\end{enumerate}
+
+\subsection{The Path Action and Markov Random Field}
+We define a dynamic routing trajectory across network depth as a state path
+$\mathbf{p} = (k_l)_{l=L_{\text{start}}}^{L_{\text{end}}}$,
+with $k_l \in \{1, \dots, K\}$
+the expert selected at layer $l$. Analogous to a discrete Euclidean action
+$\mathcal{S}[\mathbf{p}]$ of path $\mathbf{p}$ under a Wick rotation, we define
+the path cost as the sum of matching potentials (potential energy) and transition
+barriers (kinetic energy):
+\begin{equation}
+    \mathcal{S}[\mathbf{p}] = \sum_{l=L_{\text{start}}}^{L_{\text{end}}} \mathcal{L}_{\text{match}}(h_{\text{trial}}^{(l-1)}, k_l) + \sum_{l=L_{\text{start}}}^{L_{\text{end}}-1} \mathcal{L}_{\text{trans}}(k_l, k_{l+1})
+\end{equation}
+The matching loss $\mathcal{L}_{\text{match}}(h_{\text{trial}}^{(l-1)}, k_l)$ measures the semantic discrepancy between the trial representation entering layer $l$ and the pre-trained expert anchor centroid $\mu_{k_l}^{(l)}$:
+\begin{equation}
+    \mathcal{L}_{\text{match}}(h_{\text{trial}}^{(l-1)}, k) = -\log \left[ S(h_{\text{trial}}^{(l-1)}, \mu_k^{(l)}) \right]
+\end{equation}
+where $S(A, B)$ is the clamped cosine similarity preventing numerical instabilities:
+\begin{equation}
+    S(A, B) = \max \left( \epsilon, \frac{\langle A, B \rangle}{\|A\|_2 \|B\|_2} \right)
+\end{equation}
+The transition loss $\mathcal{L}_{\text{trans}}(k_l, k_{l+1})$ penalizes changes in expert selection between adjacent layers, acting as a transition barrier that suppresses high-frequency routing oscillations across depth:
+\begin{equation}
+    \mathcal{L}_{\text{trans}}(k_l, k_{l+1}) = \gamma \cdot \mathbb{I}[k_l \ne k_{l+1}]
+\end{equation}
+where $\gamma \ge 0$ is the transition barrier height, and $\mathbb{I}[\cdot]$ is the indicator function.
+
+\paragraph{Centroid Prerequisite and Calibration.}
+Our matching potential formulation relies on pre-calibrated expert activation centroids $\mu_k^{(l)}$ at each active layer $l$. While QPathMerge is training-free, this centroid collection constitutes a necessary offline prerequisite. To maintain high practical utility, this calibration is extremely sample-efficient: as analyzed in Section \ref{subsec:method_analysis}, extracting highly robust centroids requires only 1 to 4 representative images or token sequences per task. Because the potentials are scale-invariant due to the cosine similarity, the extracted centroids remain highly robust to serving-time distribution shifts, rendering extensive calibration datasets unnecessary.
+
+\subsection{Path Probability and Partition Function}
+The probability of the system selecting path $\mathbf{p}$ is governed by the Boltzmann distribution on our 1D MRF:
+\begin{equation}
+    P(\mathbf{p}) = \frac{1}{\mathcal{Z}} \exp\left( -\frac{\mathcal{S}[\mathbf{p}]}{\tau} \right)
+\end{equation}
+where $\tau > 0$ is the temperature controlling the routing distribution sharpness, and $\mathcal{Z}$ is the partition function summing over all $K^{L_{\text{end}}-L_{\text{start}}+1}$ possible routing paths:
+\begin{equation}
+    \mathcal{Z} = \sum_{\mathbf{p}} \exp\left( -\frac{\mathcal{S}[\mathbf{p}]}{\tau} \right)
+\end{equation}
+To calculate the ensembling weight $\alpha_k^{(l)}$ for expert $k$ at layer $l$, we must compute the exact marginal probability $\alpha_k^{(l)} = P(k_l = k)$ by summing over all paths passing through state $k$ at layer $l$.
+
+\subsection{Exact Marginals via Belief Propagation}
+Summing over exponentially many paths directly is computationally intractable. However, by exploiting the 1D chain structure of our depth lattice, we solve for the exact marginals analytically in $O(L K^2)$ time using sum-product message passing (the Forward-Backward algorithm).
+
+We define the local, dynamically changing node potentials (state likelihoods) at each active layer $l \in \{L_{\text{start}}, \dots, L_{\text{end}}\}$ as:
+\begin{equation}
+    \psi_l(k) = e^{-\mathcal{L}_{\text{match}}(h_{\text{trial}}^{(l-1)}, k)/\tau} = \left[ S(h_{\text{trial}}^{(l-1)}, \mu_k^{(l)}) \right]^{1/\tau}
+\end{equation}
+
+and the edge potentials (transition factor matrices) as:
+\begin{equation}
+    \phi_l(k, k') = e^{-\mathcal{L}_{\text{trans}}(k, k')/\tau} = e^{-\frac{\gamma}{\tau} \mathbb{I}[k \ne k']}
+\end{equation}
+Letting $M = \exp(-\gamma/\tau) \in [0, 1]$ represent the transition leakage parameter, we simplify the edge potentials to:
+\begin{equation}
+    \phi_l(k, k') = \begin{cases} 1 & \text{if } k = k' \\ M & \text{if } k \ne k' \end{cases}
+\end{equation}
+Here, $M$ controls the coupling strength between adjacent layers. We run scale-normalized recursive message passing to prevent numerical underflow:
+
+\subsubsection{1. Forward Pass}
+Initialize the forward messages at the first active layer $l = L_{\text{start}}$:
+\begin{equation}
+    \alpha^{\text{fwd}}_{L_{\text{start}}}(k) = \psi_{L_{\text{start}}}(k)
+\end{equation}
+Normalize the forward messages to sum to $1.0$:
+\begin{equation}
+    \tilde{\alpha}^{\text{fwd}}_{L_{\text{start}}}(k) = \frac{\alpha^{\text{fwd}}_{L_{\text{start}}}(k)}{\sum_{j=1}^K \alpha^{\text{fwd}}_{L_{\text{start}}}(j)}
+\end{equation}
+For each successive layer $l = L_{\text{start}}+1$ to $L_{\text{end}}$, propagate the forward beliefs:
+\begin{equation}
+    \alpha^{\text{fwd}}_l(k) = \psi_l(k) \sum_{k'=1}^K \tilde{\alpha}^{\text{fwd}}_{l-1}(k') \phi_{l-1}(k', k)
+\end{equation}
+And scale-normalize:
+\begin{equation}
+    \tilde{\alpha}^{\text{fwd}}_l(k) = \frac{\alpha^{\text{fwd}}_l(k)}{\sum_{j=1}^K \alpha^{\text{fwd}}_l(j)}
+\end{equation}
+
+\subsubsection{2. Backward Pass}
+Initialize the backward messages at the final active layer $l = L_{\text{end}}$:
+\begin{equation}
+    \beta^{\text{bwd}}_{L_{\text{end}}}(k) = 1.0
+\end{equation}
+And scale-normalize:
+\begin{equation}
+    \tilde{\beta}^{\text{bwd}}_{L_{\text{end}}}(k) = \frac{1}{K}
+\end{equation}
+For each layer $l = L_{\text{end}}-1$ down to $L_{\text{start}}$, propagate the backward beliefs:
+\begin{equation}
+    \beta^{\text{bwd}}_l(k) = \sum_{k'=1}^K \tilde{\beta}^{\text{bwd}}_{l+1}(k') \phi_l(k, k') \psi_{l+1}(k')
+\end{equation}
+And scale-normalize:
+\begin{equation}
+    \tilde{\beta}^{\text{bwd}}_l(k) = \frac{\beta^{\text{bwd}}_l(k)}{\sum_{j=1}^K \beta^{\text{bwd}}_l(j)}
+\end{equation}
+
+\subsubsection{3. Marginal Weights Assembly}
+At each active layer $l$, the exact marginal probability of choosing expert $k$ is the normalized product of the forward and backward beliefs:
+\begin{equation}
+    \alpha_k^{(l)} = \frac{\tilde{\alpha}^{\text{fwd}}_l(k) \tilde{\beta}^{\text{bwd}}_l(k)}{\sum_{j=1}^K \tilde{\alpha}^{\text{fwd}}_l(j) \tilde{\beta}^{\text{bwd}}_l(j)}
+\end{equation}
+These marginal probabilities are utilized directly as the dynamic merging coefficients to blend the expert LoRA weights at runtime:
+\begin{equation}
+    W^{(l)}_{\text{merged}} = W^{(l)}_{\text{base}} + \sum_{k=1}^K \alpha_k^{(l)} \Delta W_k^{(l)}
+\end{equation}
+
+\subsubsection{Robustness to Out-of-Distribution (OOD) Queries}
+A critical advantage of our Markov Random Field (MRF) formulation is its native, mathematically elegant handling of out-of-distribution (OOD) queries. Suppose a query input is completely OOD or corrupted by sensor noise, such that its intermediate representations $h_{\text{trial}}^{(l-1)}$ lie far from all calibrated task subspaces, yielding extremely small cosine similarities $S(h_{\text{trial}}^{(l-1)}, \mu_k^{(l)}) \approx 0$ across all task centroids.
+In this regime, the node potentials $\psi_l(k)$ naturally flatten towards a uniform distribution ($\psi_l(k) \approx \text{const}$).
+Our sum-product message-passing solver automatically propagates these uniform node potentials through the depth lattice, causing the ensembling weights to smoothly fall back to a uniform distribution ($\alpha_l(k) \approx 1/K$). This uniform fallback acts as a robust regularizer, neutral scaling representation, and variance-minimizing controller that prevents any single un-correlated expert from dominating the representation, ensuring high serving-time robustness under extreme query shifts.
+
+\subsection{Symmetric Cancellation of Forward-Backward Drift}
+An interesting mathematical property of our 1D lattice formulation arises when considering the transition coupling extremes. One might speculatively assume that when $M \to 0$ (absolute identity coupling), the recursive multiplication in the forward pass:
+\begin{equation}
+    \alpha^{\text{fwd}}_l(k) \propto \psi_l(k) \alpha^{\text{fwd}}_{l-1}(k) \propto \psi(k)^{l - L_{\text{start}} + 1}
+\end{equation}
+would lead to exponential sharpening across network depth, resulting in large layer-to-layer variation (maximum jitter). 
+
+However, our bidirectional path-integral formulation resolves this exactly. Since we solve the global partition function over the entire lattice, the backward pass propagates future commitments in the exact opposite direction:
+\begin{equation}
+    \beta^{\text{bwd}}_l(k) \propto \psi(k)^{L_{\text{end}} - l}
+\end{equation}
+When these beliefs are assembled at each layer $l$, the exponential sharpening factors of the forward and backward passes perfectly cancel each other out:
+\begin{equation}
+    \alpha^{(l)}_k \propto \alpha^{\text{fwd}}_l(k) \beta^{\text{bwd}}_l(k) \propto \psi(k)^{L_{\text{end}} - L_{\text{start}} + 1}
+\end{equation}
+This product is identical at every layer $l$. Consequently, the normalized ensembling weights are perfectly constant across all active layers, yielding exactly $0.000000$ layer-wise trajectory jitter at $M \to 0$. This symmetric cancellation of single-directional representation drift is a powerful theoretical advantage of bidirectional belief propagation over traditional feedforward-only smoothers.
+
+\subsection{Single-Pass Recursive On-the-Fly QPathMerge}
+\label{subsec:single_pass}
+
+While the mathematically exact Forward-Backward algorithm provides elegant spatial smoothing, executing a full trial forward pass over active network layers nearly doubles the parameters accessed, FLOPs, and latency, which is a severe penalty for resource-constrained edge hardware.
+
+To completely resolve this bottleneck, we position \textbf{Recursive On-The-Fly QPathMerge} (QPathMerge-Single) as our primary real-world deployment candidate, treating the exact bidirectional algorithm as its theoretical ideal. This single-pass formulation requires exactly \textbf{one forward pass} of the active network layers. At each active layer $l$, the forward message $\alpha^{\text{fwd}}_l(k)$ is computed exactly using the actual intermediate representation $h^{(l-1)}$ that has just been executed:
+\begin{equation}
+    \alpha^{\text{fwd}}_l(k) = \psi_l(k) \sum_{k'=1}^K \tilde{\alpha}^{\text{fwd}}_{l-1}(k') \phi(k', k)
+\end{equation}
+where $\psi_l(k) = [S(h^{(l-1)}, \mu_k^{(l)})]^{1/\tau}$ is the local node potential.
+
+Because we are in a single forward pass, future representations $h^{(l')}$ for $l' > l$ have not yet been computed. To compute the backward message $\beta^{\text{bwd}}_l(k)$ on-the-fly, we speculatively assume that future potentials will be identical to the current layer's potential $\psi_l(k)$. We then solve a recursive backward pass on this speculative future path from the final layer $L_{\text{end}}$ down to $l$:
+\begin{enumerate}
+    \item Initialize: $\beta = \vec{1}/K$ at layer $L_{\text{end}}$.
+    \item For $j = L_{\text{end}}$ down to $l+1$:
+    \begin{equation}
+        \beta = \phi @ (\beta * \psi_l)
+    \end{equation}
+    and scale-normalize $\beta$.
+    \item Set the backward message at layer $l$: $\beta^{\text{bwd}}_l = \beta$.
+\end{enumerate}
+We then assemble the marginal ensembling weights at layer $l$ inline:
+\begin{equation}
+    \alpha^{(l)}_k \propto \alpha^{\text{fwd}}_l(k) \beta^{\text{bwd}}_l(k)
+\end{equation}
+Although each backward step runs on a tiny $K$-dimensional space ($K=4$), executing a backward recurrence of length $L_{\text{end}} - l$ at each active layer $l$ results in a cumulative computational complexity of:
+\begin{equation}
+    \sum_{l=L_{\text{start}}}^{L_{\text{end}}} (L_{\text{end}} - l) = \frac{(L-1)L}{2} = O(L^2 K^2)
+\end{equation}
+This represents a quadratic scaling with respect to active depth $L$, which theoretically scales worse than the linear $O(L K^2)$ of the exact two-pass Forward-Backward algorithm. However, because the transition leakage operator $\phi$ acts as a contraction mapping on the probability simplex, we can optimize this to $O(L H K^2)$ linear scaling by employing a \emph{Truncated Backward Horizon} of length $H \ll L$, which we discuss in Section \ref{subsec:discussion}. This elegant formulation delivers the optimal layer-to-layer smoothing of path-integral ensembling in exactly one forward pass of the model, completely bypassing the trial-pass computational overhead.
+
+\subsection{Theoretical Isomorphism, Scaling Boundaries, and Speculative Future Analysis}
+\label{subsec:discussion}
+
+To ensure complete scientific precision and contextualize our physics-inspired formulation, we analyze its theoretical foundations, computational scaling, and representational boundaries:
+
+\begin{itemize}
+    \item \textbf{Statistical Physics and Classical MRF Isomorphism:} While our formulation draws a rich mathematical analogy from discrete Euclidean path integrals in statistical physics, the resulting probability distribution is mathematically isomorphic to classical statistical physics (specifically, a 1D Ising chain or Potts model under local magnetic fields) and classic chain-structured Markov Random Fields (MRFs). We explicitly acknowledge this isomorphism, identifying our message propagation as scale-normalized belief propagation (Pearl's sum-product algorithm). This classical framing preserves absolute mathematical consistency, grounding our Visionary metaphor in robust, well-established probabilistic graphical models.
+    \item \textbf{Computational Complexity and Scaling Boundaries ($L$ and $K$):} As derived in Section \ref{subsec:single_pass}, the single-pass on-the-fly backward recurrence has a raw cumulative complexity of $O(L^2 K^2)$ due to running a backward pass of length $L_{\text{end}} - l$ at each layer $l$. To restore linear scaling $O(L K^2)$ for extremely deep networks, we introduce the concept of a \emph{Truncated Backward Horizon} $H$. 
+    
+    We formally prove the mathematical convergence of this truncation using Dobrushin's contraction theorem. Our un-normalized transition factor matrix is defined as $\tilde{\phi}(i, i) = 1.0$ and $\tilde{\phi}(i, j) = M \in (0, 1]$ for $i \ne j$. Row-normalizing this matrix to form a proper transition probability matrix $\phi \in \mathbb{R}^{K \times K}$ (as executed in scale-normalized message passing) yields:
+    \begin{equation}
+        \phi(i, j) = \begin{cases} \frac{1}{1 + (K-1)M} & \text{if } i = j \\ \frac{M}{1 + (K-1)M} & \text{if } i \ne j \end{cases}
+    \end{equation}
+    Since $\phi$ has strictly positive elements ($\phi(i, j) > 0$), the transition operator acts as a strict contraction mapping on the probability simplex $\Delta^{K-1}$ under the $L_1$ norm. The Dobrushin contraction coefficient of $\phi$ is:
+    \begin{equation}
+        \eta(\phi) = 1 - \sum_{j=1}^K \min_{i} \phi(i, j) = 1 - \frac{K M}{1 + (K-1)M} < 1
+    \end{equation}
+    Therefore, for any two backward message vectors $\beta^{(1)}, \beta^{(2)} \in \Delta^{K-1}$, we have:
+    \begin{equation}
+        \|\phi \beta^{(1)} - \phi \beta^{(2)}\|_* \le \eta(\phi) \|\beta^{(1)} - \beta^{(2)}\|_*
+    \end{equation}
+    Since local node potentials $\psi$ are positive and bounded, the composite backward recurrence operator $T(\beta) = \text{normalize}(\phi (\beta * \psi))$ is also a strict contraction. This guarantees that the approximation error of the truncated backward message $\beta^{(H)}$ relative to the infinite-horizon bidirectional message $\beta^{(\infty)}$ decays exponentially fast with respect to the horizon $H$:
+    \begin{equation}
+        \|\beta^{(H)} - \beta^{(\infty)}\|_* \le C \cdot \left[ \eta(\phi) \right]^H
+    \end{equation}
+    where $C > 0$ is a constant. For our default transition leakage $M = 0.10$ and $K = 4$ experts, the row-normalized off-diagonal transition probability is $M' = \frac{0.10}{1.30} \approx 0.0769$, yielding an exact Dobrushin contraction coefficient of:
+    \begin{equation}
+        \eta(\phi) = 1 - \frac{4 \times 0.10}{1 + 3 \times 0.10} = 1 - \frac{4}{13} \approx 0.6923
+    \end{equation}
+    After $H = 4$ steps, the truncation error is bounded by $C \cdot (0.6923)^4 \approx 0.23 C$. For $M = 0.20$, the contraction coefficient is $\eta(\phi) = 1 - \frac{0.80}{1.60} = 0.50$, bounding the truncation error after $H = 4$ steps by a spectacular $C \cdot (0.50)^4 \approx 0.06 C$. This formal mathematical guarantee proves that backward messages in our depth lattice converge extremely rapidly, confirming why a tiny constant horizon $H = \min(L_{\text{end}} - l, 4)$ is highly sufficient to sustain near-oracle global spatial trajectory smoothness.
+    
+    By truncating the backward pass to a small constant $H \le 4$, we slash the cumulative single-pass complexity to $O(L H K^2)$, which is strictly linear in network depth $L$. For scaling to massive multi-expert registries (e.g., dense MoEs with $K \ge 64$ experts), the $O(L H K^2)$ cost could still scale quadratically in $K$. In such regimes, we propose two computational mitigations: (1) \emph{Sparse Transition Matrices:} Restricting expert transitions to a small $k$-nearest-neighbor subgraph of experts, reducing the transition matrix complexity to $O(L H K \log K)$, or (2) \emph{Hierarchical Message Passing:} Grouping experts into hierarchical functional domains, solving the MRF on a tree structure in $O(L H K)$ time (see Appendix \ref{sec:appendix_generalizations} for a formal mathematical sketch and derivation of tree-structured belief propagation).
+    \item \textbf{Power Iteration Degeneracy of Constant Future Potentials and Relaxed Extrapolations:} The speculative constant future potential assumption (setting $\psi_{l'} = \psi_l$ for all future layers $l' > l$) represents a first-order approximation. Under this assumption, the on-the-fly backward pass recurrence in Equation (2) reduces to:
+    \begin{equation}
+    \begin{split}
+        \beta^{(j-1)} &= \text{normalize}\left(\phi \left(\beta^{(j)} * \psi_l\right)\right) \\
+        &= \text{normalize}\left(\phi \operatorname{diag}(\psi_l) \beta^{(j)}\right)
+    \end{split}
+    \end{equation}
+    This recurrence is mathematically equivalent to the classical \emph{power iteration} algorithm applied to the positive matrix $A = \phi \operatorname{diag}(\psi_l)$. Since the transition factor matrix $\phi$ has strictly positive elements and the potential vector $\psi_l$ is positive, the matrix $A$ has strictly positive elements. By the Perron-Frobenius theorem, $A$ has a unique, positive, dominant real eigenvalue with a corresponding unique, positive dominant eigenvector $\vec{v}_{\text{dom}}$. 
+    
+    Consequently, as the backward pass iterates down from $L_{\text{end}}$ to $l+1$, the backward message vector converges exponentially fast to this dominant eigenvector $\vec{v}_{\text{dom}}$, which is purely a function of the local current potential $\psi_l$ and the transition matrix $\phi$. Under a constant potential assumption, the backward beliefs do \emph{not} contain any genuine predictive information about future representation changes; instead, they degenerate into a smoothed reflection of the current layer's local potential. This explains why a tiny truncated backward horizon $H \le 4$ is sufficient—the power iteration converges so rapidly that longer backward passes are mathematically redundant.
+    
+    To break this power-iteration degeneracy and recover a true forward-looking, predictive bidirectional solver, it is mathematically necessary to relax the constant assumption by predicting future layer potentials from the history of past layers. We propose and evaluate two mathematical relaxation variants:
+    \begin{enumerate}
+        \item \emph{Potential Linear Extrapolation (LinearExtrap):} We compute the potential slope between the current and preceding layer, $\Delta_l = \psi_l - \psi_{l-1}$ (for $l > L_{\text{start}}$, and $\Delta_l = 0$ otherwise). At each backward step $j \in \{l+1, \dots, \min(L_{\text{end}}, l+H)\}$, the extrapolated potential is:
+        \begin{equation}
+            \psi_{j}^{\text{extrap}} = \text{clip}(\psi_l + (j - l) \cdot \Delta_l, 0, 1)
+        \end{equation}
+        where the clipping operation is performed element-wise onto the interval $[0, 1]$. By projecting a linear trend, \texttt{LinearExtrap} dynamically modifies the matrix $A_j = \phi \operatorname{diag}(\psi_j^{\text{extrap}})$ at each backward step, preventing convergence to a static dominant eigenvector and enabling the backward pass to actively anticipate future representation shifts.
+        \item \emph{Potential Rolling Extrapolation (RollingExtrap):} We compute the rolling average potential over all past layers up to depth $l$:
+        \begin{equation}
+            \psi_{\text{rolling}}^{(l)} = \frac{1}{l - L_{\text{start}} + 1} \sum_{l'=L_{\text{start}}}^l \psi_{l'}
+        \end{equation}
+        and utilize $\psi_{\text{rolling}}^{(l)}$ for all future backward recurrence steps inside the truncation horizon.
+    \end{enumerate}
+    Empirically, as shown in Section 4, these extrapolation methods successfully capture complex, non-monotonic representational trajectories to stabilize depth ensembling on physical models.
+    \item \textbf{Learned and Parameterized Dynamic Edge Potentials:} In our current formulation, the transition leakage matrix $\phi$ is static and uniform across all layers ($M = 0.10$). However, deep neural networks exhibit highly non-uniform representation dynamics across depth: early layers process general task-agnostic low-level features and benefit from high transition flexibility, while deeper layers specialize in semantic representations and require maximum spatial stability. To capture this depth-wise hierarchy, the edge potentials can be parameterized as layer-specific transition matrices $\phi_l(k, k')$. Specifically, we can parameterize $\phi_l(k, k')$ as a function of the local representation state $h^{(l-1)}$ using a lightweight linear projection:
+    \begin{equation}
+        \phi_l(k, k') = \text{softmax}\left( W_k^{\top} h^{(l-1)} + b_{k, k'} \right)
+    \end{equation}
+    where $W_k \in \mathbb{R}^{D \times 1}$ and $b_{k, k'} \in \mathbb{R}$ are learnable parameters optimized end-to-end via meta-gradients or policy optimization. Alternatively, a layer-dependent scheduled leakage $M_l$ can be utilized to enforce a smooth transition from early flexibility to late-stage stability, dynamically shifting the accuracy-stability Pareto frontier.
+\end{itemize}

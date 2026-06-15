@@ -1,0 +1,113 @@
+\section{Methodology}
+\label{sec:methodology}
+
+In this section, we present the mathematical formulation of our physical layer-wise dynamic model-merging framework, our proposed Bounded Sigmoid (BSigmoid) router architecture, and the spectral diagnostic metrics (SVD Collinearity Ratio and inter-layer cosine similarity) we introduce to audit routing dimensionality.
+
+\subsection{Problem Formulation \& Dynamic Model Merging}
+
+Let $L$ be the number of layers (blocks or stages) in a deep neural network backbone, and let $K$ be the number of specialized expert models sharing a common initialization. For each layer $l \in \{1, \dots, L\}$, let $W_j^{(l)}$ and $B_j^{(l)}$ represent the trained weight and bias parameters of expert model $j \in \{0, \dots, K-1\}$.
+
+For a given input sample $x$, a dynamic model-merging system computes sample-specific dynamic routing coefficients $\lambda_{l, k}(x) \in [0, 1.0]$. To maintain structural scale and prevent activation drift across deep stacked layers, the routing coefficients are normalized to sum to 1.0 across the experts at each layer: $\sum_{k=1}^K \lambda_{l, k}(x) = 1.0$.
+
+During batch inference or calibration under a batch of size $B$, the dynamic routing coefficients are averaged over the batch to compute the batch-averaged coefficients:
+\begin{equation}
+\bar{\alpha}_{l, k} = \frac{1}{B} \sum_{b=1}^B \lambda_{l, k}(x_b)
+\end{equation}
+The merged model parameters at layer $l$ are then physically interpolated in weight space:
+\begin{equation}
+\label{eq:physical_merge}
+W_{merged}^{(l)} = \sum_{j=1}^K \bar{\alpha}_{l, j} W_j^{(l)}, \quad B_{merged}^{(l)} = \sum_{j=1}^K \bar{\alpha}_{l, j} B_j^{(l)}
+\end{equation}
+The forward pass of the batch is executed directly using the physically merged parameters $W_{merged}^{(l)}$ and $B_{merged}^{(l)}$, avoiding the computational and memory-bandwidth overhead of sample-by-sample model replication.
+
+\subsection{Bounded Sigmoid (BSigmoid) Router}
+
+Standard dynamic routing relies on Softmax activation across task dimensions \cite{shazeer2017outrageously}, imposing a zero-sum competition: increasing one task's merging weight inevitably decreases another. Under severe task conflict, this acts as a bottleneck, causing catastrophic interference. To eliminate this zero-sum bottleneck, we introduce the \textbf{BSigmoid-Router}, applying independent, element-wise Sigmoids to enable experts to cooperate or specialize without artificial constraint.
+
+To minimize parameter overhead and project high-dimensional inputs with complete mathematical transparency, we define a low-dimensional normalized routing state $\psi(x) \in \mathbb{R}^d$ with $d=8$. Specifically, we project the flattened grayscale image $x \in \mathbb{R}^D$ (where $D = 28 \times 28 = 784$) using a random frozen projection matrix $P_{proj} \in \mathbb{R}^{d \times D}$ sampled from a standard Gaussian:
+\begin{equation}
+\psi(x) = P_{proj} \text{flatten}(x)
+\end{equation}
+This projection preserves pairwise distances and directional statistics according to the Johnson-Lindenstrauss lemma (see Appendix~\ref{app:learnable_vs_random_projection} for a detailed empirical and theoretical comparison against learnable projections and PCA features). Let $W_{l, k} \in \mathbb{R}^d$ and $B_{l, k} \in \mathbb{R}$ represent the trainable weights and biases of the routing network for layer $l$ and task $k$. The unconstrained logit is:
+\begin{equation}
+\alpha_{l, k}(x) = \langle \psi(x), W_{l, k} \rangle + B_{l, k}
+\end{equation}
+We then apply our element-wise independent Sigmoid activation:
+\begin{equation}
+\tilde{\alpha}_{l, k}(x) = \sigma\left(\alpha_{l, k}(x)\right)
+\end{equation}
+where $\sigma(u) = (1 + e^{-u})^{-1}$ is the standard sigmoid function. Crucially, as observed in our systems-level audit, applying raw unnormalized sigmoidal gates across layers in deep networks (e.g., $L=12$) leads to severe exponential signal decay and representation underflow. To preserve activation scales, we perform a post-gating sum-to-1 normalization across the $K$ task dimensions to obtain the final dynamic merging coefficients:
+\begin{equation}
+\label{eq:sigmoid_normalization}
+\lambda_{l, k}(x) = \frac{\tilde{\alpha}_{l, k}(x)}{\sum_{j=1}^K \tilde{\alpha}_{l, j}(x) + \epsilon}
+\end{equation}
+where $\epsilon = 10^{-8}$ is a small stabilization constant.
+
+\paragraph{The Normalization Paradox and Zero-Sum Constraint.} We must critically analyze a fundamental mathematical paradox in this gating mechanism. While element-wise Sigmoids allow the unconstrained logits to initiate independently, the post-gating sum-to-1 division (Equation~\ref{eq:sigmoid_normalization}) mathematically re-introduces a zero-sum competitive constraint across expert dimensions at each layer. If the routing activation for task expert $k$ increases, the denominator necessarily increases, which forces the normalized routing coefficients for all other experts $j \neq k$ to decrease. Functionally, this normalized Sigmoid gating operates under a competitive zero-sum constraint similar to standard Softmax, deconstructing our initial conceptual motivation that independent gates bypass competition. In physical deep architectures, however, this normalization is a mathematical necessity: without it, unnormalized scaling under shallow bounds or narrow logits causes catastrophic exponential signal decay (scaling representations down by at least $(0.5)^L$ across $L$ layers). Hence, our proposed router is best understood as a \emph{normalized Sigmoid router} that highlights the unavoidable systems-level need for scale-stabilizing constraints in physical multi-layer weight-space merging.
+
+For our Layer-wise Router, the total learnable parameters are $L \times (d \cdot K + K)$. For $K=2$ task experts, this is $L \times 18$ parameters (72 parameters for TinyCNN-4 with $L=4$, and 216 parameters for DeepMLP-12 with $L=12$). For $K=4$ task experts, this is $L \times 36$ parameters (144 parameters for TinyCNN-4 and 432 parameters for DeepMLP-12). For the Global Router baseline ($L=1$), the same routing coefficients are replicated across all layers, utilizing only $d \cdot K + K$ parameters (18 parameters for $K=2$ and 36 parameters for $K=4$).
+
+\paragraph{Spatial Granularity of Routing.} We select the spatial granularity of routing to match backbone architectures. For DeepMLP-12, we route at the layer level ($L=12$). For TinyCNN-4, we route at the block level ($L=4$) comprising three convolutional layers and a linear output layer. CNN blocks process features at progressive semantic tiers, and stage-wise routing is natural and less prone to parameter-variance overfitting than dense block-level routing under scarce splits.
+
+\subsection{Calibration and Optimization Pipeline}
+
+During offline calibration under a highly scarce data split, we optimize the router parameters on a balanced calibration dataset of only \textbf{128 samples per task} (totaling 256 or 512 samples depending on $K$) over \textbf{40 steps} using the Adam optimizer with a learning rate of $lr = 0.01$.
+
+The objective function minimizes the multi-class cross-entropy classification loss of the physically merged model (Equation~\ref{eq:physical_merge}) on the calibration batch, coupled with an $L_2$ weight decay regularization ($\gamma = 10^{-4}$) applied to all router weights and biases:
+\begin{equation}
+\label{eq:total_loss}
+\begin{aligned}
+\mathcal{L} &= \mathcal{L}_{\mathrm{CE}}\left(f(X; W_{merged}, B_{merged}), Y\right) \\
+&\quad + \frac{\gamma}{2} \sum_{l=1}^L \sum_{k=1}^K \left( \|W_{l, k}\|_2^2 + \|B_{l, k}\|_2^2 \right)
+\end{aligned}
+\end{equation}
+where $\mathcal{L}_{\mathrm{CE}}$ is the standard cross-entropy loss and $f(X; W_{merged}, B_{merged})$ represents the forward pass through the deep network backbone parameterized by the merged weights and biases.
+
+\subsection{SVD Collinearity Audit \& Diagnostics}
+
+To mathematically investigate the ``Layer-Averaging Collapse'' claim, we construct the \textbf{Batch-Averaged Layer-wise Coefficient Matrix} $A \in \mathbb{R}^{L \times K}$ over the complete test stream of size $B$:
+\begin{equation}
+A_{l, k} = \frac{1}{B} \sum_{b=1}^B \lambda_{l, k}(x_b)
+\end{equation}
+We perform Singular Value Decomposition (SVD) on the learned matrix $A$:
+\begin{equation}
+A = U \Sigma V^T
+\end{equation}
+where $U \in \mathbb{R}^{L \times L}$ and $V \in \mathbb{R}^{K \times K}$ are orthogonal matrices, and $\Sigma = \text{diag}(\sigma_1, \sigma_2, \dots, \sigma_{\min(L, K)})$ contains the singular values sorted in descending order ($\sigma_1 \ge \sigma_2 \ge \dots \ge \sigma_{\min(L, K)} \ge 0$).
+
+We define the \textbf{Collinearity Ratio} ($\rho_{collinear}$), which measures the proportion of singular value energy concentrated in the first principal dimension:
+\begin{equation}
+\rho_{collinear} = \frac{\sigma_1}{\sum_{i=1}^{\min(L, K)} \sigma_i}
+\end{equation}
+\begin{itemize}
+    \item \textbf{Perfect Rank-1 Collapse ($\rho_{collinear} \approx 1.0$):} All row vectors $A_l$ are collinear (directionally identical). This confirms the collapse theorem, indicating that layer-wise parameterization is redundant.
+    \item \textbf{Multi-dimensional Routing ($\rho_{collinear} \ll 1.0$):} The row vectors occupy a multi-dimensional subspace. This deconstructs the collapse theorem, proving that physical layers specialize in task routing and that layer-wise dynamic merging represents an expressive routing paradigm.
+\end{itemize}
+
+To map the exact directional alignment between pairs of layers $(l, l')$, we compute the \textbf{Inter-Layer Cosine Similarity Matrix} $S \in \mathbb{R}^{L \times L}$:
+\begin{equation}
+S_{l, l'} = \frac{A_l \cdot A_{l'}}{\|A_l\|_2 \|A_{l'}\|_2}
+\end{equation}
+Under the collapse hypothesis, $S_{l, l'} \approx 1.0$ for all layer pairs. Conversely, layer specialization is indicated by distinct block-diagonal or transitioning similarity structures across the network's depth.
+
+Crucially, to evaluate these diagnostic metrics under our multi-seed protocol, we construct the Batch-Averaged matrix $A_{seed} \in \mathbb{R}^{L \times K}$ separately for each of the 5 independent random seeds. We perform SVD on each matrix individually to compute the seed-specific Collinearity Ratio $\rho_{collinear}^{(seed)}$, and then report the final mean and standard deviation of these ratios across all seeds. This ensures that our spectral diagnostics are robust and statistically stable.
+
+\subsection{The Batch-Averaged Multi-Task Inference Paradox}
+\label{subsec:batch_averaged_paradox}
+
+A major systems-level and conceptual challenge in on-the-fly dynamic model merging is what we define as the \textbf{Batch-Averaged Multi-Task Inference Paradox}. To avoid the catastrophic memory-bandwidth and latency bottleneck of dynamically reconstructing distinct physical model parameters for every individual input sample (which requires transferring billions of weights from High-Bandwidth Memory on every single forward pass, as analyzed in Section~\ref{app:systems_scaling}), dynamic weight-merging frameworks average the routing coefficients over the entire batch $B$:
+\begin{equation}
+\bar{\alpha}_{l, k} = \frac{1}{B} \sum_{b=1}^B \lambda_{l, k}(x_b)
+\end{equation}
+The model parameters are then physically interpolated once per batch using $\bar{\alpha}$. While this batch-averaging is a systems-level necessity to achieve reasonable inference latency, it introduces a devastating conceptual and functional dilemma:
+\begin{enumerate}
+    \item \textbf{The Mixed-Batch Collapse (Static Regression):} If the incoming inference stream is heterogeneous (e.g., a standard multi-task deployment containing a mixture of samples from Tasks 0, 1, 2, and 3), the batch average of the routing coefficients will inevitably smooth out. For $K=4$ tasks in our Cross-Domain suite, the batch-averaged coefficients for each task expert will mathematically converge toward a uniform distribution: $\bar{\alpha}_{l, k} \approx 1/K = 0.25$. Consequently, the ``dynamic'' router collapses back to a static, uniform-like merging, losing any sample-specific or task-specific routing benefits. This is empirically validated by our results, where the Layer-wise Router's accuracy on Cross-Domain TinyCNN-4 ($52.52\%$) is close to Uniform merging ($41.40\%$) and virtually identical to the static OFS-Tune baseline ($53.40\%$).
+    \item \textbf{The Homogeneous-Batch Redundancy (Tautology):} The only scenario where the batch-averaged router can output highly specialized, non-uniform coefficients (e.g., $\bar{\alpha} \approx [1.0, 0.0, 0.0, 0.0]$ for Task 0) is if the inference batch is perfectly homogeneous, consisting exclusively of samples from a single task. However, to construct such homogeneous batches in a real deployment, the system must already possess the task labels a priori to partition and group the inputs. If the system already has these labels, the entire dynamic merging mechanism becomes computationally and logically redundant: rather than performing expensive weight-space parameter interpolation on the fly, the system can simply route the entire batch directly to the specialized individual expert model (the Oracle). This direct routing achieves near-perfect single-task accuracy ($98\%$--$99\%$) with zero representational damage and zero parameter interpolation overhead.
+\end{enumerate}
+This paradox exposes a critical conceptual blindspot in the current literature. Dynamic model merging is either logically redundant (under homogeneous batches) or functionally degraded to static merging (under mixed batches). Under our critical Methodologist perspective, we do not shy away from this paradox; instead, we present it as a fundamental systems-level boundary of the weight-space merging paradigm.
+
+To resolve this Batch-Averaged Paradox and unlock true dynamic capacity, we propose two primary pathways for future research:
+\begin{enumerate}
+    \item \textbf{Sample-Specific Low-Rank Adaptive Merging (LR-SFP):} Rather than merging full-parameter model weights, dynamic merging can be restricted to low-rank parameter-efficient fine-tuning (PEFT) modules (e.g., LoRA). Because LoRA adapters possess a fraction of the parameter count ($< 1\%$), we do not need to physically reconstruct full-parameter matrices. Instead, we can run true sample-specific forward passes by keeping low-rank adapters separate and computing batch-wise sample-specific low-rank delta updates on the fly using specialized CUDA kernels (similar to S-LoRA or vLLM). This completely bypasses batch averaging and eliminates the memory-bandwidth bottleneck, unlocking real sample-specific routing on heterogeneous batches.
+    \item \textbf{Task-Aware Bucketing/Dynamic Batching:} Modern serving engines can leverage extremely lightweight, zero-shot task routing or metadata parsing to group incoming requests into homogeneous, task-specific buckets before batching. While this might seem to re-introduce the homogeneous tautology, in real-world deployment we often require the dynamic merging of \emph{combinations} of expert capabilities (e.g., instruction-following plus translation) for which no single pre-trained expert model exists. In such scenarios, task-aware bucketing enables dynamic merging of expert parameters tailored to the bucket's shared requirements.
+\end{enumerate}

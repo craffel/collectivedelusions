@@ -1,0 +1,25 @@
+# Evaluation Component 4: Experimental Evaluation and Baseline Rigor
+
+## Evaluation of the Experimental Setup
+The experimental setup is designed with high methodological rigor and statistical integrity:
+1. **Multi-Seed Evaluation:** Evaluating across 3 independent random trials using distinct seeds (42, 100, 2026) is excellent practice. It allows the authors to report standard deviations and identify optimization instability (e.g., the 4x increase in standard deviation for Adam GD), which is one of the most critical findings in their paper.
+2. **Dataset Choice:** The choice of MNIST, FashionMNIST, CIFAR-10, and SVHN is highly appropriate for a diagnostic study. These datasets range from simple/saturated (MNIST) to complex/highly non-linear (SVHN), allowing the authors to isolate the effect of task complexity and expose the "SVHN Rescue vs. CIFAR-10 Collapse Trade-off".
+3. **Data Splitting:** Splitting disjoint subsets of 512 images for expert training, 256 images for calibration, and 512 images for evaluation ensures no data leakage and maintains a clean evaluation pipeline.
+
+## Baseline Rigor
+The paper is highly critical of previous SOTA papers (like AdaMerging and SyMerge) for comparing their methods against weak, uncalibrated baselines (e.g., Task Arithmetic with a fixed $\lambda = 0.3$). The authors address this baseline weakness in two ways:
+1. **Spatially Averaged Baselines:** They introduce "Spatial Mean - 1+1 ES" and "Spatial Mean - Adam GD" as baselines. These baselines use a single optimized scalar coefficient per task (collapsing the layer dimension). This effectively reduces the search space by 92.3% and serves as a powerful, properly optimized task-wise single-scalar baseline.
+2. **Comparison with Task Arithmetic:** Comparing directly with standard Task Arithmetic ($\lambda = 0.3$) reveals that unconstrained layer-wise optimization (especially Adam GD) does not yield generalizable gains over the basic uniform baseline on the test set, highlighting the transductive overfitting issue.
+
+## Do the Results Support the Claims?
+Yes, the empirical results in Table 1, Table 2, Figure 1, and Figure 2 strongly support all of the authors' claims:
+1. **1+1 ES and the Layer-Specificity Illusion:** The fact that Spatial Mean (1+1 ES) gets $85.21 \pm 0.11\%$ (which is strictly better than the optimized $85.07 \pm 0.47\%$) while reducing the standard deviation by more than 4x strongly supports the claim that layer-specificity under zero-order search is an illusion.
+2. **Adam GD and Transductive Overfitting:** The fact that Shuffling Adam GD's coefficients collapses average performance from $84.52\%$ to $79.09\%$ (and CIFAR-10 from $89.84\%$ to $74.15\%$) shows that Adam GD indeed found a highly precise, delicate layer configuration. However, the fact that this optimized model fails to outperform the basic Task Arithmetic baseline on the unseen test set ($84.52 \pm 1.57\%$ vs. $84.44 \pm 0.37\%$) while quadrupling the seed variance proves that this precise structure is a transductive overfitting artifact.
+3. **Extreme Landscape Flatness:** The noise sweep in Figure 2 is exceptionally flat, showing that the model is extremely robust to coefficient perturbations. This empirically validates that many different configurations can achieve similar performance, confirming that the optimization landscape resides in an exceptionally flat basin.
+4. **CKA-Accuracy Decoupling:** In Table 2, the Spatial Mean models have higher average CKA similarity than the optimized models, but this does not correlate with downstream accuracy (specifically CIFAR-10 accuracy under Adam GD collapses by 10.35% despite keeping a high CKA of $>0.95$). This strongly supports the claim that high-level activation correlation decouples from weight-space decision boundary integrity.
+5. **Joint Entropy Minimization Task-Bias:** Under Adam GD, SVHN test accuracy collapses to $71.22 \pm 8.08\%$ (lower than the Task Arithmetic baseline of 73.24%), while MNIST/FashionMNIST remain saturated. This supports the claim that joint entropy objectives sacrifice high-entropy/complex tasks.
+
+## Areas for Improvement in Experiments
+1. **Number of Seeds:** Increasing the seed count from 3 to 5 or more would strengthen the statistical claims and make the standard deviations even more robust, especially for the high-variance Adam GD settings.
+2. **Additional Archs / Larger Models:** While CLIP ViT-B/32 is an appropriate diagnostic model, the authors should ideally provide at least a pilot experiment on a larger model (such as a ViT-L/14 or a small decoder-only language model like LLaMA-style 1B/3B experts) to confirm if the flatness of the landscape and the transductive overfitting patterns hold in larger model regimes. 
+3. **Baseline Global Search:** Although the Spatial Mean acts as an optimized single-scalar task-wise baseline, comparing against a directly searched global scalar baseline (e.g., optimizing a single global scalar per task on the calibration set directly rather than averaging the optimized layer-wise coefficients) would make the baseline comparison even more comprehensive.

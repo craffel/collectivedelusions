@@ -1,0 +1,287 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the formal mathematical framework and architectural specifications of
+\textbf{Task-Space Anchor Regularization (TSAR)}. We first describe the low-dimensional state
+representation layer and task-space feature anchor extraction, followed by our dynamic linear
+routing formulation, and conclude with the joint regularized calibration objective.
+
+\subsection{Low-Dimensional State Representation}
+To construct a computationally lightweight router, we avoid processing high-dimensional
+intermediate visual activations directly. Let $z(x)_b \in \mathbb{R}^D$ represent the feature
+representation mathematically simulated to mimic the globally pooled activations of a Vision
+Transformer (ViT-Tiny) backbone for calibration sample $b$, where $D=192$. 
+
+Using a subset of the calibration split $X_{cal}$, we compute a frozen, unsupervised Principal
+Component Analysis (PCA) projection matrix $P \in \mathbb{R}^{D \times d}$ to project features into
+a compact, low-dimensional routing subspace of dimension $d = K = 4$. Specifically, the
+high-dimensional visual features $z(x)_b$ are mean-centered over the calibration split prior to
+computing the singular value decomposition (SVD) of the sample covariance matrix, with the
+projection matrix $P$ comprising the top $d$ right-singular vectors. 
+
+While computing PCA on a tiny dataset ($B_{cal} = 64$ samples total) would normally introduce high
+sampling noise and parameter variance, the pre-trained backbone representations exhibit high
+inter-task separability. Because task-specific representations lie in highly distinct coordinate
+spaces, the top eigenvectors of the covariance matrix represent exceptionally stable multi-task axes
+that are easily captured from a handful of samples. To completely eliminate any potential risk of
+sampling noise or meta-overfitting on the projection space, practitioners can also: (i) compute the
+PCA matrix $P$ over a larger task-agnostic unlabeled pre-training set, or (ii) employ a completely
+data-independent random Gaussian projection (Johnson-Lindenstrauss projection), which mathematically
+guarantees pairwise distance preservation within a bounded distortion factor without requiring any
+calibration data (as analyzed in Section \ref{sec:sandbox_extrap}). Indeed, under extreme data
+scarcity (e.g., $B_{cal} \le 32$), our empirical ablation in Appendix~\ref{sec:projection_ablation}
+shows that data-independent Random Gaussian projection consistently and substantially outperforms
+unsupervised PCA (+5.26\% Joint Mean accuracy at $B_{cal}=16$ while cutting seed variance by more
+than half) because it is entirely immune to local calibration sampling noise. We therefore recommend
+Random Gaussian projection as the preferred default scheme for ultra-sparse low-data constraints.
+
+To stabilize optimization and ensure scale invariance across disparate visual tasks, we normalize
+the projected coordinate onto the unit sphere. The low-dimensional normalized routing state
+$\psi(x)_b \in \mathbb{R}^d$ is formulated as:
+\begin{equation}
+\psi(x)_b = \frac{z(x)_b P}{\|z(x)_b P\|_2 + \epsilon}
+\label{eq:state_proj}
+\end{equation}
+where $\epsilon = 10^{-8}$ is a small positive constant to prevent division by zero. Note that
+while the PCA projection matrix $P$ is computed on mean-centered calibration features to align with
+standard Singular Value Decomposition (SVD) conventions, the forward projection in
+Equation~\ref{eq:state_proj} is applied directly to the raw feature vector $z(x)_b$ without explicit
+test-time mean subtraction. Let $\mu_z \in \mathbb{R}^D$ represent the global mean of the
+calibration features, such that the true centered and projected coordinates are formulated as
+$(z(x)_b - \mu_z)P$. Applying Equation~\ref{eq:state_proj} to uncentered features is mathematically
+equivalent to introducing a translation vector $\mu_P = \mu_z P$ inside both the numerator and the
+$L_2$ norm divisor:
+\begin{equation}
+\psi(x)_b = \frac{(z(x)_b - \mu_z) P + \mu_P}{\|(z(x)_b - \mu_z) P + \mu_P\|_2 + \epsilon}
+\label{eq:uncentered_proj_approx}
+\end{equation}
+Because the translation vector $\mu_P$ resides inside the norm divisor, the normalization scales
+each sample non-linearly depending on the magnitude of the centered projected vector
+$(z(x)_b - \mu_z) P$, introducing a sample-dependent non-linear distortion. Mathematically, this is
+not strictly equivalent to a constant linear shift that can be perfectly absorbed by the downstream
+bias parameters $B_{l,k}$ (or $B_k$). However, under our representation sandbox, the task manifolds
+are highly separated on the unit sphere, meaning the centered projected vector's norm
+$\|(z(x)_b - \mu_z) P\|_2$ is highly concentrated. Under this regime, the non-linear distortion is
+exceptionally small and behaves as a harmless, highly localized scaling perturbation. This
+approximation completely eliminates the operational overhead of storing, tracking, and subtracting
+global feature means during real-time edge system deployment, while preserving outstanding
+empirical routing stability.
+
+\subsection{Task Feature Anchors}
+A major challenge of low-data calibration is that the coordinate space of the projected features
+$\psi(x)_b$ exhibits high variance under sample scarcity, making the routing optimization prone to
+overfitting local noise. Our key observation is that the centroids of pre-trained expert feature
+representations represent stable, task-specific coordinates (or anchors) that can guide
+optimization.
+
+Let $X_{cal, k}$ denote the partition of the calibration set $X_{cal}$ containing samples belonging
+to task $k \in \{1, \dots, K\}$. We compute the task-space feature anchor $\bar{\psi}_k \in
+\mathbb{R}^d$ by averaging the low-dimensional routing states of all samples belonging to task $k$:
+\begin{equation}
+\bar{\psi}_k = \frac{1}{|X_{cal, k}|} \sum_{b \in X_{cal, k}} \psi(x)_b
+\label{eq:anchor_mean}
+\end{equation}
+These centroids $\bar{\psi}_k$ are computed offline once prior to router calibration, requiring
+zero additional overhead during the optimization loops or inference.
+
+\subsection{Routing Coefficient Dynamics}
+For a given input sample $b$, we instantiate a compact, single-layer global linear router ($L=1$) as our recommended default architecture. The dynamic, sample-specific merging coefficient $\alpha_{k, b}$ is computed as:
+\begin{equation}
+\alpha_{k, b}^{TSAR} = \langle \psi(x)_b, W_{k} \rangle + B_{k}
+\label{eq:router_coeffs_l1}
+\end{equation}
+where $W_{k} \in \mathbb{R}^d$ and $B_{k} \in \mathbb{R}$ represent the trainable routing weights and biases, respectively. For a task count of $K=4$ and projection dimension $d=4$, the complete routing parameter footprint is only 20 parameters, ensuring near-zero computational overhead during both optimization and inference deployment.
+
+While the single-layer global router is the optimal and recommended choice for classification head model merging (where coefficient collapse renders layer-wise routers redundant, as proven below), we also formulate the generalized multi-layer router ($L > 1$) to maintain mathematical generality and support layer-wise deep model merging (where intermediate layer weights are merged using layer-specific routing coefficients). In this generalized formulation, for layer $l \in \{1, \dots, L\}$, the dynamic, sample-specific merging coefficient $\alpha_{k, b}(l)$ is computed as:
+\begin{equation}
+\alpha_{k, b}^{TSAR}(l) = \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k}
+\label{eq:router_coeffs}
+\end{equation}
+where $W_{l, k} \in \mathbb{R}^d$ and $B_{l, k} \in \mathbb{R}$ represent the trainable layer-wise weights and biases.
+
+Unlike softmax-based routers, our formulation is linear and unconstrained, which prevents the
+zero-sum competitive bottleneck identified in prior literature \cite{trial5_submission5}, preserving
+classical representation capacity. 
+
+In our controlled representation sandbox, the specialized expert weights $W_k$ represent the joint
+effective classification parameters of the model. To combine these experts dynamically under our generalized multi-layer formulation, we pool the layer-wise dynamic router coefficients across the $L=14$ layer groups. Under batch deployment, we average these coefficients across a batch of size $B$ and across all layer groups $L$:
+\begin{equation}
+\bar{\alpha}_k = \frac{1}{L} \sum_{l=1}^L \left( \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}(l) \right)
+\label{eq:batch_coeff}
+\end{equation}
+The merged model parameter matrix $W_{merged}$ and bias vector $B_{merged}$ are then dynamically
+constructed as a weighted linear combination of the pre-trained expert parameter matrices $W_k$ and
+bias vectors $B^{expert}_k$:
+\begin{equation}
+W_{merged} = \sum_{k=1}^K \bar{\alpha}_k W_k, \quad B_{merged} = \sum_{k=1}^K \bar{\alpha}_k
+B^{expert}_k
+\label{eq:merging_sum}
+\end{equation}
+
+\paragraph{Mathematical Equivalence to Output-Level Logit Ensembling:}
+We must highlight a fundamental mathematical property of our sandbox. Because the specialized
+expert models are linear classifiers applied directly on top of a frozen feature space, the output
+logits for an input feature representation $z$ under the merged parameters are:
+\begin{align}
+\text{logits} &= W_{\text{merged}} z + B_{\text{merged}} \nonumber \\
+&= \left( \sum_{k=1}^K \bar{\alpha}_k W_k \right) z + \left( \sum_{k=1}^K \bar{\alpha}_k
+B^{\text{expert}}_k \right) \nonumber \\
+&= \sum_{k=1}^K \bar{\alpha}_k \left( W_k z + B^{\text{expert}}_k \right)
+\label{eq:logit_equivalence}
+\end{align}
+This derivation reveals that in our linear sandbox, dynamic parameter-level model merging is
+mathematically identical to taking a weighted linear combination of the output logits of each
+individual expert model (dynamic output-level logit ensembling). 
+
+We embrace this equivalence as a major analytical strength. It makes the parameter-merging process
+mathematically tractable and transparent, allowing us to isolate and study routing mechanics,
+gradient cross-talk, and stream audits independently of architectural confounders. 
+
+However, we stress that for multi-layer deep neural networks with non-linear activation functions
+(e.g., ReLUs, GeLUs, or self-attention blocks), parameter-level model merging and output-level logit
+ensembling are physically distinct and diverge fundamentally:
+\begin{align}
+\sigma\big( W_{\text{merged}, 2} &\sigma( W_{\text{merged}, 1} x ) \big) \nonumber \\
+&\neq \sum_{k=1}^K \bar{\alpha}_k \sigma\big( W_{k, 2} \sigma( W_{k, 1} x ) \big)
+\label{eq:deep_merging_divergence}
+\end{align}
+In deep networks, merging weights of intermediate layers alters the representation flow
+non-linearly, which cannot be replicated by linear combinations at the output level. Thus, while our
+linear sandbox serves as a controlled proxy to study calibration optimization, the actual physical
+challenges of model merging in deep networks are much more complex, and we include output-level
+logit ensembling as a key baseline in our evaluation to empirically verify this mathematical
+equivalence.
+
+Crucially, we must analyze the structural implications of this pooling formulation. Mathematically,
+substituting the sample-specific linear routing equation (Equation \ref{eq:router_coeffs}) into our
+batch-average pooling equation (Equation \ref{eq:batch_coeff}) yields:
+\begin{align}
+\bar{\alpha}_k &= \frac{1}{L} \sum_{l=1}^L \left( \frac{1}{B} \sum_{b=1}^B \left( \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k} \right) \right) \nonumber \\
+&= \frac{1}{B} \sum_{b=1}^B \left( \langle \psi(x)_b, \frac{1}{L} \sum_{l=1}^L W_{l, k} \rangle +
+\frac{1}{L} \sum_{l=1}^L B_{l, k} \right)
+\label{eq:collapse_proof}
+\end{align}
+Let us define the globally collapsed parameters as the layer-wise averages:
+\begin{equation}
+W_{\text{global}, k} = \frac{1}{L} \sum_{l=1}^L W_{l, k}, \quad B_{\text{global}, k} = \frac{1}{L}
+\sum_{l=1}^L B_{l, k}
+\label{eq:collapsed_params}
+\end{equation}
+where $W_{\text{global}, k} \in \mathbb{R}^d$ and $B_{\text{global}, k} \in \mathbb{R}$. We can
+then rewrite the final pooled dynamic coefficient as:
+\begin{equation}
+\bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \left( \langle \psi(x)_b, W_{\text{global}, k} \rangle + B_{\text{global}, k} \right)
+\label{eq:collapsed_coeff}
+\end{equation}
+This derivation formally exposes the phenomenon of \textbf{layer-averaging collapse}. At inference
+deployment, our layer-wise router collapses to a single global low-dimensional router, rendering the
+$L=14$ layer-wise weight divisions mathematically redundant in terms of representation capacity. 
+
+However, from an optimization perspective, training this $L$-layer over-parameterized routing model
+on a tiny 64-sample calibration split introduces key mathematical advantages over direct
+single-layer optimization:
+\begin{enumerate}
+  \item \textbf{Gradient Damping and Variance Reduction (Gradient Bagging):} Under severe low-data
+calibration, optimization gradients are exceptionally noisy, making a 20-parameter single-layer
+router highly prone to bad local minima or early divergence. In our $L$-layer over-parameterized
+formulation, backpropagation gradients with respect to each individual layer weight $W_{l, k}$ are
+damped by the scaling factor $1/L$ via the chain rule:
+  \begin{equation}
+  \frac{\partial \mathcal{L}_{CE}}{\partial W_{l, k}} = \frac{1}{L} \frac{\partial
+\mathcal{L}_{CE}}{\partial \bar{\alpha}_k} \psi(x)_b
+  \label{eq:damped_grad}
+  \end{equation}
+  This $1/L$ gradient damping, combined with randomized independent parameter initializations,
+smooths the optimization trajectory. Individual layer-wise routers act as distinct "routing heads"
+exploring different local basins of the loss landscape, and their final average $W_{global, k}$ acts
+as a robust ensemble (akin to bagging across layers), delivering substantially lower gradient
+variance and superior seed stability.
+  \item \textbf{Distributed Geometric Springs:} Under TSAR, the regularization loss (Equation
+\ref{eq:tsar_penalty}) acts as a distributed system of geometric springs, pulling each of the $L$
+layers independently toward the stable task anchor $\bar{\psi}_k$. This multi-layer regularized
+constraint stabilizes optimization path trajectories, preventing high-frequency parameter
+oscillations and enabling the ensemble average parameters $W_{global, k}$ to converge robustly onto
+the true task coordinates.
+\end{enumerate}
+
+\subsection{TSAR Calibration Loss Function}
+To calibrate the routing weights $W_{l, k}$ and biases $B_{l, k}$ under extreme data scarcity, we
+augment the standard multi-task cross-entropy loss over the calibration split with a spatial
+distance penalty that pulls the routing weights $W_{l, k}$ toward their respective task feature
+anchors $\bar{\psi}_k$. The total joint optimization objective is defined as:
+\begin{equation}
+\mathcal{L}_{total} = \mathcal{L}_{CE} + \mathcal{L}_{WD} + \mathcal{L}_{TSAR}
+\label{eq:total_loss}
+\end{equation}
+where:
+\begin{equation}
+\mathcal{L}_{WD} = \lambda_{wd} \sum_{l=1}^L \sum_{k=1}^K \left( \|W_{l, k}\|_2^2 + B_{l, k}^2 \right)
+\label{eq:l2_wd}
+\end{equation}
+is the standard $L_2$ weight decay regularization, and:
+\begin{equation}
+\mathcal{L}_{TSAR} = \lambda_{anchor} \sum_{l=1}^L \sum_{k=1}^K \| W_{l, k} - \bar{\psi}_k \|_2^2
+\label{eq:tsar_penalty}
+\end{equation}
+is our proposed Task-Space Anchor Regularization penalty, scaled by the coefficient
+$\lambda_{anchor} \ge 0$. Calibration is performed for $100$ epochs using the AdamW optimizer with a
+learning rate of $1.0 \times 10^{-2}$ and weight decay coefficient $\lambda_{wd} = 10^{-3}$ (see
+Appendix~\ref{sec:reproducibility} for complete hyperparameter specifications).
+
+By forcing the router parameters to stay aligned with the task feature anchors, TSAR acts as a
+geometric spatial prior. It ensures that the routing weights do not scale excessively or drift into
+arbitrary noise-aligned subspaces during low-data optimization, thereby maintaining stable,
+task-aligned routing gradients.
+
+\subsection{Multi-Task Gradient Balancing via PCGrad}
+While the TSAR spatial penalty prevents parameter drift, dynamic router calibration under
+multi-task setups is still subject to severe gradient cross-talk. Specifically, when task
+difficulties differ significantly (e.g., MNIST is simple, whereas SVHN is highly noisy and complex),
+the total calibration gradient $\nabla_{W} \mathcal{L}_{total}$ is heavily dominated by the
+gradients of the hardest tasks. This gradient imbalance can drive the routing parameters of simple
+tasks away from their stable anchors to minimize hard-task loss, leading to severe optimization
+instability.
+
+To resolve this multi-task gradient cross-talk, we implement \emph{Projecting Conflicting
+Gradients} (PCGrad) \cite{yu2020gradient} during calibration. Instead of backpropagating the
+averaged cross-entropy loss directly, we compute the individual task losses $\mathcal{L}^{(k)}$
+separately on the calibration samples. For each task $k \in \{1, \dots, K\}$, we compute its
+corresponding gradient vector $g_k = \nabla_{W} \left( \mathcal{L}^{(k)} + \frac{1}{K}
+(\mathcal{L}_{WD} + \mathcal{L}_{TSAR}) \right)$. 
+
+We then identify conflicts between task gradients and project them to preserve mutual optimization
+direction. If two gradients $g_i$ and $g_j$ conflict (indicated by a negative cosine similarity,
+i.e., $g_i \cdot g_j < 0$), we project $g_i$ onto the normal plane of $g_j$:
+\begin{equation}
+g_i \leftarrow g_i - \frac{g_i \cdot g_j}{\|g_j\|_2^2} g_j
+\label{eq:pcgrad_proj}
+\end{equation}
+This projection is applied iteratively across tasks in a randomized order. The final balanced
+gradient $g = \sum_k g_k$ is then applied to update the router parameters. By explicitly projecting
+conflicting gradients, PCGrad preserves cross-task inhibition—preventing dominant tasks from
+corrupting easily aligned routing parameters—while allowing all tasks to be mutually optimized under
+extreme data constraints. While PCGrad introduces an $O(K)$ computational complexity scaling
+bottleneck during training, we present a comprehensive scalability analysis and propose three highly
+practical mitigations (Task Grouping, Selective Projection, and Stochastic Task Sampling) in
+Appendix~\ref{sec:pcgrad_complexity} to keep the main text self-contained and ensure real-world
+scalability. Specifically, when $K \ge 20$, task grouping reduces the backward passes to $O(G)$
+(where $G \ll K$ is the number of semantic clusters), while stochastic task sampling maintains a
+constant $O(1)$ scaling cost per step, rendering PCGrad computationally viable for massive
+multi-task systems.
+
+\subsection{Architecture and Complexity Specifications}
+Our recommended default architecture is a compact single-layer global router ($L=1$) with a projection dimension $d=4$. Since the projection dimension matches the number of tasks $K=4$, the complete routing parameter footprint is:
+\begin{itemize}
+  \item \textbf{Weights ($W$):} Shape $(K \times d) = (4 \times 4) = 16$ parameters.
+  \item \textbf{Biases ($B$):} Shape $(K) = 4$ parameters.
+  \item \textbf{Total Router Parameters:} 20 trainable parameters.
+\end{itemize}
+
+For research purposes and to support deep layer-wise model merging of intermediate weights (where different weights are merged at each layer group and layer-wise routing is active), we also support the generalized $L=14$ layer-wise router:
+\begin{itemize}
+  \item \textbf{Weights ($W$):} Shape $(L \times K \times d) = (14 \times 4 \times 4) = 224$ parameters.
+  \item \textbf{Biases ($B$):} Shape $(L \times K) = (14 \times 4) = 56$ parameters.
+  \item \textbf{Total Router Parameters:} 280 trainable parameters.
+\end{itemize}
+
+Both parameter footprints are ultra-lightweight, representing less than $0.005\%$ of the backbone model's parameter size, ensuring near-zero computational overhead during backpropagation and deployment inference.

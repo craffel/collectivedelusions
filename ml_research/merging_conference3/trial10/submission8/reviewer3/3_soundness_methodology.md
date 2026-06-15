@@ -1,0 +1,29 @@
+# Technical Soundness and Methodology Evaluation
+
+A detailed evaluation of the mathematical, theoretical, and practical methodology of the submission.
+
+## 1. Mathematical and Theoretical Soundness
+The mathematical proofs in the submission (detailed in Appendix A) are exceptionally rigorous, clean, and technically sound.
+* **Theorem 1 (Fourier Complexity)**: The proof leverages H{\"o}lder's inequality to bound the inner product $\langle \theta, \Psi(z_l) \rangle$ by $\|\theta\|_1 \|\Psi(z_l)\|_\infty \le C_0 \|\Psi(z_l)\|_\infty$. Since the trigonometric basis functions are strictly bounded in $[-1, 1]$, their coordinates are sub-Gaussian. Applying Massart's Finite Lemma to the finite set of $4F+2$ elements (representing positive and negative directions of the $2F+1$ basis components) yields the logarithmic bound $C_0 \sqrt{\frac{2 \ln(4F+2)}{L}}$. This is a standard and flawless application of statistical learning theory.
+* **Theorem 2 (Joint Multi-Task Complexity)**: The proof cleverly utilizes the fact that the joint basis vector $\vec{\Psi}(z)$ is constructed by repeating the single-task basis vector $\Psi(z)$ exactly $K$ times. Thus, when taking the supremum over the coordinates, the set of random variables contains redundant duplicate copies. Since the expected maximum over duplicate random variables is equivalent to that over the unique ones, the bound remains independent of $K$ inside the logarithm.
+* **Theorem 3 (DCT Complexity)**: Omitting the sine harmonics reduces the basis dimension to $F+1$, resulting in a strictly tighter complexity bound $C_0 \sqrt{\frac{2 \ln(2F+2)}{L}}$ and successfully eliminating the periodic boundary identity.
+
+### Conceptual Transparency
+The authors are highly commended for their conceptual transparency. They explicitly address:
+1. **Trajectory-Space vs. Data-Space Generalization**: Acknowledging that the Rademacher complexity bound is over the fixed, deterministic network depth coordinates rather than independent data samples.
+2. **The Composition-Based Generalization Gap**: Discussing how standard composition-based generalization bounds can scale exponentially with depth in deep networks and explaining how architectural normalization layers (e.g., LayerNorm, BatchNorm) empirically act as regularizers that stabilize activations.
+3. **The Task-Scaling Discrepancy**: Clarifying that while the joint trajectory-space bound is independent of $K$, the actual downstream prediction generalization bound scales as $\mathcal{O}(\sqrt{K/N})$ under independent Rademacher variables. This level of theoretical honesty is rare and highly valued.
+
+## 2. Practical Methodology
+The optimization methodology is well-designed and logically consistent:
+* **Spectral Lasso Formulation**: The decision to apply the $L_1$ penalty strictly to the harmonic coefficients ($\theta_{harm}$) while leaving the baseline uniform coefficient $a_0$ unpenalized is methodologically brilliant. It prevents artificial activation attenuation while ensuring that as the regularization parameter $\gamma \to \infty$, the trajectory smoothly collapses back to the robust Static Uniform baseline.
+* **Heuristics for $\gamma$**: Proposing data-driven heuristics like **Few-Shot Split-Validation** (7/3 split of a 10-shot dataset with rapid grid-search) and the **Spectral Covariance Heuristic** provides practical ways to bypass hyperparameter tuning in extreme few-shot regimes.
+
+## 3. Potential Technical Flaws or Limitations
+* **The "Static Uniform Dominance Paradox"**: In the synthetic Analytical Coordinate Sandbox (ACS), the parameter-free **Static Uniform baseline consistently and significantly outperforms the proposed spectral trajectory methods** in categorical accuracy (85.10% vs 70.70% on CNN, and 83.75% vs 72.70% on CLIP). This indicates that the sandbox is a highly idealized and symmetric toy model where any adaptation introduces destructive topological shearing. While the authors transparently discuss this as a "worst-case" scenario, it means the ACS experiments are primarily useful for demonstrating trajectory shapes rather than practical ensembling benefits.
+* **Small-Scale Real-World Validation**: The real-world verification is conducted on CIFAR-10 and CIFAR-100 using a ViT-B/16 checkpoint. In modern weight-space ensembling research, CIFAR is considered a toy benchmark. Validating on larger datasets, modern LLMs (e.g., LLaMA, Mistral ensembling), or a larger stream of downstream tasks would significantly bolster the practical soundness of the method.
+* **Dual-Dataset Footprint for Permutation Alignment**: The authors disclose that ZipIt! permutation alignment requires activation covariance statistics estimated using 100 unlabelled samples, while ensembling parameters are optimized on 10 samples. This is a pragmatic solution to rank-deficiency, but it technically increases the data footprint from a pure 10-shot calibration to 10-shot labeled + 100-shot unlabelled. This should be highlighted in comparisons with methods that do not require permutation alignment (such as task arithmetic on perfectly aligned pre-trained checkpoints).
+* **Continuous Trajectory Assumption**: Parameterizing layer-wise coefficients as a smooth continuous curve across depth assumes that adjacent layers have structurally similar optimal merging weights. While this holds for deep networks with residual connections, it might break down in architectures with highly heterogeneous block types or where specific layers (e.g., downsampling layers in CNNs) require radically different scaling.
+
+## 4. Reproducibility
+The LaTeX source code and equations are highly detailed and self-contained. The proof sketches and complete derivations in the appendix provide sufficient mathematical detail for an expert reader to replicate the theory. The optimization steps, hyperparameters, and sandbox equations are clearly stated, indicating high potential for reproducibility.

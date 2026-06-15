@@ -1,0 +1,18 @@
+# 2. Novelty Check
+
+## Key Novel Aspects
+1. **Hyperbolic Geometrical Workspace for Model Merging:** Shifting the geometric substrate of test-time activation-space adapter ensembling from Euclidean space ($\mathbb{R}^D$) to the Poincaré Ball ($\mathbb{D}_c^D$).
+2. **Beltrami-Klein Symmetric Blending (BKSB):** Resolving the non-associativity and non-commutativity of standard Möbius addition in hyperbolic space by mapping representations to the Beltrami-Klein model, calculating the Lorentz-weighted Einstein midpoint (barycenter), and projecting back. This achieves order-independence (permutation invariance) and applies ensembling weights exactly once (avoiding the "double-weighting flaw").
+3. **Hyperbolic Centroid Alignment (HCA):** Utilizing the Klein-space Einstein midpoint to compute closed-form task reference barycenters (Fréchet means) on calibration data.
+4. **Hyperbolic Out-of-Distribution Rejection (HOR):** A non-parametric security mechanism utilizing Poincaré geodesic distances to task reference centroids to reject OOD samples.
+
+## Delta from Prior Work
+- **From Euclidean Model Merging (SABLE, SPS-ZCA, PFSR):** Standard methods use Euclidean centroid alignment or sample-wise linear activation blending. HyperMerge replaces these with Poincaré mapping, hyperbolic distance metrics, Klein coordinate transformations, and Einstein midpoints. The main "delta" is the non-linear ensembling operator.
+- **From Hyperbolic Deep Learning (HNNs, HGNNs):** Prior work has developed hyperbolic feed-forward layers, RNNs, and graph networks by formalizing standard operations (such as linear layers, convolutions, and attention) in Möbius gyrovector spaces. HyperMerge is the first to apply hyperbolic geometry and non-linear Möbius algebra to **test-time activation-space ensembling** and **dynamic adapter routing**.
+
+## Characterization and Significance of Novelty
+- **Theoretical/Algebraic Novelty:** **Moderate to Significant.** The application of the Beltrami-Klein model's Einstein midpoint formula to resolve the ordering bias and non-associativity of sequential Möbius additions is mathematically elegant and well-formulated. The authors successfully identify a real challenge in hyperbolic algebra (the non-associativity of Möbius addition) and solve it using Klein-space barycenters.
+- **Conceptual/Practical Novelty:** **Incremental to Low.** While the mathematical framework is novel in this specific context, the practical significance is severely undermined by two factors:
+  1. **Empirical Deficit:** HyperMerge does not actually outperform Euclidean ensembling. SABLE (a Euclidean method) consistently outperforms HyperMerge in joint mean accuracy across standard settings (84.03% vs 83.40%) and overlapping subspaces (77.98% vs 76.62%). The mathematical complexity of hyperbolic mapping actually leads to a slight degradation in performance due to projection distortion.
+  2. **Mathematical Equivalence in the Small-Norm Regime:** Because Low-Rank Adapter (LoRA) updates $E_{k,b}^{(l)}$ are small-norm vectors ($\|E\|_2 \ll 1$), they project close to the coordinate origin $\mathbf{0}$. Near the origin, hyperbolic space is locally Euclidean, and the exponential volume growth is inactive. As shown via Taylor expansion, HyperMerge mathematically converges to a standard Euclidean linear weighted average up to first-order terms, meaning that the hyperbolic "Novelty" is practically inactive during inference.
+- **Novelty of Baselines and Claims:** The paper claims absolute immunity to stream heterogeneity as a major contribution. However, this is a general property of **all** sample-wise activation ensembling methods (including the Euclidean baselines SABLE and SPS-ZCA) rather than a unique benefit of HyperMerge.

@@ -1,0 +1,118 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the mathematical formulation of our proposed \textbf{OmniMerge} framework. OmniMerge is designed to optimize model merging coefficients that remain robust across a wide variety of post-training quantization schemas, thereby enabling hardware-invariant edge deployment.
+
+\subsection{Unquantized Model Merging and Task Arithmetic}
+Let $\theta_{\text{pre}} \in \mathbb{R}^D$ represent the parameters of a shared pre-trained backbone network, and let $\theta_k \in \mathbb{R}^D$ represent the parameters of a task-specific expert fine-tuned on task $k \in \{1, \dots, K\}$. The task vector $\tau_k$ is defined as the weight difference:
+\begin{equation}
+    \tau_k = \theta_k - \theta_{\text{pre}}
+\end{equation}
+Rather than deploying $K$ independent networks, weight-space merging combines the pre-trained backbone with all task vectors. Specifically, we define layer-wise merging coefficients $\Lambda \in [0, 1]^{K \times L}$, where $L = 14$ is the number of optimized layer groups (including normalization and encoder blocks). The unquantized merged weight $W^l$ at layer $l$ is computed as:
+\begin{equation}
+    W^l = \theta^l_{\text{pre}} + \sum\nolimits_k \lambda^l_k \tau^l_k
+\end{equation}
+
+\subsection{The Stochastic Operator Pool}
+In heterogeneous edge deployment, a single model checkpoint may be deployed across diverse hardware accelerators. Each hardware/compiler combination employs a specific quantization schema. Rather than optimizing coefficients under a single static operator, we define a discrete \emph{Stochastic Operator Pool} $\mathcal{Q}$ consisting of four hardware-standard post-training quantization schemas:
+\begin{equation}
+    \mathcal{Q} = \{Q_{\text{sym, tens}}, Q_{\text{sym, chan}}, Q_{\text{asym, tens}}, Q_{\text{asym, chan}}\}
+\end{equation}
+During test-time co-optimization, at each optimization step $t$, an active operator $Q^{(t)}$ is stochastically sampled from $\mathcal{Q}$ with uniform probability:
+\begin{equation}
+    Q^{(t)} \sim \mathcal{Q}, \quad \text{with } P(Q^{(t)} = Q_j) = 0.25
+\end{equation}
+
+\subsection{Quantization Mathematical Equations}
+We define the quantization of a weight tensor $W$ to a target bit-width $b$ (e.g., $b = 4$ or $b = 8$).
+
+\textbf{Asymmetric Quantization.}
+Asymmetric quantization maps the range $[\min(W), \max(W)]$ to the integer range $[-2^{b-1}, 2^{b-1}-1]$. Let $s_{\text{asym}}$ and $z_{\text{asym}}$ denote the scale factor and zero-point offset, respectively. Under Scale and Zero-Point Noise Perturbation (SZNP), we introduce stochasticity during the forward pass:
+\begin{align}
+    s_{\text{asym}} &= \frac{\max(W) - \min(W)}{2^b - 1} \cdot (1 + \epsilon_s) \\
+    z_{\text{asym}} &= \left\lfloor \frac{-\min(W)}{s_{\text{asym}}} \right\rceil - 2^{b-1} + \epsilon_z
+\end{align}
+where $\epsilon_s \sim \mathcal{N}(0, \sigma^2_{\text{scale}})$ and $\epsilon_z \sim \mathcal{N}(0, \sigma^2_{\text{zero}})$ represent the scale and zero-point perturbation noises, parameterized by standard deviations $\sigma_{\text{scale}} = 0.01$ and $\sigma_{\text{zero}} = 0.02$, respectively (yielding variances of $\sigma^2_{\text{scale}} = 10^{-4}$ and $\sigma^2_{\text{zero}} = 4 \times 10^{-4}$). The asymmetric quantization operator $Q_{\text{asym}}(W, b)$ is formulated as:
+\begin{equation}
+\begin{aligned}
+    Q_{\text{asym}}&(W, b) = s_{\text{asym}} \cdot \\
+    &\left( \left[ \left\lfloor \frac{W}{s_{\text{asym}}} + z_{\text{asym}} \right\rceil \right]_{a}^{c} - z_{\text{asym}} \right)
+\end{aligned}
+\end{equation}
+where $a = -2^{b-1}$, $c = 2^{b-1} - 1$, $[\cdot]_{a}^{c}$ denotes element-wise clipping, and $\lfloor \cdot \rceil$ represents the round-to-nearest-integer operator.
+
+Crucially, during backpropagation, the scale factor $s_{\text{asym}}$ and zero-point $z_{\text{asym}}$ are treated as constant parameters and are detached from the PyTorch autograd computation graph. Gradients are propagated back to the continuous merging coefficients $\Lambda$ strictly through the rounded weights using the Straight-Through Estimator (STE). This prevents the highly sparse, noisy, and unstable gradients that would occur if gradients were backpropagated through the tensor-wide, non-differentiable min/max operations, ensuring highly stable and reliable test-time co-optimization.
+
+We explicitly clarify that the scale and zero-point perturbation noises $\epsilon_s$ and $\epsilon_z$ are strictly active during the test-time co-optimization phase to act as a continuous parameter-space regularizer. Once the optimization of merging coefficients converges, the final unquantized merged model is compiled without any noise perturbations ($\epsilon_s = 0, \epsilon_z = 0$). The scales and zero-points are mapped back to standard floating-point and integer values respectively, which are rounded to strict integers as required by commodity edge accelerators (like mobile DSPs and TPUs) to avoid any floating-point accumulators in integer pipelines. Thus, OmniMerge incurs absolutely zero latency or hardware-compatibility overhead during inference.
+
+\textbf{Symmetric Quantization.}
+Symmetric quantization restricts the zero-point to zero ($z_{\text{sym}} = 0$) and maps the range $[-\max(|W|), \max(|W|)]$ to the integer range $[-2^{b-1}+1, 2^{b-1}-1]$:
+\begin{equation}
+    s_{\text{sym}} = \frac{\max(|W|)}{2^{b-1} - 1} \cdot (1 + \epsilon_s)
+\end{equation}
+where $\epsilon_s \sim \mathcal{N}(0, \sigma_{\text{scale}}^2)$ represents the scale perturbation noise with standard deviation $\sigma_{\text{scale}} = 0.01$. The symmetric quantization operator is defined as:
+\begin{equation}
+\begin{aligned}
+    Q_{\text{sym}}&(W, b) = \\
+    &s_{\text{sym}} \cdot \left[ \left\lfloor \frac{W}{s_{\text{sym}}} \right\rceil \right]_{-2^{b-1}+1}^{2^{b-1}-1}
+\end{aligned}
+\end{equation}
+
+For both operators, quantization can be applied either \emph{per-tensor}, where scale $s$ and zero-point $z$ are scalars computed over the entire weight tensor $W^l$, or \emph{per-channel}, where $s$ and $z$ are vectors computed along the output dimension of $W^l$.
+
+\textbf{Double Quantization.}
+To achieve extreme edge compression, double quantization (DQ) quantizes both the weights and their corresponding scale factors. We first compute the uncompressed asymmetric scale factor tensor $s$ along the channels of $W$:
+\begin{equation}
+    s = \frac{\max(W) - \min(W)}{2^b - 1}
+\end{equation}
+To further compress $s$ to 8-bit symmetric precision, we compute a scale-of-scale factor $s_{\text{scale}}$:
+\begin{equation}
+    s_{\text{scale}} = \frac{\max(s)}{127}
+\end{equation}
+The quantized and dequantized scale tensor $s_{\text{dequant}}$ is then computed as:
+\begin{equation}
+    s_{\text{dequant}} = \text{clip}\left( \left\lfloor \frac{s}{s_{\text{scale}}} \right\rceil, -127, 127 \right) \cdot s_{\text{scale}}
+\end{equation}
+Finally, we execute 8-bit asymmetric quantization on the weight tensor $W$ using the dequantized scale factors $s_{\text{dequant}}$:
+\begin{align}
+    z_{\text{double}} &= \left\lfloor \frac{-\min(W)}{s_{\text{dequant}}} \right\rceil - 2^{b-1} \\
+    Q_{\text{double}}&(W, b) = s_{\text{dequant}} \cdot \nonumber \\
+    &\left( \left[ \left\lfloor \frac{W}{s_{\text{dequant}}} + z_{\text{double}} \right\rceil \right]_{a}^{c} - z_{\text{double}} \right)
+\end{align}
+where $a = -2^{b-1}$ and $c = 2^{b-1}-1$. Double quantization is applied per-channel to maintain high representation capacity.
+
+\subsection{Stochastic Co-Optimization Techniques}
+The core innovation of OmniMerge is the synergistic interaction between \textbf{Stochastic Operator Sampling (SOS)} and \textbf{Scale/Zero-Point Noise Perturbation (SZNP)}.
+\begin{itemize}
+    \item \textbf{SOS as Parameter-Space Augmentation:} By stochastically switching between symmetric/asymmetric and per-tensor/per-channel schemas at each step, SOS prevents the merging coefficients $\Lambda$ from overfitting to the discretization grid of any single compiler.
+    \item \textbf{SZNP for Landscape Smoothing:} The non-differentiable rounding operator $\lfloor \cdot \rceil$ creates an extremely rugged, discontinuous loss landscape in weight space. Injecting Gaussian perturbation noise via $\epsilon_s$ and $\epsilon_z$ stochastically shifts the rounding boundaries. This acts to smooth out local discontinuities, preventing gradient-based optimization from getting trapped in fragile, sub-optimal local minima.
+\end{itemize}
+
+\subsection{Unsupervised Joint Objective and Consensus Regularization}
+OmniMerge performs test-time calibration without requiring labeled data, making it highly practical for edge scenarios. We minimize prediction entropy over a small, unlabeled calibration stream $D_{\text{cal}} = \{X_{i, k}\}_{i=1}^N$, where $X_{i, k}$ is the $i$-th calibration sample for task $k$. The prediction entropy loss is defined as:
+\begin{equation}
+    \mathcal{L}_{\text{entropy}}(\Lambda) = -\frac{1}{N K} \sum\nolimits_{k, i, c} p_{k, i}(c \mid \Lambda) \log p_{k, i}(c \mid \Lambda)
+\end{equation}
+where $p_{k, i}(c \mid \Lambda)$ represents the softmax probability predicted by the model configured with stochastically quantized weights $\theta^l_{\text{quant}, t} = Q^{(t)}(W^l(\Lambda), b)$.
+
+To prevent catastrophic drift of the coefficients away from their initial values and to encourage inter-task ensembling stability, we incorporate a \textbf{Task-Consensus Regularization (TCR)} penalty $\mathcal{R}_{\text{con}}(\Lambda)$. TCR prevents any single dominant task from monopolizing the optimization path by encouraging the blending coefficients of different tasks to remain near their group consensus mean at each layer:
+\begin{equation}
+    \mathcal{R}_{\text{con}}(\Lambda) = \frac{1}{K L} \sum\nolimits_{k, l} \left[ \beta (\lambda^l_k - \lambda_{\text{init}})^2 + \gamma (\lambda^l_k - \bar{\lambda}^l)^2 \right]
+\end{equation}
+where $\beta = 0.1$ penalizes absolute deviation from the starting uniform blending coefficient $\lambda_{\text{init}} = 0.3$. Crucially, $\bar{\lambda}^l = \frac{1}{K} \sum_{k=1}^K \lambda^l_k$ represents the task-wise average consensus blending coefficient at layer $l$, and $\gamma = 0.5$ penalizes task-specific deviation from this layer-wise consensus average. The total joint objective is:
+\begin{equation}
+    \mathcal{L}_{\text{total}}(\Lambda) = \mathcal{L}_{\text{entropy}}(\Lambda) + \mathcal{R}_{\text{con}}(\Lambda)
+\end{equation}
+
+\textbf{Gradient Flow via Straight-Through Estimator.}
+During backward propagation, the gradient through the non-differentiable round-to-nearest operator is approximated using the Straight-Through Estimator (STE):
+\begin{equation}
+    \frac{\partial Q^{(t)}(W, b)}{\partial W} \approx 1
+\end{equation}
+Because the active operator $Q^{(t)}$ varies stochastically, the gradients $\nabla_{\Lambda} \mathcal{L}_{\text{total}}$ inherit a form of ``gradient dropout''. This regularizes the coefficient search, guiding the parameter updates toward a flat, robust minimum:
+\begin{equation}
+    \Lambda^{(t+1)} = \text{clamp}\left( \Lambda^{(t)} - \eta \cdot \mathbf{u}^{(t)}, [0, 1] \right)
+\end{equation}
+where $\mathbf{u}^{(t)} = \text{Adam}\left( \nabla_{\Lambda} \mathcal{L}_{\text{total}}(\Lambda^{(t)}) \right)$ is the parameter update step calculated by the Adam optimizer~\cite{kingma14adam} with learning rate $\eta = 10^{-2}$ (and $\eta = 2 \times 10^{-2}$ for OmniMerge to ensure rapid convergence within 15 steps), and the final coefficients are clamped to $[0, 1]$.
+
+An alternative to STE-guided optimization is zeroth-order (gradient-free) optimization, such as Covariance Matrix Adaptation Evolution Strategies (CMA-ES) or stochastic random-walk search. While zeroth-order methods completely avoid the approximation bias inherent in STE by relying solely on forward evaluations, they exhibit prohibitive sample complexity. Specifically, zeroth-order search scales poorly with the number of layer groups $L$, requiring thousands of forward model evaluations to estimate search directions. In contrast, first-order STE-guided co-optimization leverages highly informative gradients to converge in a mere 15 steps of test-time adaptation. This makes OmniMerge exceptionally aligned with the strict compute and latency budgets of edge deployment, where calibration must execute in a fraction of a second. Furthermore, our stochastically sampled operators and boundary noise act as parameter-space regularizers, effectively mitigating the approximation bias of standard STE.

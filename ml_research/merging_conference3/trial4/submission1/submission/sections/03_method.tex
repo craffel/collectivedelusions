@@ -1,0 +1,172 @@
+\section{Methodology: Continuous Fourier Phase Superposition}
+\label{sec:methodology}
+
+Instead of seeking linear compromises in static, real-valued coordinate spaces, PhaseMerge introduces a wave-theoretic formulation that merges deep neural networks in the complex Fourier frequency domain. By treating task-specific weight updates as continuous wavefunctions, we enable the optimizer to dynamically tune constructive and destructive wave interference. Below, we formalize the mathematical framework of PhaseMerge.
+
+\subsection{Preliminaries and Weight Space Deconstruction}
+Let $W_{\text{pre}}^l \in \mathbb{R}^{H \times W}$ denote the pre-trained weights of a base neural network at layer $l \in \{1, \dots, L\}$. Let $W_k^l \in \mathbb{R}^{H \times W}$ be the fine-tuned weights of expert model $k \in \{1, \dots, K\}$ specialized in task $k$. The spatial task vector $\tau_k^l$, representing the parameter delta gained during task-specific fine-tuning, is defined as:
+\begin{equation}
+    \tau_k^l = W_k^l - W_{\text{pre}}^l
+\end{equation}
+In standard Task Arithmetic \cite{ilharco2022editing}, the merged model parameters $W^l_{\text{merged}}$ are obtained via a static linear combination:
+\begin{equation}
+    W^l_{\text{merged}} = W_{\text{pre}}^l + \sum_{k=1}^K \lambda_k \tau_k^l
+\end{equation}
+where $\lambda_k$ are hyperparameter scaling coefficients. Because $\tau_k^l$ are high-dimensional spatial tensors, direct averaging in real space triggers severe parameter conflicts across tasks.
+
+\subsection{2D Real Fourier Transform Projection}
+To decouple parameter magnitude from spatial direction, we project the real-valued task vectors $\tau_k^l$ into the complex frequency domain. We employ the Real 2D Fast Fourier Transform (RFFT2D), which takes advantage of conjugate symmetry to map the $H \times W$ spatial matrix to a complex frequency-space tensor of shape $H \times (\lfloor W/2 \rfloor + 1)$:
+\begin{equation}
+    \mathcal{F}_k^l = \text{RFFT2D}(\tau_k^l) \in \mathbb{C}^{H \times (\lfloor W/2 \rfloor + 1)}
+\end{equation}
+This complex frequency representation $\mathcal{F}_k^l$ can be decomposed into its amplitude $A_k^l$ and original phase angle $\theta_k^l$ for each frequency component. The amplitude, which represents the magnitude of the frequency update, is computed as:
+\begin{equation}
+    A_k^l = |\mathcal{F}_k^l| = \sqrt{\text{Re}(\mathcal{F}_k^l)^2 + \text{Im}(\mathcal{F}_k^l)^2}
+\end{equation}
+The original phase angle, which encodes the relative alignment of features, is extracted as:
+\begin{equation}
+    \theta_k^l = \text{angle}(\mathcal{F}_k^l) = \text{atan2}\left(\text{Im}(\mathcal{F}_k^l), \text{Re}(\mathcal{F}_k^l)\right)
+\end{equation}
+where $\text{Re}(\mathcal{F}_k^l)$ and $\text{Im}(\mathcal{F}_k^l)$ are the real and imaginary parts of the frequency tensor, respectively.
+
+\subsection{Differentiable Phase Rotation Parameterizations}
+To avoid the Overfitting-Optimizer Paradox associated with unconstrained real-space coefficient optimization, we parameterize the learned phase adjustments as structured representations. For each task $k$ and layer $l$, we explore two distinct configurations:
+\begin{enumerate}
+    \item \textbf{Uniform Phase Rotation ($r=1$), representing U-PhaseMerge:} We define a single, uniform scalar phase parameter $\tilde{\phi}_k^l \in \mathbb{R}^{1 \times 1}$. This parameter is uniformly broadcast to all frequency components:
+    \begin{equation}
+        \phi_k^l = \pi \cdot \tanh\left( \tilde{\phi}_k^l \right)
+    \end{equation}
+    Operating on the global phase angle per layer and task, it serves as a highly structured phase regularizer with a total footprint of $196$ parameters.
+    \item \textbf{Bilinear Continuous Phase Grids ($r=2$), representing PhaseMerge:} We define a compact $2 \times 2$ phase grid $\tilde{\phi}_k^l \in \mathbb{R}^{2 \times 2}$. This grid is dynamically upsampled to match the shape of the complex frequency tensor $\mathcal{F}_k^l$ using bilinear interpolation, with values mapped to the physical angle limits of $[-\pi, \pi]$:
+    \begin{equation}
+        \phi_k^l = \pi \cdot \tanh\left( \text{Upsample}\left( \tilde{\phi}_k^l, \left(H, \lfloor W/2 \rfloor + 1\right) \right) \right)
+    \end{equation}
+    Because the $2 \times 2$ grid is small and upsampled via smooth bilinear interpolation, the resulting phase shift $\phi_k^l$ is spatially continuous and low-frequency. This behaves as an implicit low-pass physical regularizer, limiting the optimizer's high-frequency degrees of freedom and smoothing out validation noise.
+\end{enumerate}
+Crucially, under both configurations, the parameters $\tilde{\phi}_k^l$ are initialized to zero, yielding zero initial phase rotation ($\phi_k^l = 0$). This guarantees that at step 0 of optimization, PhaseMerge perfectly reproduces the initial Task Arithmetic baseline.
+
+\textbf{Coordinate Dependency and Matrix-Basis Regularization.} Because neuron indexes in dense networks can be permuted arbitrarily without altering the network's function, dense weights are technically permutation-invariant. However, the Discrete Fourier basis is constructed using complex exponentials over grid coordinates, which makes the 2D FFT itself highly coordinate-dependent. Permuting the rows or columns of a weight matrix reshuffles its elements, mixing its real and imaginary parts in the Fourier spectrum in a complex, coordinate-dependent manner. Thus, applying a uniform phase shift $e^{i \phi_k^l}$ in Fourier space is coordinate-dependent and \textbf{not} strictly permutation-invariant under arbitrary row or column swapping. 
+
+To resolve this, we emphasize that in weight-space model merging, all task-specific expert networks ($W_k$) are fine-tuned from the \emph{same shared pre-trained initialization} ($W_{\text{pre}}$). Because they share identical starting coordinates, their row and column dimensions are structurally aligned. By locking this permutation index to the base pre-trained model, the 2D FFT operates on a stable, shared coordinate basis. Rather than treating row and column dimensions as physical spatial axes, we frame the Fourier projection as a \textbf{matrix-basis regularizer} over this shared basis, limiting the optimizer's degrees of freedom and smoothing out high-frequency gradient noise.
+
+\subsection{The Spatial Domain Dual: Equivalence to the Directional Hilbert Transform}
+\label{sec:hilbert_equivalence}
+To establish a rigorous theoretical link between our frequency-domain phase rotations and the spatial coordinate domain, we prove that applying a uniform phase-shift $\phi_k^l$ to the Real 2D Fourier representation of a task vector $\tau_k^l$ is mathematically equivalent to a rotation in a 2D spatial subspace spanned by the task vector and its directional Hilbert transform.
+
+\begin{theorem}
+Let $\tau \in \mathbb{R}^{H \times W}$ represent a real-valued spatial task vector. Let $\mathcal{F}_{\text{full}} = \text{FFT2D}(\tau)$ be its full 2D Discrete Fourier Transform. Let $\Omega^+$ and $\Omega^-$ represent the positive and negative frequency half-planes of the frequency grid, respectively, such that conjugate symmetry requires $\mathcal{F}_{\text{full}}(-u, -v) = \mathcal{F}_{\text{full}}(u, v)^*$. Applying a uniform phase shift $\phi \in [-\pi, \pi]$ to the half-complex Fourier representation under Real-valued Fourier Transform (RFFT2D) reconstruction yields a spatial task vector of the form:
+\begin{equation}
+    \tau_{\text{merged}} = \cos\phi \cdot \tau + \sin\phi \cdot \mathcal{H}(\tau)
+\end{equation}
+where $\mathcal{H}(\tau)$ is the directional Hilbert transform of the task vector $\tau$ along the frequency-splitting direction of RFFT2D.
+\end{theorem}
+
+\begin{proof}
+When we optimize a uniform phase shift $\phi$ in U-PhaseMerge ($r=1$), we apply the rotation $e^{i\phi}$ to the positive frequency half-plane $\Omega^+$ of the Real Fourier Transform:
+\begin{equation}
+    \mathcal{F}'(u, v) = e^{i\phi} \mathcal{F}(u, v) \quad \text{for } (u, v) \in \Omega^+
+\end{equation}
+To reconstruct a real-valued spatial matrix, the inverse transform (\texttt{IRFFT2D}) mathematically enforces conjugate symmetry on the negative frequency half-plane $\Omega^-$:
+\begin{align}
+    \mathcal{F}'(-u, -v) &= \mathcal{F}'(u, v)^* \nonumber \\
+    &= \left(e^{i\phi} \mathcal{F}(u, v)\right)^* \nonumber \\
+    &= e^{-i\phi} \mathcal{F}(-u, -v) \quad \text{for } (u, v) \in \Omega^-
+\end{align}
+Consequently, the effective phase shift $\phi_{\text{eff}}(u, v)$ across the entire 2D frequency spectrum is:
+\begin{equation}
+    \phi_{\text{eff}}(u, v) = \begin{cases} 
+    +\phi & \text{for } (u, v) \in \Omega^+ \\ 
+    -\phi & \text{for } (u, v) \in \Omega^- \\ 
+    0 & \text{on DC/Nyquist (via } M_{\text{sym}}\text{)}
+    \end{cases}
+\end{equation}
+This effective phase-shift function $\phi_{\text{eff}}(u, v)$ is a discontinuous, odd function of frequency. We can write the phase-rotated Fourier representation across the full spectrum as:
+\begin{equation}
+    \mathcal{F}'_{\text{full}}(u, v) = e^{i \phi_{\text{eff}}(u, v)} \mathcal{F}_{\text{full}}(u, v)
+\end{equation}
+Using Euler's formula, we can expand the complex multiplier:
+\begin{equation}
+    e^{i \phi_{\text{eff}}(u, v)} = \cos\left(\phi_{\text{eff}}(u, v)\right) + i \sin\left(\phi_{\text{eff}}(u, v)\right)
+\end{equation}
+Because the cosine function is even, $\cos(\phi_{\text{eff}}(u, v)) = \cos\phi$ is constant across all non-DC/Nyquist frequencies. Because the sine function is odd, we have $\sin(\phi_{\text{eff}}(u, v)) = \sin\phi \cdot \text{sgn}(u, v)$, where the signum function $\text{sgn}(u, v)$ is defined as:
+\begin{equation}
+    \text{sgn}(u, v) = \begin{cases} 
+    1 & \text{for } (u, v) \in \Omega^+ \\ 
+    -1 & \text{for } (u, v) \in \Omega^- \\ 
+    0 & \text{on DC/Nyquist frequencies}
+    \end{cases}
+\end{equation}
+Substituting these expansions back into the full-spectrum representation yields:
+\begin{align}
+    \mathcal{F}'_{\text{full}}(u, v) = &\cos\phi \cdot \mathcal{F}_{\text{full}}(u, v) \nonumber \\
+    &+ i \sin\phi \cdot \text{sgn}(u, v) \mathcal{F}_{\text{full}}(u, v)
+\end{align}
+Due to the linearity of the Inverse Fast Fourier Transform, we can map this expression back to the spatial domain term-by-term:
+\begin{align}
+    \tau_{\text{merged}} &= \text{IRFFT2D}\left( \mathcal{F}'_{\text{full}} \right) \nonumber \\
+    &= \cos\phi \cdot \text{IRFFT2D}\left( \mathcal{F}_{\text{full}} \right) \nonumber \\
+    &\quad + \sin\phi \cdot \text{IRFFT2D}\left( i \cdot \text{sgn}(u, v) \cdot \mathcal{F}_{\text{full}} \right)
+\end{align}
+Since $\text{IRFFT2D}(\mathcal{F}_{\text{full}}) = \tau$, and the operator $\mathcal{H}(\tau) = \text{IRFFT2D}(i \cdot \text{sgn}(u, v) \cdot \mathcal{F}_{\text{full}})$ is exactly the directional Hilbert transform of $\tau$ (which shifts the phase of positive frequencies by $+\pi/2$ and negative frequencies by $-\pi/2$), we obtain:
+\begin{equation}
+    \tau_{\text{merged}} = \cos\phi \cdot \tau + \sin\phi \cdot \mathcal{H}(\tau)
+\end{equation}
+This completes the proof.
+\end{proof}
+
+This mathematical equivalency is highly revealing: it shows that our elegant "frequency-domain phase rotation" in U-PhaseMerge is mathematically dual to a structured spatial coordinate rotation in the 2D subspace spanned by the task vector $\tau$ and its directional Hilbert transform $\mathcal{H}(\tau)$. The Hilbert transform $\mathcal{H}(\tau)$ acts as a spatial-quadrature representation of the task update. 
+
+By optimizing $\phi_k^l$, the model dynamically mixes the original task vector with its Hilbert-transformed counterpart. In dense neural networks, because the rows and columns have no natural spatial indices, the specific direction of this Hilbert transform is coordinate-dependent (tied to the arbitrary initial neuron indexing of $W_{\text{pre}}$). Nonetheless, because this coordinate indexing is locked and shared across all experts, this continuous spatial mixing acts as a powerful, low-dimensional regularization pathway that allows the model to interpolate and adjust feature alignments without introducing unconstrained degrees of freedom.
+
+\subsection{Complex Wave Superposition and Spatial Reconstruction}
+Using Euler's formula, we apply the continuous phase shifts $\phi_k^l$ to rotate the phase angles of the frequency components of each expert, leaving the amplitudes $A_k^l$ intact:
+\begin{align}
+    \mathcal{F}'^l_k &= A_k^l e^{i (\theta_k^l + \phi_k^l)} \\
+    &= A_k^l \left( \cos(\theta_k^l + \phi_k^l) + i \sin(\theta_k^l + \phi_k^l) \right)
+\end{align}
+This rotation allows the optimizer to continuously adjust how the waves from different experts align. If the updates from two tasks conflict at a particular frequency band, the optimizer can rotate their phases to be out of phase ($\Delta \phi \approx \pi$), actively cancelling the conflicting elements. If they are complementary, they can be aligned in-phase ($\Delta \phi \approx 0$).
+
+We reconstruct the phase-rotated updates in the real spatial domain using the Inverse Real 2D Fast Fourier Transform (IRFFT2D), and introduce learnable task-wise scaling coefficients $s_k \in \mathbb{R}$ to scale the contribution of each expert. The final merged task vector is obtained as a weighted combination of these reconstructed, phase-aligned updates:
+\begin{equation}
+    \tau^l_{\text{merged}} = \sum_{k=1}^K s_k \cdot \text{IRFFT2D}(\mathcal{F}'^l_k)
+\end{equation}
+where $s_k$ are the learnable task scaling coefficients. These coefficients are initialized to $0.3$ (reproducing standard Task Arithmetic at step 0) and are optimized via backpropagation simultaneously alongside the continuous phase-shift grids. 
+
+\textbf{Macro-Micro Decoupling and Amplitude Equivalence.} Mathematically, due to the linearity of the RFFT2D and IRFFT2D operators, scaling the reconstructed spatial update by the task scale $s_k$ is mathematically equivalent to scaling the Fourier amplitudes $A_k^l$ of all layers and frequency components by $s_k$ prior to reconstruction:
+\begin{align}
+    s_k \cdot \text{IRFFT2D}\left(\mathcal{F}'^l_k\right) &= \text{IRFFT2D}\left(s_k \cdot \mathcal{F}'^l_k\right) \nonumber \\
+    &= \text{IRFFT2D}\left((s_k A_k^l) e^{i(\theta_k^l + \phi_k^l)}\right)
+\end{align}
+Consequently, the global scaling factors $s_k$ could theoretically be absorbed into the frequency amplitudes. However, we choose to decouple them: $s_k$ acts as a single, global task-wide scalar (shared across all layers) that coordinates macro-level task balance relative to the pre-trained backbone. In contrast, the layer-wise phase grids $\tilde{\phi}_k^l$ perform micro-level wave synchronization and frequency filtering within individual layers. This separation has profound benefits for optimization stability: by optimization of a single global scale $s_k$ per expert, we prevent the optimizer from having to adjust hundreds of independent layer-wise amplitudes simultaneously, mitigating the Overfitting-Optimizer Paradox under scarce test-time calibration streams ($M=16$) and ensuring stable convergence in only 5 optimization steps.
+
+The final real-space merged weights are obtained by adding the combined reconstructed task vector to the pre-trained backbone:
+\begin{equation}
+    W^l_{\text{merged}} = W^l_{\text{pre}} + \tau^l_{\text{merged}}
+\end{equation}
+
+\textbf{Real-Signal Constraints on DC and Nyquist Components.} A subtle mathematical nuance of the Real-valued Inverse Fourier Transform involves conjugate symmetry. The real 2D Fourier transform requires that the DC component (frequency $(0,0)$) and the Nyquist components must have zero imaginary parts, restricting their valid phase angles to strictly $\{0, \pi\}$ to represent a real spatial signal. Because our learnable continuous phase grids $\phi_k^l$ can generate arbitrary rotations in $[-\pi, \pi]$ for these components, this technically introduces complex-valued residuals that violate Fourier symmetry. To resolve this, we enforce a strict, symmetry-preserving frequency mask $M_{\text{sym}} \in \{0, 1\}^{H \times (\lfloor W/2 \rfloor + 1)}$ that physically zeroes out the phase-shift rotation ($\phi_k^l$) at the DC and Nyquist components:
+\begin{equation}
+    M_{\text{sym}}[u, v] = \begin{cases} 
+    0 & \text{if } (u, v) = (0,0) \\
+    0 & \text{if } u = H/2 \text{ and } H \% 2 = 0 \\
+    0 & \text{if } v = W/2 \text{ and } W \% 2 = 0 \\
+    1 & \text{otherwise}
+    \end{cases}
+\end{equation}
+By element-wise multiplying the continuous phase shift by $M_{\text{sym}}$ (i.e., $\phi_k^l \leftarrow \phi_k^l \odot M_{\text{sym}}$), we guarantee that the phase shifts of the DC and Nyquist frequencies are strictly zero. This preserves the mathematical conjugate symmetry constraints of the real Fourier transform, ensuring a mathematically consistent real-valued spatial matrix reconstruction without reliance on silent autograd imaginary-discarding. As shown in our experimental sweeps (Section~\ref{sec:sample_complexity}), enforcing this mathematical consistency dramatically stabilizes optimization in complex frequency-space and prevents performance degradation.
+
+\subsection{Quantization Projection and Test-time Entropy Optimization}
+To validate robustness under edge deployment constraints, the merged weights $W^l_{\text{merged}}$ are projected through a Post-Training Quantization (PTQ) operator to a target bit-width $b$ (e.g., asymmetric channel-wise 8-bit or 4-bit quantization):
+\begin{equation}
+    W^l_{\text{quant}} = Q_{\text{opt}}(W^l_{\text{merged}}, b)
+\end{equation}
+Let $p_{k, i}(c)$ represent the prediction probability for class $c \in \{1, \dots, C\}$ on calibration sample $i$ of task $k$ using the quantized model. The parameters $\tilde{\Phi} = \{\tilde{\phi}_k^l\}$ are optimized by minimizing the prediction entropy over a small unsupervised calibration stream $D_{\text{cal}}$:
+\begin{align}
+    \mathcal{L}_{\text{entropy}}(\tilde{\Phi}) = &-\frac{1}{|D_{\text{cal}}| \cdot K} \nonumber \\
+    &\times \sum_{k=1}^K \sum_{i=1}^{|D_{\text{cal}}|} \sum_{c=1}^C p_{k, i}(c) \log p_{k, i}(c)
+\end{align}
+Because the rounding operator in $Q_{\text{opt}}$ is non-differentiable, we employ the Straight-Through Estimator (STE) \cite{bengio2013estimating} during backpropagation. Gradients flow backwards through the quantized model, through the IRFFT2D, and back to the continuous phase-shift grids $\tilde{\Phi}$ using the Adam optimizer. 
+
+\textbf{Prevention of Class Collapse.} Unsupervised prediction entropy minimization can theoretically be susceptible to "class collapse," a degenerate failure mode where the model predicts a single class with extreme confidence to trivially minimize the entropy objective. In PhaseMerge, this vulnerability is mitigated by several structural design constraints. First, we initialize all parameters to perfectly reproduce standard Task Arithmetic at step 0 ($\phi = 0, s = 0.3$), anchoring optimization in a highly functional, well-calibrated parameter coordinate. Second, we restrict the test-time calibration budget to a highly conservative duration (exactly 5 optimization steps). Third, we operate in an extremely low-dimensional and smooth phase-rotation space (such as U-PhaseMerge's 196 parameters). Together, these structural constraints prevent the model from drifting into degenerated class-collapse regimes, ensuring that the prediction distribution remains highly balanced and statistically robust throughout optimization.
+
+This elegant computational pipeline is fully end-to-end differentiable, bridging wave-theoretic mechanics with standard deep learning autograd frameworks.

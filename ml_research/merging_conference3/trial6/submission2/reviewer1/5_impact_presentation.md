@@ -1,0 +1,24 @@
+# Intermediate Evaluation: Impact and Presentation
+
+This document evaluates the major strengths, areas for improvement, overall presentation quality, and potential impact/significance of the submission, from an empirical perspective.
+
+## 1. Major Strengths
+- **Rigorous Learning-Theoretic Foundation:** The paper provides the first formal learning-theoretic generalization bound for dynamic model merging. Utilizing empirical Rademacher complexity to bound parameter-space blending is highly original and mathematically elegant.
+- **Task-Adaptive Regularization Formulation:** Deriving Covariance-weighted Frobenius Regularization (CFR) directly from the Rademacher bound is technically impressive. It connects learning theory to a practical, offline-computable quadratic penalty that introduces zero online computational overhead.
+- **Well-Structured Ablations:** The authors conduct extensive ablations over calibration sample size ($N$), latent routing dimension ($d$), feature extraction blocks, and a continuous hyperparameter sweep over CFR regularization strength ($\lambda_{\text{wd}}$). This helps map the "Dynamic-Resilience Trade-off."
+- **Clear Engineering Focus:** Proactively addressing the hardware-level bottleneck of heterogeneity collapse under batch averaging is a highly practical and valuable contribution for edge deployment.
+- **Outstanding Writing and Contextualization:** The related work is thoroughly reviewed, and the paper clearly distinguishes its contribution from static merging, test-time adaptation, and dynamic routing. The mathematical proofs are detailed and complete.
+
+## 2. Areas for Improvement (Critique)
+- **Lack of Statistical Significance and Variance Testing:** In a low-data calibration regime ($N=64$), the optimization is highly sensitive to sample selection and initialization. The complete lack of multiple random seeds, standard deviations, or confidence intervals in the empirical tables is a major gap. It is impossible to know if the tiny differences (e.g., +0.12% or +0.24% at larger $N$) are statistically significant or just random noise.
+- **The "Dynamic Collapse" Paradox (Underwhelming Practical Utility):** Under default CFR settings, the router weights shrink to almost zero ($\mathcal{M}_{\text{drift}} \approx 0.012$), meaning the model behaves as a static layer-wise merger. The fact that the "Static Layer-Wise (Optimized)" baseline (which trains only biases and has zero routing weights) matches the proposed method's performance exactly (65.62%) severely undercuts the necessity of deploying a dynamic routing network.
+- **Outperformed by Standard L2 Decay Baseline:** Standard L2-regularized routing achieves higher average multi-task accuracy than R2D-Merge across both Homogeneous (66.88% vs. 65.62%) and Collapsed streams (65.88% vs. 65.62%). Standard L2 decay is computationally simpler, requires no offline pre-computation, and no auxiliary matrix storage. This makes the practical adoption of CFR highly questionable.
+- **Weak Expert Bottleneck:** The SVHN expert is poorly fine-tuned (only 64.60% accuracy), causing merged model accuracy on SVHN to hover near random guessing (17% - 30%). Evaluating on a weak expert drags down the average performance metrics and makes the average results less representative of a well-tuned system.
+- **Scale and Domain Limits:** The evaluation is confined to a tiny model (ViT-Tiny, 5.7M parameters) on low-resolution image datasets (MNIST, FashionMNIST, CIFAR-10, SVHN). The paper needs to demonstrate how R2D-Merge scales to larger architectures (e.g., ViT-Base/Large, CLIP, or LLMs) and more complex multi-modal tasks.
+
+## 3. Overall Presentation Quality
+The presentation quality is **Excellent**. The paper is superbly written, highly professional, and structured logically. Key equations are clearly defined, and the proofs in Section 3 are complete and detailed. Figure 1 provides a clear visual illustration of the "heterogeneity collapse" and the resilience of R2D-Merge. The tables are neat and well-formatted. Konstruktive feedback is provided for future extensions (Section 5).
+
+## 4. Potential Impact and Significance
+- **Theoretical Impact (High):** The paper sets a new standard for rigor in model merging. Grounding parameter blending in statistical learning theory could influence future research, inspiring others to derive similar bounds for non-linear routing, attention-based blending, or activation-space routing.
+- **Practical Impact (Low to Moderate):** Because standard L2 decay outperforms the proposed CFR penalty on average, and a simple static layer-wise optimized model achieves the exact same accuracy, practitioners are unlikely to adopt the proposed CFR penalty in its current form due to its extra offline pre-computation and loading workflows. The practical significance is heavily limited by the "dynamic collapse" behavior.

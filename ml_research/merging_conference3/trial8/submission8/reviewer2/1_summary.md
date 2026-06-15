@@ -1,0 +1,20 @@
+# Summary of Paper
+
+## Main Topic and Approach
+This paper presents a thorough methodological and empirical evaluation of out-of-distribution (OOD) task rejection in dynamic model merging frameworks (specifically activation-space blending architectures like SPS-ZCA and SABLE). These architectures serve multi-tenant parameter-efficient fine-tuning (PEFT) experts, such as LoRA adapters, over a shared pre-trained backbone by mapping early-layer representation activations onto pre-computed task centroids. This maps incoming queries into a low-dimensional "similarity coordinate space," over which a diagonal Gaussian Mixture Model (GMM) is fit during a one-time offline calibration phase to compute log-likelihoods for OOD task rejection.
+
+The authors expose a critical vulnerability in prior coordinate density models: they overfit small, low-resource calibration splits ($N \le 64$), leading to unstable variance estimates that collapse (variance collapse) under mild covariate shift (representation-level noise). To resolve this boundary instability, the authors propose **SRC-DE** (Shrinkage-Regularized Coordinate Density Estimation), which applies analytical, parameter-free Ledoit-Wolf-style covariance shrinkage to regularize GMM covariance matrices immediately following the expectation-maximization (EM) optimization. 
+
+## Key Findings
+1. **Unregularized GMM Collapse:** Fitting multi-component diagonal GMMs on tiny calibration datasets yields underestimated variance boundaries, causing log-likelihoods to drop catastrophically when test-time representation drift is introduced.
+2. **Symmetric Evaluation Necessity:** Prior work suffered from an "unequal noise confounder," where representation noise was only applied to in-distribution samples. Applying identical noise symmetrically to both ID and OOD samples resolves this evaluation design flaw.
+3. **The Outstanding Robustness of Raw Cosine:** The non-parametric, 1D Raw Cosine thresholding baseline is extremely robust to noise. It consistently and significantly outperforms all parametric joint GMM models under noise due to the "curse of dimensionality" (noise accumulates over inactive coordinate dimensions in joint GMMs, burying the active routing signal).
+4. **Crossover of Joint Density vs. 1D Isolation:** Joint multi-dimensional GMMs are mathematically necessary to detect and reject overlapping task-mixture queries, where 1D models (like Raw Cosine or Independent 1D GMMs) fail. However, joint GMMs scale poorly to larger registries ($K \ge 16$) due to high-dimensional noise propagation. Independent 1D GMMs resolve this scaling collapse under disjoint setups but are blind to semantic overlap.
+5. **On-Device Viability:** diagonal GMM routing with SRC-DE is exceptionally lightweight, running in sub-millisecond envelopes and requiring negligible memory and active energy, making it highly suitable for bare-metal microcontrollers.
+
+## Explicitly Claimed Contributions and Evidence
+* **Methodological Audit of Coordinate Density Models:** Exposing overfitting vulnerabilities and the "curse of dimensionality" under noise in multi-dimensional coordinate GMMs. (Supported by systematic noise sweeps and dimensionality scaling experiments in Section 4).
+* **Resolving the Unequal Noise Confounder:** Introducing a symmetric, scientifically valid evaluation setup. (Supported by formulation and validation in Section 4.4).
+* **SRC-DE Framework:** Proposing an analytical, training-free, and adaptive covariance-shrunk coordinate density estimator using global and spherical diagonal targets. (Supported by mathematical derivations in Section 3.3 and pseudocode in Section 3.4).
+* **Silent Software Bug Discovery:** Identifying and resolving a cached Cholesky precision bug in `scikit-learn` that renders manual GMM covariance regularizations ineffective. (Supported by code fixes detailed in Section 4.3).
+* **Downstream and Physical Scaling Validation:** Evaluating physical multi-task registries, end-to-end input image corruptions, and emulating on-device MCU resource profiles. (Supported by comprehensive audits in Sections 4.7, 4.8, 4.9, and 4.10).

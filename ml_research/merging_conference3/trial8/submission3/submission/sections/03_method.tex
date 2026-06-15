@@ -1,0 +1,62 @@
+\section{Methodology}
+\label{sec:method}
+
+We present \textbf{Scale-Aligned Quantized Activation Blending (SA-QAB)}, a training-free, forward-only framework designed for efficient multi-task edge deployment. SA-QAB addresses representation collapse and scale mismatches of post-merge quantization by keeping the base model and task experts decoupled during quantization, executing them independently, and dynamically blending their activations on-the-fly. An architectural overview is in Figure~\ref{fig:pipeline_diagram_app} of Appendix C.
+
+\subsection{Decoupled Heterogeneous Quantization (DHQ)}
+To minimize memory transfer latency, we compress the heavy, shared base backbone to INT4 while keeping the lightweight LoRA adapters \cite{lora} in INT8 to preserve task specificity. We define a symmetric uniform quantization operator $Q_b(X)$ mapping a tensor $X$ to a signed $b$-bit integer grid $[ -2^{b-1} + 1, \, 2^{b-1} - 1 ]$:
+\begin{equation}
+    Q_b(X) = \text{round}\left( \text{clip}\left(\frac{X}{S}, -2^{b-1} + 1, 2^{b-1} - 1\right) \right)
+\end{equation}
+where $S = \max(|X|) / (2^{b-1} - 1)$ is the dequantization scale, and $\text{clip}(x, L, U)$ restricts $x$ to $[L, U]$. 
+Applying DHQ: (1) \textbf{Base Weights ($W_{\text{base}}$)} are quantized per-channel to INT4 format: $Q_4(W_{\text{base}}^{(l)})$ with scale factors $S_{\text{base}}^{(l)}$. (2) \textbf{Adapter Weights ($A_k, B_k$)} are quantized symmetrically to INT8: $Q_8(A_k^{(l)})$ with scale $S_{A, k}^{(l)}$, and $Q_8(B_k^{(l)})$ with scale $S_{B, k}^{(l)}$. This heterogeneous bit-width reduces active backbone memory by approximately $4\times$ while preserving expert task representation boundaries.
+
+\subsection{Quantized Zero-Shot Centroid Alignment (Q-ZCA)}
+Rather than executing expensive late-stage routing, SA-QAB dynamically routes activations at runtime based on task similarity at Layer 3 (see Appendix B.1 for comprehensive, training-free mathematical and structural heuristics for selecting the optimal routing block in deeper or alternative topologies). During offline calibration, we pass a small set $\mathcal{C}_k$ of 64 samples per task $k$ and compute the task centroid in Layer 3's representation space: $\mu_k^{(3)} = \frac{1}{|\mathcal{C}_k|} \sum_{s \in \mathcal{C}_k} h_s^{(3)}$. Centroids are quantized to INT8 format: $Q_8(\mu_k^{(3)})$ with scale $S_{\mu, k}$.
+During on-device inference, we quantize the input's Layer 3 feature $h_b^{(3)}$ to INT8 ($Q_8(h_b^{(3)})$) and compute cosine similarity scores $u_{k, b}$ using pure integer dot products:
+\begin{equation}
+    u_{k, b} = \frac{Q_8(h_b^{(3)}) \cdot Q_8(\mu_k^{(3)})}{\|Q_8(h_b^{(3)})\|_2 \|Q_8(\mu_k^{(3)})\|_2}
+\end{equation}
+Scores are passed through a temperature-scaled Softmax to yield continuous coefficients:
+\begin{equation}
+    \label{eq:routing_softmax}
+    \alpha_{k, b} = \exp(u_{k, b} / \tau) \Big/ \sum_{j=1}^K \exp(u_{j, b} / \tau)
+\end{equation}
+where $\tau$ is a tunable temperature regulating routing sharpness.
+
+\textbf{Hardware Optimizations and Noise Robustness of Routing:} For microcontroller deployment of Q-ZCA, we implement: (1) \emph{Sparse Routing via Hard Maxima,} setting the active expert routing weight to $1$ and others to $0$ to execute exactly one expert (true $O(1)$ expert compute footprint); and (2) \emph{Hardware-Efficient Cosine,} which pre-normalizes centroids offline and approximates feature norms via fast fixed-point bit-shifting to bypass expensive on-device division and square roots. Q-ZCA's unit-sphere projection also acts as an isotropic filter that absorbs INT4 quantization noise. See Appendix A for details.
+
+\subsection{Quantization Scale Recovery (QSR)}
+Aggressive low-bit quantization induces systematic scale contraction and representation distortion. Blending quantized activations directly can result in scale drift, perturbing the relative influence of backbone and expert pathways. To resolve this without backpropagation, we propose \textbf{Quantization Scale Recovery (QSR)}. We pre-compute scaling factors $\beta_k^{(l)}$ as the expected L2 norm ratio of unquantized to quantized adapter activations across the calibration dataset:
+\begin{equation}
+    \beta_k^{(l)} = \frac{\mathbb{E}_{s \in \mathcal{C}_k} \left[ \| \text{Adapter\_FP}_k(h_s^{(l-1)}) \|_2 \right]}{\mathbb{E}_{s \in \mathcal{C}_k} \left[ \| \text{Adapter\_Quant}_k(h_s^{(l-1)}) \|_2 \right]}
+\end{equation}
+where $\text{Adapter\_FP}_k$ is the FP16 adapter activation, and $\text{Adapter\_Quant}_k$ is the simulated INT8 quantized adapter output. During inference, these pre-computed $\beta_k^{(l)}$ factors are applied on-the-fly to scale expert activations, neutralizing scale contraction.
+
+\textbf{Transparent Disclosure on Calibration Inputs and Ambiguity Resolution:} We explicitly disclose a methodological choice regarding the input activations $h_s^{(l-1)}$ in \cref{eq:qsr_beta}. During offline calibration, $h_s^{(l-1)}$ is extracted from the clean, full-precision (FP16) network stream rather than the quantized base network. This allows $\text{Adapter\_FP}_k$ to capture the unperturbed expert representations as a clean target for scale alignment. Although this introduces a minor distribution mismatch at test-time due to INT4 backbone noise, our empirical sweeps in \cref{tab:main_results} prove that dynamic routing and scale recovery factors generalize exceptionally well. Calibrating over quantized base features instead corrupts the reference expectation with compounding noise, destabilizing the scale factors. Extracting clean FP16 features is thus a pragmatic compromise prioritizing stable scale references over complex online loops.
+
+\subsection{Single-Pass Quantized Activation Blending}
+For layers $l \ge 4$, SA-QAB executes the INT4 base backbone and INT8 adapter paths in parallel, dequantizing outputs and dynamically blending them on-the-fly using routing weights $\alpha_{k, b}$ and scale recovery factors $\beta_k^{(l)}$:
+\begin{equation}
+\begin{split}
+    h_b^{(l)} &= \text{GEMM\_INT4}\left(h_b^{(l-1)}, Q_4(W_{\text{base}}^{(l)})\right) S_{\text{base}}^{(l)} \\
+    &+ \sum_{k=1}^K \alpha_{k, b} \beta_k^{(l)} \Phi_k^{(l)}\left(h_b^{(l-1)}\right)
+\end{split}
+\end{equation}
+where $\Phi_k^{(l)}(h)$ is the dequantized output of the $k$-th adapter, defined hierarchically to explicitly model activation quantization and scale propagation on integer-only hardware:
+\begin{equation}
+\begin{split}
+    \Phi_k^{(l)}(h) &= \text{GEMM}_8\left(Q_8(\tilde{h}_k), Q_8(B_k^{(l)})\right) S_{\tilde{h}, k}^{(l)} S_{B, k}^{(l)} \\
+    \tilde{h}_k &= \text{GEMM}_8\left(Q_8(h), Q_8(A_k^{(l)})\right) S_h^{(l-1)} S_{A, k}^{(l)}
+\end{split}
+\end{equation}
+where $Q_8(h)$ is the 8-bit quantized representation of activation $h$ on the integer grid, scaled by its activation scale factor $S_h^{(l-1)}$, and $Q_8(\tilde{h}_k)$ is the 8-bit quantized intermediate adapter activation, scaled by $S_{\tilde{h}, k}^{(l)}$. This formulation guarantees mathematical consistency under pure integer-only arithmetic, completely eliminating any runtime floating-point or dynamic casting overhead. This dynamic, sample-wise blending avoids parameter-space weight interference and is completely immune to batch heterogeneity collapse.
+
+\subsection{Out-of-Distribution (OOD) GMM Rejection Gate}
+To prevent edge devices from wasting energy processing out-of-distribution (OOD) or noisy inputs, we train a diagonal Gaussian Mixture Model (GMM) on Layer 3 representation space:
+\begin{equation}
+    P\left(h_q^{(3)}\right) = \frac{1}{K} \sum_{k=1}^K \mathcal{N}\left(h_q^{(3)}; \bar{\mu}_k, \Sigma_k\right)
+\end{equation}
+where mean vectors $\bar{\mu}_k = \mathbb{E}[h_q^{(3)} \mid \text{task } k]$ and diagonal covariance matrices $\Sigma_k = \text{diag}(\text{Var}[h_q^{(3)} \mid \text{task } k] + \epsilon I)$ (with ridge term $\epsilon = 10^{-4}$) are estimated offline. During inference, if the log-likelihood $\log P(h_q^{(3)})$ falls below safety threshold $\eta$, the sample is classified as OOD, dynamic routing is bypassed ($\alpha_{k, b}=0$), and the input is processed solely by the robust, frozen base backbone.
+
+\textbf{Calibration and Complexity Trade-offs of GMM:} To configure threshold $\eta$, we use a percentile-based heuristic over an offline validation set. We restrict GMM covariances $\Sigma_k$ to diagonals, reducing storage to $O(D)$ parameters and inference to $O(D)$ linear-time arithmetic. This completely bypasses expensive $O(D^3)$ matrix operations while preserving near-perfect OOD discrimination. See Appendix A for details.

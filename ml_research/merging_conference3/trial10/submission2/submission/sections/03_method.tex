@@ -1,0 +1,84 @@
+\section{Methodology}
+\label{submission:sec:methodology}
+
+We introduce \textbf{Layer-Decoupled Stateful Kinetics (LDS-Kinetics)}, which generalizes and decouples continuous-time kinetics-based state space routing along the network's depth. This section details the coordinate projection, the decoupled state recurrence, the Gibbs ensembling policy, and our unified learning-theoretic PAC-Bayesian regularization.
+
+\subsection{Coordinate Signals and Subspace Projections}
+We consider a frozen backbone network of $L$ layers equipped with $K$ task-specific low-rank experts (LoRAs). At time step $t$, an input query sample $\mathbf{x}_t$ propagates through the initial frozen layers of the backbone. At an early routing layer $l_{\text{route}} = 3$, we extract the intermediate activation representation $z_t \in \mathbb{R}^D$ and normalize it onto the unit sphere to ensure strict scale bounds:
+\begin{equation}
+    \tilde{z}_t = \frac{z_t}{\|z_t\|_2 + \epsilon}
+\end{equation}
+where $\epsilon = 10^{-8}$ is a small numerical stabilization constant. To measure the affinity of the current representation space with each of the $K$ expert tasks, we project $\tilde{z}_t$ onto task-specific principal component analysis (PCA) subspaces:
+\begin{equation}
+    e_{k, t} = \|P_k \tilde{z}_t\|_2 \in [0, 1]
+\end{equation}
+where $P_k \in \mathbb{R}^{D \times d}$ is the orthonormal PCA projection matrix representing the activation manifold of task expert $k$, and $\mathbf{e}_t = [e_{1, t}, \dots, e_{K, t}]^T$ is the resulting coordinate signal vector.
+
+\subsection{Decoupled Stateful Recurrence}
+Instead of maintaining a single global state across all network depths (spatial homogeneity), LDS-Kinetics partitions the dynamic ensembling layers (Layers 4 to 14) into $M$ disjoint blocks: $\mathcal{B}^{(1)}, \dots, \mathcal{B}^{(M)}$. Let $m(l) \in \{1, \dots, M\}$ denote the block index containing layer $l$. 
+
+For each block $m \in \{1, \dots, M\}$, we maintain an independent concentration state vector $s^{(m)}_t \in \mathbb{R}^K$ that captures the temporal task affinity of that specific network depth. The state vector evolves dynamically as:
+\begin{equation}
+    s^{(m)}_t = \mathbf{A}^{(m)}_t s^{(m)}_{t-1} + W^{(m)} \mathbf{e}_t
+\end{equation}
+where:
+\begin{itemize}
+    \item $\mathbf{A}^{(m)}_t = \text{diag}(a^{(m)}_{1, t}, \dots, a^{(m)}_{K, t}) \in \mathbb{R}^{K \times K}$ is the dynamic block-wise state-retention matrix.
+    \item $W^{(m)} \in \mathbb{R}^{K \times K}$ is the unconstrained coordinate injection (coupling) matrix, which models the cross-task coupling of the coordinate signals for block $m$.
+\end{itemize}
+
+To suppress phase lag during rapid task transitions, we scale down the state retention online using the rolling cosine similarity of incoming coordinate signals, which measures current workload homogeneity:
+\begin{equation}
+    Sim_t = \frac{\mathbf{e}_t^T \mathbf{e}_{t-1}}{\|\mathbf{e}_t\|_2 \|\mathbf{e}_{t-1}\|_2 + \epsilon}
+\end{equation}
+The dynamic, scaled retention rate for task $k$ in block $m$ is defined as:
+\begin{equation}
+    a^{(m)}_{k, t} = a^{(m)}_k \cdot Sim_t, \quad \text{with} \quad a^{(m)}_k = \sigma(u^{(m)}_k) \in (0, 1)
+\end{equation}
+where $u^{(m)}_k \in \mathbb{R}$ is a learnable state-retention parameter, and $\sigma(\cdot)$ is the standard sigmoid function. When the task stream is homogeneous ($Sim_t \approx 1$), the state memory is fully retained to filter noise. During a task switch ($Sim_t \to 0$), the state is rapidly flushed ($a^{(m)}_{k, t} \to 0$), allowing the state vector to instantaneously adapt to the new task.
+
+\subsection{Gibbs Softmax Policy}
+For each block $m$, the raw concentration state vector $s^{(m)}_t$ is converted into a valid probability distribution over task experts via a multi-temperature Gibbs policy:
+\begin{equation}
+    \alpha^{(m)}_{k, t} = \frac{\exp\left(s^{(m)}_{k, t} / \tau^{(m)}_k \right)}{\sum_{j=1}^K \exp\left(s^{(m)}_{j, t} / \tau^{(m)}_j \right)}
+\end{equation}
+where $\alpha^{(m)}_t \in \Delta^{K-1}$ are the active ensembling weights for block $m$ at step $t$. The task-specific learned temperatures are defined as:
+\begin{equation}
+    \tau^{(m)}_k = e^{w^{(m)}_k} + \tau_{\min}
+\end{equation}
+where $w^{(m)}_k \in \mathbb{R}$ is a learnable temperature parameter, and $\tau_{\min} = 0.01$ is a minimum temperature threshold to prevent numerical underflow.
+
+\subsection{Layer-Wise Dynamic Activation Blending}
+During the forward execution pass, representation ensembling occurs on-the-fly at each dynamic layer $l \in [4, 14]$. The intermediate activation $h_t^{(l-1)} \in \mathbb{R}^D$ is blended using the ensembling weights $\alpha^{(m(l))}_t$ computed for block $m(l)$ containing layer $l$:
+\begin{equation}
+    h_t^{(l)} = h_t^{(l-1)} W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha^{(m(l))}_{k, t} \left( h_t^{(l-1)} A_k^{(l)} B_k^{(l)} \right)
+\end{equation}
+where $W_{\text{base}}^{(l)}$ is the base network's frozen weight matrix at layer $l$, and $A_k^{(l)}, B_k^{(l)}$ are the task-specific low-rank LoRA adapter matrices.
+
+\subsection{Learning-Theoretic PAC-Bayesian Regularization}
+The total parameter vector of our decoupled router is the concatenation of parameters across all $M$ blocks:
+\begin{equation}
+    \Theta = \left\{ \mathbf{u}^{(m)}, W^{(m)}, \mathbf{w}^{(m)} \right\}_{m=1}^M \in \mathbb{R}^{M \times (2K + K^2)}
+\end{equation}
+Since the search space scales linearly with $M$, unregularized empirical risk minimization (ERM) on a short calibration sequence $T$ inevitably leads to transductive overfitting and representation collapse. 
+
+To prevent this, we formulate a unified learning-theoretic complexity penalty. We invoke Catoni’s PAC-Bayesian bound~\cite{catoni2007} designed for \emph{stationary} $\beta$-mixing stochastic processes, which bounds the true generalization risk of a randomized predictor. We note that while the resulting complexity penalty mathematically reduces to an isotropic, block-wise $L_2$ weight decay centered around safe SABLE-grounded default parameters $\Theta_0$, its exact formulation, scaling coefficients, and centering coordinates are rigorously derived from Catoni's PAC-Bayesian bound rather than heuristics. This anchors the regularization parameters (like $\sigma_0^2$ and $n_{\text{eff}}$) in learning theory and ensures a principled way to balance empirical risk and parameter complexity as sequence length $T$ scales. 
+
+We also note that while our real-world serving evaluations involve non-stationary workload switches (which technically violate the stationarity assumption of the bound), modeling the sequential stream as a stationary mixing process is a standard, highly effective abstraction in online learning theory that provides robust empirical regularization in practice. Theoretically, sudden non-stationary task switches cause the underlying coupling between past states and current samples to change abruptly, which degrades the effective sample size $n_{\text{eff}}$ and loosens the generalization guarantees of the PAC-Bayesian bound. 
+
+To resolve this and make the theoretical narrative stronger, we establish a clean separation of roles between offline calibration and online serving: the PAC-Bayesian complexity penalty acts as a robust \emph{regularization prior} during the offline calibration phase, while our online similarity scaling $Sim_t$ physically manages non-stationarity during online inference. Specifically, during online serving, $Sim_t$ acts as a dynamic flush mechanism that resets the stateful recurrence during switches, physically aligning the state's memory with the stream's non-stationarity while retaining the mathematical regularization benefits of the stationary mixing bound during offline learning. Under a Gaussian posterior centered at the learnable parameters $\Theta$ and isotropic prior centered at safe, SABLE-grounded default parameters $\Theta_0$, the PAC-Bayesian minimization objective simplifies to regularized ERM:
+\begin{equation}
+\begin{aligned}
+    \mathcal{J}(\Theta) &= \frac{\lambda}{\mathcal{L}_{\max}} \hat{R}_T(\Theta) + \frac{1}{n_{\text{eff}} \sigma_0^2} \sum_{m=1}^M \left( \|\mathbf{u}^{(m)} - \mathbf{u}_0\|_2^2 \right. \\
+    &\quad \left. + \|W^{(m)} - W_0\|_F^2 + \|\mathbf{w}^{(m)} - \mathbf{w}_0\|_2^2 \right)
+\end{aligned}
+\end{equation}
+where:
+\begin{itemize}
+    \item $\hat{R}_T(\Theta) = \frac{1}{T} \sum_{t=1}^T \mathcal{L}_{\text{trunc}}(y_t, \hat{y}_t)$ is the empirical risk over calibration sequence $T$, computed using a truncated Cross-Entropy loss ($\mathcal{L}_{\max} = 5.0$).
+    \item $\lambda = 0.5$ is a weighting hyperparameter.
+    \item $\sigma_0^2 = 5.0$ is the prior variance of the parameter distribution.
+    \item $n_{\text{eff}} = T/4$ is the effective sample size bounding mixing temporal dependencies.
+    \item $\Theta_0 = \{ \mathbf{u}_0, W_0, \mathbf{w}_0 \}$ is the default prior coordinate. Following SABLE's default setup, we set $\mathbf{u}_0 = \mathbf{0}$ (neutral memory), $W_0 = I_K$ (identity coordinate mapping), and $\mathbf{w}_0 = \ln(0.05) \cdot \mathbf{1}$ (neutral temperature).
+\end{itemize}
+By optimizing $\mathcal{J}(\Theta)$ over the calibration sequence, LDS-Kinetics balances empirical task accuracy with parameter complexity, enabling stable generalization.

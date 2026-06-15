@@ -1,0 +1,106 @@
+\section{Methodology}
+\label{sec:methodology}
+
+This section describes the mathematical formulation of our proposed \textbf{Cross-Attention Multi-Expert Router (CAM-Router)}. Unlike standard dynamic routers that perform global pooling on token features, CAM-Router preserves spatial token coordinates and learns specialized queries to dynamically attend to localized image patches.
+
+\subsection{Multi-Head Cross-Attention (MHCA) Spatial Gating}
+Let $H_0 \in \mathbb{R}^{B \times N \times D}$ represent the sequence of patch token representations extracted from the early stage of the transformer backbone (specifically, the output of the first self-attention block), where $B$ is the batch size, $N$ is the number of spatial patch tokens, and $D$ is the hidden feature dimension. Let $H_{0, b} \in \mathbb{R}^{N \times D}$ denote the token sequence for a single sample $b \in \{1, \dots, B\}$.
+
+\paragraph{First-Block Paradox Resolution:} A logical paradox arises if we attempt to extract $H_0$ from an already merged network, as weight merging coefficients must be predicted before running early layers. To resolve this, we utilize the pre-trained, static base model parameters $W_{base}^{(1)}$ to execute the patch embedding and the first transformer block. Because the earliest layers in Vision Transformers act as generic, task-invariant feature extractors (e.g., Gabor-like filters and low-level edge detectors), keeping this first block static provides a stable and highly robust token coordinate space. Layers $2$ to $L$ of the model, which contain the high-level semantic representation channels, are then dynamically merged based on the coefficients predicted from $H_0$.
+
+We introduce $K$ trainable task-expert query embeddings $Q \in \mathbb{R}^{K \times D}$, where $K$ is the number of expert tasks to merge. Each query $Q_k$ (the $k$-th row of $Q$) serves as a learned template trained to recognize feature structures characteristic of task domain $k$.
+
+For each attention head $j \in \{1, \dots, h\}$, where $h$ is the number of attention heads and $d_h = D/h$ is the head dimension, we project the queries, keys, and values into their respective subspaces:
+\begin{align}
+    Q^{(j)} &= Q W_Q^{(j)} \in \mathbb{R}^{K \times d_h} \\
+    K_{b}^{(j)} &= H_{0, b} W_K^{(j)} \in \mathbb{R}^{N \times d_h} \\
+    V_{b}^{(j)} &= H_{0, b} W_V^{(j)} \in \mathbb{R}^{N \times d_h}
+\end{align}
+where $W_Q^{(j)}, W_K^{(j)}, W_V^{(j)} \in \mathbb{R}^{D \times d_h}$ are the trainable query, key, and value projection matrices for head $j$.
+
+The attention score matrix $S_{b}^{(j)} \in \mathbb{R}^{K \times N}$ for sample $b$ and head $j$ is computed via a scaled dot-product operation:
+\begin{equation}
+    S_{b}^{(j)} = \text{Softmax}\left( \frac{Q^{(j)} (K_{b}^{(j)})^T}{\sqrt{d_h}} \right)
+\end{equation}
+Each entry $(k, n)$ of $S_{b}^{(j)}$ represents the attention weight assigned by task expert $k$ to spatial patch token $n$ of sample $b$, enabling localized and spatially adaptive feature extraction.
+
+The contextualized representation output for head $j$ is obtained by taking the weighted sum of the values:
+\begin{equation}
+    O_{b}^{(j)} = S_{b}^{(j)} V_{b}^{(j)} \in \mathbb{R}^{K \times d_h}
+\end{equation}
+We concatenate the outputs of all $h$ heads and project them back into the $D$-dimensional space using an output projection matrix $W_O \in \mathbb{R}^{D \times D}$ to yield the final joint task-specific feature matrix $A_b$:
+\begin{equation}
+    A_b = \left[ O_{b}^{(1)}; O_{b}^{(2)}; \dots; O_{b}^{(h)} \right] W_O \in \mathbb{R}^{K \times D}
+\end{equation}
+
+\subsection{Independent Bounded Gating}
+To prevent the zero-sum competitive pressure associated with traditional Softmax constraints, we apply independent gating to each task-specific representation. For each task expert $k \in \{1, \dots, K\}$, we extract its specialized representation vector $A_{b, k, :} \in \mathbb{R}^D$ from the $k$-th row of $A_b$.
+
+We map $A_{b, k, :}$ to a raw logit $o_{k, b}$ using a task-specific linear routing head:
+\begin{equation}
+    o_{k, b} = \langle A_{b, k, :}, W_{route, k} \rangle + b_{route, k}
+\end{equation}
+where $W_{route, k} \in \mathbb{R}^D$ and $b_{route, k} \in \mathbb{R}$ are the routing weights and bias.
+
+To obtain sample-specific merging coefficients $\alpha_{k, b}$ that represent stable, dynamic mixing bounds, we pass the logits through an independent Bounded Sigmoid activation:
+\begin{equation}
+    \alpha_{k, b} = \lambda_{max} \cdot \sigma(o_{k, b}) \quad \text{with } \lambda_{max} = 0.3
+\end{equation}
+where $\sigma(\cdot)$ is the standard Sigmoid function and $\lambda_{max} = 0.3$ is the maximum dynamic scaling coefficient assigned to any single task vector to ensure fusions remain stable.
+
+\subsection{Deterministic Inference and Decoupled Historical Gating}
+To resolve the theoretical contradictions of batch pooling—namely, inference non-determinism and "task heterogeneity collapse" in large batched environments—we define two operating modes for model assembly:
+
+\paragraph{1. Deterministic Single-Sample Inference ($B=1$):} At inference time, absolute determinism is guaranteed by operating on a single-sample basis. For any single input sample $x$, the merging coefficients $\alpha_{k}$ are computed strictly from its individual token representation $H_{0, b}$, and the model weights are assembled specifically for that sample:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \alpha_{k} V_k^{(l)}
+\end{equation}
+where $\alpha_k$ is the sample's predicted coefficient. This completely eliminates batch composition dependency and ensures that predictions are fully deterministic and independent of other inputs.
+
+\paragraph{2. Decoupled Historical Gating (DHG) for Batched Inference:} For high-throughput batched production environments, we introduce Decoupled Historical Gating (DHG). Rather than average pooling the coefficients over the active batch (which causes task representations to average out and collapse back to mediocre static compromises), we decouple the co-batched samples. We compute per-sample coefficients $\alpha_{k, b}$ and maintain an exponential moving average (EMA) of the coefficients over a sliding historical window:
+\begin{equation}
+    \bar{\alpha}_k^{(t)} = \beta \bar{\alpha}_k^{(t-1)} + (1 - \beta) \left( \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}^{(t)} \right)
+\end{equation}
+where $\beta \in [0, 1)$ is a smoothing coefficient (typically $\beta = 0.95$). In practice, DHG filters out high-frequency task variance and provides a stable, smoothly shifting weight trajectory that preserves individual routing signatures without introducing intra-batch inference dependencies.
+
+\paragraph{3. Batched Calibration Training:} During calibration training, average-pooling is utilized over the small calibration batch as an efficient gradient-smoothing mechanism:
+\begin{equation}
+    \bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}
+\end{equation}
+which is used to update the router parameters. This decoupled paradigm ensures that the model enjoys smooth gradient updates during optimization, while remaining highly deterministic and robust during inference.
+
+For layer $l \in \{2, \dots, L\}$ of the backbone, the dynamically merged parameters are then assembled:
+\begin{equation}
+    W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k V_k^{(l)}
+\end{equation}
+where $W_{base}^{(l)}$ is the base model weight matrix for layer $l$, and $V_k^{(l)} = W_k^{(l)} - W_{base}^{(l)}$ is the task vector corresponding to task expert $k$.
+
+\subsection{Loss Function and Optimization}
+We train the parameters of the routing framework, denoted as $\Theta = \{Q, \{W_Q^{(j)}, W_K^{(j)}, W_V^{(j)}\}_{j=1}^h, W_O, \{W_{route, k}, b_{route, k}\}_{k=1}^K\}$, on a small, task-heterogeneous calibration set. We optimize $\Theta$ by minimizing the Cross-Entropy classification loss under standard $L_2$ weight decay:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{CE} + \lambda_{wd} \|\Theta\|_2^2
+\end{equation}
+where $\lambda_{wd} = 10^{-3}$ is the default weight decay penalty.
+
+\subsection{Architectural Parameters and Parameter Complexity}
+Our implementation of CAM-Router on the Vision Transformer (`vit\_tiny\_patch16\_224`) model merging backbone utilizes the following specific configurations:
+\begin{itemize}
+    \item \textbf{Backbone Parameters:} $L = 14$ layers, feature dimension $D = 192$, and token count $N = 196$.
+    \item \textbf{Trainable Queries:} $Q$ of shape $4 \times 192$ ($768$ parameters).
+    \item \textbf{MHCA Projections:} Query, Key, Value weights of shape $192 \times 192 \times 3$ and Output weights of shape $192 \times 192$, totalling $147,456$ parameters.
+    \item \textbf{Routing Classifiers:} $4$ linear projection layers, mapping $192$ features to $1$ logit ($772$ parameters).
+\end{itemize}
+The \textbf{Total Trainable Parameter Overhead} of CAM-Router is \textbf{148,996} (~0.15M parameters). Compared to the standard $5.7\text{M}$ parameters of the ViT-Tiny backbone, CAM-Router introduces an extremely lightweight parameter overhead of only \textbf{2.61\%}, making it highly practical for edge deployment.
+
+\subsection{Latency Discussion and Conceptual Hardware Acceleration Roadmap}
+Performing weight-space merging dynamically during a forward pass introduces a memory-bandwidth-heavy operation if implemented naively in eager PyTorch mode. Summing large weight tensors ($W_{base}^{(l)} + \sum \bar{\alpha}_k V_k^{(l)}$) for $L-1$ layers on-the-fly during inference can trigger high-bandwidth memory (HBM) roundtrips, resulting in latency. To address this potential latency in future production environments, we outline a conceptual hardware acceleration roadmap consisting of two proposed GPU-level engineering designs (which remain as future research directions and are not implemented in the current codebase):
+
+\paragraph{1. Proposed Coefficient Quantization and Model Caching:}
+Because the predicted routing coefficients $\alpha_k$ vary smoothly across the continuous space, they could be quantized into a finite set of discrete states (e.g., discretizing the scaling factor into $5$ bins). During deployment, the system can pre-compile and cache a tiny pool of pre-merged model weights in GPU memory. During inference, the predicted coefficients are mapped to the nearest quantized bin, and the forward pass is executed using the corresponding cached pre-merged weights. This would completely bypass any on-the-fly weight summation, reducing latency overhead to exactly zero.
+
+\paragraph{2. Fused Gated Matrix Multiplication via Proposed Triton Kernels:}
+For settings requiring continuous on-the-fly coefficient routing, we can bypass the physical materialization of the merged weight tensor $W_{merged}^{(l)}$ in HBM. Instead of calculating the merged weights and writing them back to global memory, we propose the future development of custom Triton kernels that fuse the parameter summation and the linear projection operation:
+\begin{equation}
+    Y = X \left( W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k V_k^{(l)} \right)
+\end{equation}
+By keeping the base weights $W_{base}^{(l)}$ and lightweight task vectors $V_k^{(l)}$ resident in cache, such a Triton kernel would perform the summation and accumulation directly within the GPU's high-speed static random-access memory (SRAM) registers during the matrix multiplication. This would eliminate intermediate write and read roundtrips to GPU HBM, bringing the execution latency of dynamic fusions to near-parity with standard static model inference.

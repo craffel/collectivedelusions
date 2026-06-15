@@ -1,0 +1,25 @@
+# 1. Summary of the Paper
+
+**Title:** Deconstructing the "Re-Quantization Silence": A Methodological Audit of QLoRA Adapter Merging  
+**Authors:** Arthur Vance, Clara Montgomery  
+**Affiliation:** Department of Computer Science and Technology, University of Cambridge, United Kingdom  
+
+## 1.1. Core Problem and Motivation
+Model merging has emerged as a resource-efficient paradigm for combining specialized Parameter-Efficient Fine-Tuning (PEFT) adapters (like LoRA/QLoRA) into a single multi-task model without further training compute. However, current research assumes a high-precision (FP16/FP32) abstraction. In real-world deployment pipelines, merged models must undergo Post-Training Quantization (PTQ) to 8-bit or 4-bit formats for edge execution. 
+
+This paper exposes a major methodological blindspot: **Re-Quantization Silence (or Re-Quantization Collapse)**. During standard merging, dequantized base weights $W_0$ (which have large magnitudes and high dynamic range) are added to low-rank updates $\Delta W_{\text{merged}}$ (which are small in magnitude). When the resulting continuous fused matrix is re-quantized, the quantization step size (scale factor $s$) is dominated by $W_0$, causing the fine-grained task updates of the adapters to be rounded to zero. The paper aims to systematically audit this behavior, explain its underlying mechanics, and critically evaluate mitigations.
+
+## 1.2. Key Technical Contributions and Proposed Methods
+To address this silence, the authors introduce a rigorous auditing framework and evaluate two distinct mitigations:
+1. **Multi-Axial Re-Quantization Auditing (RQA) Framework:** Evaluates model merging under post-training quantization across multiple bit-widths (4-bit vs. 8-bit), formats (Symmetric vs. Asymmetric), and spatial granularities (Per-Tensor vs. Per-Channel).
+2. **Discovery of the Quantization Granularity Bifurcation:** Demonstrates that the "Re-Quantization Silence" is not a universal failure, but is highly localized to per-tensor grids. Under standard per-channel configurations, naive re-quantization is nearly lossless, dropping only $0.15\%$ to $0.30\%$ accuracy, while under per-tensor grids it drops up to $8.6\%$.
+3. **Scale-Adaptive Weight Shifting (SAWS):** A data-free, closed-form mitigation that scales up low-rank updates prior to merging based on the Frobenius norm ratio of base weights to adapter updates, and applies a scalar projection alignment factor ($c^l \approx 1.0$) at inference to align the final activation output.
+4. **Quantization-Aware Adapter Coefficient Search (QA-ACS):** A test-time optimization (TTA) method that optimizes layer-wise merging coefficients directly through the quantization operator on a tiny unlabeled calibration set ($N=16$) using Straight-Through Estimators (STE).
+
+## 1.3. Critical Deconstructions and In-depth Analyses
+Rather than presenting these mitigations as flawless SOTA methods, the paper is exceptionally self-critical and deconstructs their mechanics:
+- **Representation Scale Preservation Dilemma (SAWS):** Shows that trying to mathematically preserve activation scale by dividing the output by the boosting factor $\gamma^l$ scales down base features by $10\times$ to $100\times$, collapsing representations. Thus, SAWS succeeds not through scale preservation, but through *selective task-vector boosting*, acting as a scale-aware regularizer.
+- **Robustness and Limits of Test-Time Optimization (QA-ACS):** Evaluates how unconstrained prediction entropy minimization on $N=16$ calibration samples collapses under aggressive per-tensor noise. The optimizer confidently predicts a single class to drive entropy to zero, destroying accuracy. The authors evaluate *Supervised QA-ACS* and *L2 Regularized QA-ACS* as successful stabilizers.
+- **Double Quantization Noise (NF4 to INT format-shift):** Proves that transitioning from QLoRA's native NF4 format to deployment formats (INT4/INT8) introduces severe weight reconstruction errors (relative Frobenius error increases up to $29.4\%$), representing a major baseline confounding variable.
+- **Co-existence vs. Merging Scaling:** Evaluates the resource/latency tradeoffs of maintaining separate adapters vs. weight merging. It includes physical CPU latency profiling on a 128-core Intel Xeon CPU, showing that while toy backbones can fit in hardware cache and mask latency overheads, multi-billion parameter LLMs are DRAM-bandwidth bound, making co-existence scale linearly ($O(K)$) and rendering weight-space merging mandatory for latency-critical deployments.
+- **Individual Expert Auditing Control Experiment:** Decouples quantization-induced erasure from pre-existing weight-space task interference. Under per-channel grids, direct quantization of individual unmerged experts is virtually lossless, proving that the merged model's performance limitations are due entirely to weight-space task interference, not quantization. Under per-tensor grids, individual experts collapse catastrophically, highlighting the necessity of SAWS under coarse grids.

@@ -1,0 +1,118 @@
+\section{Methodology: PID-Merge}
+\label{sec:method}
+
+We propose \textbf{PID-Merge}, a closed-loop, discrete-time Proportional-Integral-Derivative (PID) controlled stateful routing framework for dynamic, single-pass model ensembling. In this section, we present the system architecture, mathematical formulation, and the physical control-theoretic intuition behind our design.
+
+\subsection{System Architecture and Problem Formulation}
+Let $f_\theta$ be a pre-trained frozen deep backbone of $L$ layers. We are given $K$ task expert adapters $\mathcal{E} = \{E_1, \dots, E_K\}$ (e.g., LoRA) targeting query and value projections. At test-time, the system receives sequential unlabeled queries $X_1, X_2, \dots$ sample-by-sample. 
+
+For query $X_t$ at step $t$, we propagate the input through early frozen layers up to anchoring layer $l_{\text{route}} = L_{\text{frozen}}$ to extract intermediate representation $z_t \in \mathbb{R}^D$. We measure cosine similarity between $z_t$ and pre-computed task centroids $\mu_k \in \mathbb{R}^D$ to compute projection coordinates $\mathbf{e}_t = [e_{1,t}, \dots, e_{K,t}]^T$, which are normalized into raw routing weights $w_k^{(l)}$ via Softmax. We handle test-time domain shift and OOD queries via dynamic centroid tracking and fallback routing (Appendices \ref{sec:appendix_robustness} and \ref{sec:appendix_ood_experiments}).
+
+In stateless ensembling, raw weights are applied directly across adapted layers $l \in [L_{\text{frozen}}+1, L]$. In stateful ensembling, we maintain running controller states across adapted layers to filter layer-to-layer noise. At adapted layer $l$, the expert adapter outputs are blended with base model activations using simplex-bounded coefficients $\alpha_k^{(l)}$:
+\begin{equation}
+h^{(l)} = h_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_k^{(l)} \left( h^{(l-1)} A_k^{(l)} B_k^{(l)} \frac{s_{\text{LoRA}}}{r} \right)
+\label{eq:blending}
+\end{equation}
+where $A_k^{(l)}$ and $B_k^{(l)}$ are down/up projections, $r$ is LoRA rank, and $s_{\text{LoRA}}$ is scaling.
+
+\subsection{Closed-Loop Tracking Error}
+Prior stateful methods operate in an open-loop fashion, accumulating historical routing weights without feeding back the current system state. This leads to severe tracking lag (inertial drag) under rapid task transitions. To resolve this, PID-Merge introduces a closed-loop system that continuously monitors the difference between our reference signal (the setpoint) and the current state of the system (the plant output).
+
+Specifically, at adapted layer $l$, the raw nearest-centroid similarity routing weight $w_k^{(l)}$ serves as our reference setpoint, while the active ensembling coefficient applied at the previous layer $\alpha_k^{(l-1)}$ is the controlled plant output. We define the tracking error for expert $k$ at layer $l$ as $e_k^{(l)} = w_k^{(l)} - \alpha_k^{(l-1)}$. At the boundary layer $L_{\text{frozen}}$, we initialize the system to a state of uniform ensembling and zero error: $\alpha_k^{(L_{\text{frozen}})} = 1/K$, $e_k^{(L_{\text{frozen}})} = 0$, and $e_k^{(L_{\text{frozen}}-1)} = 0$.
+
+\paragraph{Closed-Loop on Weights vs. Open-Loop on Neural Representations.}
+We must draw an important conceptual distinction: PID-Merge is closed-loop with respect to the controller's own ensembling weight trajectory, but is open-loop with respect to the underlying neural representation space. The tracking error $e_k^{(l)}$ is calculated using the static early-layer anchored routing setpoint $w_k$ and the previous layer's ensembling coefficient $\alpha_k^{(l-1)}$. There is no explicit feedback from intermediate neural representations at subsequent layers. While a true representation-level closed-loop system would re-evaluate routing similarity at every layer, doing so is computationally prohibitive ($O(L \cdot K)$ centroids) and risks representation corruption due to deep activation mixing. By operating closed-loop on the ensembling weights themselves, PID-Merge filters out representation noise while maintaining a static $O(1)$ computation overhead.
+
+\paragraph{Early-Layer Transition Blending and Representation Hierarchy.}
+Because PID-Merge is stateful and initialized uniformly at the anchor layer ($L_{\text{frozen}} = 3$), it takes $2$ to $3$ adapted layers to transition and converge to the target task-specific expert weight ($1.0$). During these transition layers (Layers 4, 5, 6), the model uses a blended mixture of expert activations. From an ML systems and representation-learning perspective, this transition blending is not a defect, but is actually highly aligned with the natural hierarchy of deep networks: early layers extract general, task-agnostic representations, whereas deeper layers model highly task-specific features. Thus, a gradual transition from uniform ensembling to task-specific ensembling across depth is a mathematically natural fit. Empirically, we prove in Section~\ref{sec:experiments} that this transition blending does not degrade semantic representations, as PID-Merge's heterogeneous stream accuracy ($94.82\%$) virtually matches the raw stateless SABLE ceiling ($94.93\%$) while slashing depth-wise jitter.
+
+\subsection{Incremental (Velocity) PID State Update}
+To recursively update the unnormalized routing state $s_k^{(l)} \in \mathbb{R}$ of expert $k$ across network depth, we employ the standard discrete-time velocity control update $s_k^{(l)} = s_k^{(l-1)} + \Delta s_k^{(l)}$, where the state increment is defined as:
+\begin{equation}
+\Delta s_k^{(l)} = K_p \Delta e_k^{(l)} + K_i e_k^{(l)} + K_d \Delta^2 e_k^{(l)}
+\label{eq:pid_increment}
+\end{equation}
+with $\Delta e_k^{(l)} = e_k^{(l)} - e_k^{(l-1)}$ and $\Delta^2 e_k^{(l)} = e_k^{(l)} - 2e_k^{(l-1)} + e_k^{(l-2)}$. Here, $K_p \ge 0$, $K_i \ge 0$, and $K_d \ge 0$ are the Proportional, Integral, and Derivative control gains, respectively.
+
+\paragraph{Simplification under Anchored Constant Setpoints.}
+Because the routing setpoint is constant across subsequent adapted layers ($w_k^{(l)} = w_k$), error differences simplify to $\Delta e_k^{(l)} = -\Delta \alpha_k^{(l-1)}$ and $\Delta^2 e_k^{(l)} = -\Delta^2 \alpha_k^{(l-1)}$ (see Appendix~\ref{sec:appendix_stability}). Substituting these into Equation~\ref{eq:pid_increment} yields the simplified velocity state increment:
+\begin{equation}
+\Delta s_k^{(l)} = -K_p \Delta \alpha_k^{(l-1)} + K_i e_k^{(l)} - K_d \Delta^2 \alpha_k^{(l-1)}
+\label{eq:simplified_update}
+\end{equation}
+This control-theoretic reduction reveals that the Proportional (P) and Derivative (D) gains act as negative feedback damping terms operating directly on the output ensembling weight trajectory $\alpha_k$, entirely decoupled from the reference setpoint itself. This elegant decoupling ensures smooth and stable trajectory updates across depth.
+
+\paragraph{Physical Control Intuition.}
+Each of the three control terms plays a distinct physical role in steering the trajectory: (1) the \textbf{Proportional (P) Term} reacts to the immediate tracking error to provide rapid corrective steering toward the target; (2) the \textbf{Integral (I) Term} accumulates depth-wise error, acting as a stateful low-pass filter that smooths out layer-to-layer representation oscillations; and (3) the \textbf{Derivative (D) Term} measures error acceleration. Crucially, because states are reset per query for security, the Derivative term detects the rapid error acceleration at the Layer 4 boundary transition, providing an anticipatory boost that overcomes depth-wise adaptation lag and drives ensembling weights to the target within 2--3 layers.
+
+\subsection{Simplex-Bounded Mapping, Logit Drift, and Anti-Windup}
+To map the unnormalized controller states $s_k^{(l)}$ onto the probability simplex, we employ a multi-temperature Gibbs Softmax policy to yield the final active ensembling weights:
+\begin{equation}
+\alpha_k^{(l)} = \frac{\exp\left(\bar{s}_k^{(l)}\right)}{\sum_{j=1}^K \exp\left(\bar{s}_j^{(l)}\right)}
+\label{eq:softmax}
+\end{equation}
+where $\tau_k = e^{w_k} + \tau_{\min}$ represents the task-specific routing temperature governed by log-temperature parameter $w_k \in \mathbb{R}$ and a minimum temperature threshold $\tau_{\min} = 0.01$ to prevent numerical division-by-zero. During calibrated optimization, these unconstrained log-temperatures $w_k$ are sufficient on their own to search the parameter space via backpropagation, eliminating the need for explicit cross-expert temperature normalization. Specifically, because the multi-temperature Softmax handles the relative scaling of each expert's contribution, updating the unconstrained parameters $w_k \in \mathbb{R}$ directly does not introduce scale-shifting or gradient explosion issues during backpropagation, as the positive-definite exponential parameterization $\tau_k = e^{w_k} + \tau_{\min}$ naturally self-bounds the active temperature range.
+
+However, we note that because these temperatures $\tau_k$ are expert-specific, the mapping in Equation~\ref{eq:softmax} is not strictly monotonic or rank-preserving with respect to the unnormalized controller states $s_k^{(l)}$ when temperatures differ across experts. For example, an expert with a lower unnormalized state but a significantly lower temperature can receive a higher ensembling weight than an expert with a larger state and a higher temperature. While this multi-temperature flexibility allows the optimizer to recalibrate individual expert confidence and scaling under noise, it introduces a potential risk of rank-reversal on out-of-distribution (OOD) queries. To mitigate this concern and guarantee rank-preserving monotonic consistency, a globally shared temperature alternative ($\tau_k = \tau$) can be used, or a soft variance penalty $\lambda \sum_{i,j} (\tau_i - \tau_j)^2$ can be appended to the optimization objective to constrain temperature divergence.
+
+Because the Softmax function with task-specific temperatures ($\tau_k \neq \tau_j$) is not strictly translation-invariant under direct logit subtraction, a standard centering on raw logits ($s_k^{(l)} - C$) would distort the ensembling probabilities. Furthermore, because the Integral (I) term in PID-Merge continuously accumulates tracking errors across depth, the unnormalized logit states $s_k^{(l)}$ are prone to monotonic growth and logit drift. In actual implementation, this can lead to absolute value overflow of floating-point numbers.
+
+To ensure absolute numerical stability while retaining perfect mathematical translation invariance under any set of task-specific temperatures, we propose a computationally free numerical normalization safeguard: \textbf{scaled logit mean-centering}. We first define the temperature-scaled logits as $\tilde{s}_k^{(l)} = s_k^{(l)} / \tau_k$. At each adapted layer $l$, before computing the Softmax, we center these scaled logits:
+\begin{equation}
+\bar{s}_k^{(l)} = \tilde{s}_k^{(l)} - \frac{1}{K} \sum_{j=1}^K \tilde{s}_j^{(l)}
+\label{eq:anti_windup}
+\end{equation}
+Since Softmax with a default temperature of $1.0$ is exactly translation-invariant, subtracting the mean of the scaled logits $C^{(l)} = \frac{1}{K}\sum_j \tilde{s}_j^{(l)}$ mathematically cancels out:
+\begin{equation}
+\alpha_k^{(l)} = \frac{\exp\left(\tilde{s}_k^{(l)} - C^{(l)}\right)}{\sum_j \exp\left(\tilde{s}_j^{(l)} - C^{(l)}\right)} = \frac{\exp\left(s_k^{(l)} / \tau_k\right)}{\sum_j \exp\left(s_j^{(l)} / \tau_j\right)}
+\end{equation}
+This mean-centering bounds the magnitudes of the exponents and prevents numerical floating-point overflow without any mathematical distortion of the probabilities.\footnote{We note that this formulation achieves perfect translation invariance under any set of expert-specific temperatures. During backpropagation, the unconstrained parameters $w_k$ are optimized directly in $\mathbb{R}$ without any scale-shifting issues (see Appendix~\ref{sec:appendix_sensitivity} for details).} Specifically, because the mean subtraction is a linear operator (with constant Jacobian $\mathbf{I} - \frac{1}{K}\mathbf{1}\mathbf{1}^T$), the gradients of the unconstrained gain parameters propagate cleanly without introducing vanishing or exploding gradients. This preserves the structural integrity of the loss landscape, ensuring smooth and stable parameter updates during backpropagation. However, from a control-theoretic perspective, absolute numerical bounding is distinct from true integrator windup. Integrator windup occurs when the active ensembling weight $\alpha_k$ saturates near the simplex boundaries (i.e., $\alpha_k \approx 1.0$), while the controller continues to integrate positive tracking errors across depth. In deep topologies, this causes the unnormalized logit state of the dominant expert to grow unchecked, leading to severe transition lag during sudden subsequent task switches. To resolve this and ensure scalability to arbitrarily deep architectures, we propose a generalized, dynamic control-theoretic anti-windup clamping mechanism: \textbf{conditional integration (clamping)}. Instead of using heuristic hardcoded boundaries (which fail to trigger under crowded expert spaces of large $K$ where no single expert dominates), we formulate dynamic, $K$-scaled clamping thresholds:
+\begin{equation}
+\theta_{\text{high}} = 1 - \epsilon, \quad \theta_{\text{low}} = \frac{\epsilon}{K}
+\label{eq:clamping_thresholds}
+\end{equation}
+where $\epsilon \in (0, 0.5)$ represents a narrow boundary buffer (set to $0.08$ in our implementation). The integral state accumulation for expert $k$ is dynamically frozen if its active ensembling weight violates these boundaries in the direction of integration, i.e., when $\alpha_k^{(l-1)} \ge \theta_{\text{high}}$ with $e_k^{(l)} > 0$, or $\alpha_k^{(l-1)} \le \theta_{\text{low}}$ with $e_k^{(l)} < 0$:
+\begin{equation}
+\Delta s_k^{(l)} = \begin{cases} \Delta s_{k,\text{PD}}^{(l)}, & \text{if } \left(\alpha_k^{(l-1)} \ge \theta_{\text{high}} \;\land\; e_k^{(l)} > 0\right) \\
+& \lor\; \left(\alpha_k^{(l-1)} \le \theta_{\text{low}} \;\land\; e_k^{(l)} < 0\right) \\
+\Delta s_{k,\text{PID}}^{(l)}, & \text{otherwise} \end{cases}
+\label{eq:clamping}
+\end{equation}
+where $\Delta s_{k,\text{PID}}^{(l)}$ is the standard update (Equation~\ref{eq:pid_increment}) and:
+\[
+\Delta s_{k,\text{PD}}^{(l)} = K_p \Delta e_k^{(l)} + K_d \Delta^2 e_k^{(l)}
+\]
+is the PD update with the Integral term frozen (clamped), where the differences $\Delta e_k^{(l)}$ and $\Delta^2 e_k^{(l)}$ simplify under constant anchored setpoints as before. This conditional clamping prevents relative logit inflation and completely eliminates saturation-induced transition lag, as detailed in Appendix~\ref{sec:appendix_scaling}.
+
+To guarantee that the PID gains are mathematically valid (non-negative) and stable, we parameterize them using a Softplus transformation: $K_p = \ln(1 + e^{u_p})$, $K_i = \ln(1 + e^{u_i})$, and $K_d = \ln(1 + e^{u_d})$, where $u_p, u_i, u_d \in \mathbb{R}$ are unconstrained log-parameters.
+
+To ensure that the learned gains remain within the bounds of BIBO stability, we derive tight analytical stability bounds for the closed-loop ensembling system using Jury's criterion in Appendix~\ref{sec:appendix_stability}. This analysis establishes the stability condition $K_s(2K_p + K_i + 4K_d) < 2$, with plant gain $K_s \le \frac{1}{4\tau_k}$. In practice, during calibrated backpropagation, we explicitly penalize violations of these bounds in our optimization objective:
+\begin{equation}
+\mathcal{L}_{\text{stab}} = \max(0, K_d \!-\! 4\tau_k) \!+\! \max(0, 2K_p \!+\! K_i \!+\! 4K_d \!-\! 8\tau_k)
+\label{eq:stability_penalty}
+\end{equation}
+This penalty prevents the optimizer from converging to unstable, underdamped regions under noisy calibration data, guaranteeing stable and smooth trajectories on unseen streams.
+
+\subsection{Practical Deployment Modes}
+To support seamless integration, PID-Merge is designed for trivial real-world deployment and operates under two distinct modes depending on calibration data availability:
+
+\paragraph{Training-Free (Zero-Shot) Mode.} When training data or compute is unavailable, the control gains are statically fixed to robust, heuristic default values: $K_p = 0.5$, $K_i = 0.15$, and $K_d = 0.2$. This zero-shot configuration is ready to deploy immediately and achieves superior responsiveness.
+
+\paragraph{Calibrated (Optimized) Mode.} When a tiny sequence (e.g., $T = 32$ samples) is available, the unconstrained parameters $u_p, u_i, u_d$ and task log-temperatures $w_k$ can be optimized via standard backpropagation to minimize task classification loss on the calibration split. Because the gains are globally shared across tasks, the parameter space is extremely small ($3 + K$ parameters), preventing overfitting and ensuring perfect out-of-sample generalization. See Appendix~\ref{sec:appendix_sensitivity} for an exhaustive grid-search sensitivity analysis of these parameters and Appendix~\ref{sec:appendix_dynamic_gains} for a proposed workload-adaptive self-tuning variant under non-stationary query streams.
+
+\subsection{Computational and Architectural Complexity}
+Unlike SOTA stateful ensembling methods such as ChemMerge, which require continuous-time integrations of chemical reaction kinetics ODEs at test-time, PID-Merge is exceptionally simple. The state update (Equation \ref{eq:pid_increment}) requires only $15$ floating-point operations (FLOPs) per expert per layer. It executes in $O(1)$ parallel serving time, introduces absolutely zero latency overhead, and maintains a negligible SRAM footprint (storing only two previous error steps: $e_k^{(l-1)}$ and $e_k^{(l-2)}$), satisfying the strictest edge device constraints. For a detailed theoretical complexity and hardware latency scalability analysis up to $K=64$ experts, see Appendix~\ref{sec:appendix_scalability}.
+
+\subsection{System-Level Deployment and Multi-Tenant LLM Blueprint}
+\label{subsec:blueprint}
+
+To demonstrate the real-world practicality of PID-Merge, we address critical production-level concerns: (1) state management under multi-tenant security/privacy constraints, and (2) integration with SOTA high-throughput serving platforms (e.g., Punica \cite{chen2023punica} or S-LoRA \cite{s-lora}).
+
+\paragraph{1. Security and Privacy Mandates.}
+In multi-tenant cloud-serving systems, resetting the unnormalized controller state variables $s_k^{(l)}$ and error history variables to zero at the start of each query is a \textbf{mandatory security and privacy requirement}. Prior stateful methods (e.g., ChemMerge \cite{chemmerge} and PAC-Kinetics \cite{pac_kinetics}) carry states temporally from query to query, creating severe vulnerabilities to \emph{cross-user representation corruption} and \emph{side-channel privacy leakage}. By resetting states per query, PID-Merge acts as a sample-wise layer-stateful controller, enforcing strict user isolation and zero cross-user data contamination.
+
+\paragraph{2. High-Throughput Systems Integration.}
+Integrating PID-Merge into SOTA serving engines is exceptionally straightforward:
+(1) \textbf{Prefill-Locked Routing \& KV Cache Coherence:} In LLM serving, ensembling weights $\alpha_k^{(l)}$ are computed and locked during the prefill phase, then applied statically during the decode phase. This slashes decoding routing overhead to absolutely zero and guarantees perfect \emph{KV Cache coherence} across generation steps (see Appendix~\ref{sec:appendix_autoregressive} for a detailed mathematical analysis).
+(2) \textbf{Continuous Batching Registries:} State variables are stored in a lightweight request-level state registry, indexed by active request IDs, making PID-Merge fully compatible with continuous batching (see Appendix~\ref{sec:appendix_blueprint}).
+(3) \textbf{Fused CUDA/Triton Kernels:} Because the discrete velocity PID state updates and logit mean-centering are element-wise $O(1)$ operations, they can be fused directly into specialized Triton attention kernels, bypassing GPU memory write-back bottlenecks (see Appendix~\ref{sec:appendix_triton}).

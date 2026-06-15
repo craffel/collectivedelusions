@@ -1,0 +1,101 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the mathematical formulation and architectural details of the two Zero-Shot Calibration-Free Model Merging paradigms evaluated in our study: (1) \textbf{Zero-Shot Expert Entropy Routing (EER)} and (2) \textbf{Entropy-Pseudo-Labeled Online Centroid Adaptation (EPL-OCA)}. Both methods operate entirely in the forward activation space of a frozen backbone base model $f_\theta$ containing $L$ sequential blocks, serving a registry of $K$ pre-trained task-specific expert adapters $\{E_k\}_{k=1}^K$ without requiring offline labeled calibration datasets.
+
+\subsection{Paradigm 1: Zero-Shot Expert Entropy Routing (EER)}
+EER represents an \emph{Accuracy-First} direct-routing paradigm. Instead of routing samples based on spatial representations, EER utilizes the pre-trained expert models themselves as zero-shot confidence-guided classifiers.
+
+For an incoming streaming sample $x_b$, we first run the shared, adapter-free early-stage blocks of the frozen backbone $f_\theta$ to extract its intermediate representation $h_b = f_{\theta, \text{block3}}(x_b) \in \mathbb{R}^D$. To measure expert confidence, we pass $h_b$ through the mid-to-late blocks (Layers 4 to $L$) and classification head of each specialized expert $E_k$ in parallel:
+\begin{equation}
+p_k(x_b) = \text{Softmax}\left( E_k.\text{head}(E_{k, 4 \dots L}(h_b)) \right) \in \Delta^{Y_k - 1}
+\label{eq:eer_expert_prob}
+\end{equation}
+where $Y_k$ is the class vocabulary size of expert $k$, and $\Delta^{Y_k - 1}$ is the probability simplex.
+
+We evaluate the prediction confidence of each expert on input $x_b$ using the Shannon entropy:
+\begin{equation}
+H(p_k(x_b)) = - \sum_{y=1}^{Y_k} p_{k, y}(x_b) \log p_{k, y}(x_b)
+\label{eq:eer_sample_entropy}
+\end{equation}
+
+Since a specialized expert outputs highly confident (low-entropy) predictions on its native domain but highly uncertain (high-entropy) predictions on foreign domains, we route the sample directly to the expert with the minimum prediction entropy:
+\begin{equation}
+k^* = \arg\min_{k \in \{1, \dots, K\}} H(p_k(x_b))
+\label{eq:eer_routing}
+\end{equation}
+
+While our simulation sandbox features equal class vocabularies across tasks ($Y_k = 10 \, \forall k$), in real-world heterogeneous settings where experts possess varying vocabulary sizes, the raw Shannon entropy in Eq.~\ref{eq:eer_sample_entropy} is mathematically biased toward experts with smaller vocabularies (since maximum possible entropy scales as $\log(Y_k)$). To achieve complete scale-invariance and scale EER to heterogeneous registries, we propose utilizing the \emph{Normalized Shannon Entropy}:
+\begin{equation}
+\bar{H}(p_k(x_b)) = \frac{H(p_k(x_b))}{\log(Y_k)} \in [0, 1]
+\label{eq:normalized_entropy}
+\end{equation}
+Using this normalized metric in Eq.~\ref{eq:eer_routing} guarantees unbiased, mathematically consistent, and vocabulary-agnostic zero-shot task routing under heterogeneous settings.
+
+The final served prediction is made by executing the active expert $k^*$:
+\begin{equation}
+\text{Logits}(x_b) = E_{k^*}.\text{head}(E_{k^*, \text{layers } 4 \dots L}(h_b))
+\label{eq:eer_prediction}
+\end{equation}
+EER completely bypasses representation-space centroids and ensembling, relying entirely on the specialized discriminative knowledge of the experts.
+
+\subsection{Paradigm 2: Centroid-Based Ensembling via EPL-OCA}
+EPL-OCA represents an \emph{Efficiency-First} centroid-routing paradigm. It maintains running task centroids $\{\mu_k\}_{k=1}^K \subset \mathbb{R}^D$ on-the-fly to enable single-pass ensembling.
+
+To prevent chronological data leakage (where the current sample's representation leaks into its own routing similarity), we strictly enforce that centroid updates occur \textbf{after} the routing and prediction steps are completed for sample $x_b$:
+\begin{enumerate}
+    \item \textbf{Similarity-Based Routing (Step $b \ge T_{\text{warmup}}$):} We calculate the cosine similarity between the intermediate representation $h_b$ and the centroids from the previous step $\{\mu_{k, b-1}\}_{k=1}^K$:
+    \begin{equation}
+    u_{k, b} = \text{cos\_sim}(h_b, \mu_{k, b-1}) = \frac{\langle h_b, \mu_{k, b-1} \rangle}{\|h_b\|_2 \|\mu_{k, b-1}\|_2 + \epsilon}
+    \label{eq:epl_cos_sim}
+    \end{equation}
+    Using a sharp temperature $\tau = 0.001$, we compute ensembling coefficients $\alpha_{k, b}$:
+    \begin{equation}
+    \alpha_{k, b} = \frac{\exp(u_{k, b} / \tau)}{\sum_{j=1}^K \exp(u_{j, b} / \tau)}
+    \label{eq:epl_soft_routing}
+    \end{equation}
+    \item \textbf{Single-Pass Activation Blending (SPS):} We execute layers 4 to $L$ using Single-Pass Activation-Space Dynamic Blending (SPS) \cite{sps_zca}:
+    \begin{equation}
+    z_i = z_{i-1} + \sum_{k=1}^K \alpha_{k, b} \cdot \Delta W_k^{(i)}(z_{i-1})
+    \label{eq:epl_sps}
+    \end{equation}
+    And obtain final served logits using the blended classification head:
+    \begin{equation}
+    \text{Logits}(x_b) = \sum_{k=1}^K \alpha_{k, b} \left( W_{\text{head}_k} z_L + b_{\text{head}_k} \right)
+    \label{eq:blended_head}
+    \end{equation}
+    \item \textbf{On-the-fly Centroid Update:} Once the prediction is made, we update the task centroids for subsequent serving steps. We compute the pseudo-label $k^*(x_b)$ using EER (Eq.~\ref{eq:eer_routing}) and update centroid $\mu_{k^*}$ using $h_b$ via a running average:
+    \begin{equation}
+    \mu_{k^*, b} \leftarrow 
+    \begin{cases} 
+    h_b, & N_{k^*} = 0 \\
+    (1 - \beta)\mu_{k^*, b-1} + \beta h_b, & N_{k^*} > 0
+    \end{cases}
+    \label{eq:epl_centroid_update}
+    \end{equation}
+    Followed by unit normalization $\mu_{k^*, b} \leftarrow \text{Normalize}(\mu_{k^*, b})$.
+\end{enumerate}
+Note that in EPL-OCA, the assignment of discovered centroids to experts is \emph{implicitly and continuously maintained at every step} via zero-shot entropy-based pseudo-labeling. This completely bypasses the need for a costly, one-time offline bipartite matching (such as the Hungarian algorithm) at $T_{\text{warmup}}$. Because of this continuous tracking, EPL-OCA remains inherently aligned with the correct experts even under continuous representation drift, avoiding the cluster-to-expert assignment collapse that can afflict static offline clustering schemes. If a practitioner were to deploy a fully unsupervised offline streaming clustering baseline (e.g., streaming K-Means), implementing a \emph{periodic re-alignment policy} (such as re-evaluating Hungarian matching every 500 steps) would be mathematically necessary to preserve expert-to-centroid mappings under non-linear covariate shifts. Indeed, in Section~4.2, we evaluate a Streaming K-Means baseline where we solve the bipartite matching at $T_{\text{warmup}} = 200$. As we show, without continuous entropy-based pseudo-labeling, the unsupervised centroids completely collapse due to the Representational Sparsity Paradox, and the initial expert alignment becomes highly degraded. This underscores the critical importance of EPL-OCA's continuous implicit alignment, which keeps the centroids securely anchored to their respective experts throughout the lifetime of the stream.
+
+\subsection{Serving Complexity and Activation Divergence Analysis}
+A critical systems-level analysis is required to understand the serving latency of these zero-shot pipelines. In our sequential vision transformer, LoRA adapters are inserted starting at Layer 4 (out of 12 layers). Specifically, LoRA adapters are applied to each and every layer from Layer 4 through Layer 12, whereas early layers (Layers 1 to 3) are completely shared and adapter-free. Once activations pass through the LoRA adapters in Layer 4 of expert $k$, the output activations $z_k^{(4)}$ diverge immediately:
+\begin{equation}
+z_k^{(4)} = z_L^{(3)} + \Delta W_k^{(4)}(z_L^{(3)})
+\label{eq:activation_divergence}
+\end{equation}
+
+When feeding these divergent activations into Layer 5, the heavy, shared backbone base weights $W_{\text{base}}^{(5)}$ must be multiplied by $z_k^{(4)}$. Since $z_k^{(4)}$ is unique to each expert, \textbf{this heavy backbone compute can no longer be shared across experts}. To compute the prediction entropy for all $K$ experts, Layers 4 to 12 ($75\%$ of the network compute) must be executed independently $K$ times. 
+
+Thus, the total FLOP cost of executing the entropy pseudo-labeler is:
+\begin{equation}
+Cost_{\text{entropy}} = 0.25 + 0.75 K \text{ passes of the base model}
+\label{eq:cost_entropy}
+\end{equation}
+For $K=4$, this translates to **$3.25\times$ forward passes**. EER evaluates this confidence signal on every sample, which yields outstanding, drift-robust accuracy (+4.44\% over supervised ZCA) but introduces a $3.25\times$ latency penalty. 
+
+To resolve this systems overhead, we introduce \textbf{Amortized Pseudo-Labeling}. Because streaming tasks exhibit temporal locality, we only execute the entropy-guided pseudo-labeler and update centroids once every $N_{\text{amortize}} = 10$ steps. For the intermediate steps, we perform pure $1.0\times$ single-pass SPS routing based on the cached centroids. This brings the amortized serving cost down to:
+\begin{equation}
+Cost_{\text{amortized}} = 1.0 + \frac{0.25 + 0.75 K}{N_{\text{amortize}}} \approx 1.3\times \text{ passes}
+\label{eq:amortized_complexity}
+\end{equation}
+which is highly practical for resource-constrained edge hardware.

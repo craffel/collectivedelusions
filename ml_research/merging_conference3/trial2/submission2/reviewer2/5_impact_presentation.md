@@ -1,0 +1,24 @@
+# 5. Presentation, Strengths, and Impact Evaluation
+
+This section synthesizes the presentation quality, major strengths, core areas for improvement, and potential impact of the submission.
+
+## Overall Presentation Quality
+The overall presentation quality of the paper is **good**. The narrative is logical, and the writing is clear, structured, and easy to follow. The mathematical formulation is clean and precise. Figures and tables are well-placed and clearly communicate the experimental configurations and outcomes. The authors' discussion of scope and limitations in Section 4.7 is also a positive aspect, demonstrating a self-aware approach.
+
+## Major Strengths
+1. **Mathematical Rigor of the Scale-Invariance Proofs:** Section 3.4 is a highly valuable theoretical contribution. The mathematical proofs demonstrating how L2-normalization, LayerNorm, and RMSNorm layers neutralize positive global weight scaling factors are elegant and sound. This provides a deep, foundational explanation for why global scale-preservation algorithms are redundant in modern deep neural networks.
+2. **Exhaustive Hyperparameter Sweeps:** The authors perform thorough sweeps over both the scaling coefficient $\lambda$ and spectral ranks $k$, presenting clear comparative trends against the standard Task Arithmetic baseline.
+3. **Information-Theoretic Rank Allocation (Entropy-SVS):** Utilizing Shannon spectral entropy of singular values to adaptively scale slicing ranks is an intellectually stimulating concept that aligns well with the structural hierarchy of deep backbones.
+4. **Honest Discussion of the Representation Gap:** The authors do not hide the fact that SVS is outperformed by coordinate pruning baselines. Their analysis of the "representation gap" (dense spectral projections vs. sparse coordinate masking) provides useful conceptual insights.
+
+## Core Areas for Improvement (Constructive Critique)
+1. **The "Known Task Identity" Routability Assumption:** The evaluation protocol must be revised. Routing activations to separate downstream classification heads using known task IDs at test-time makes the entire model merging exercise redundant (since one could simply run the corresponding specialized expert and get **88.93%** instead of SVS's **74.83%**). To show the true value of SVS, the authors should evaluate it in a **unified, task-agnostic zero-shot setting** (e.g., using CLIP's joint text-image embedding space to perform cross-task classification without separate routed heads).
+2. **Evaluation Scope (Move beyond CLIP-ViT-B/32):** To be of significant interest to the conference community, the method should be validated on modern autoregressive Large Language Models (LLMs) like LLaMA or Mistral. LLMs are the primary playground for model merging research, and evaluating only on a small 86M parameter vision model limits the work's impact.
+3. **Deconstruct the "Entropy-SVS" Overhead:** The authors should acknowledge that Entropy-SVS performs virtually identically to a simple uniform rank of the same average size. Calculating Shannon entropy across every layer introduces unnecessary computational overhead without any actual accuracy gains.
+4. **Address the Non-Monotonicity of Rank Performance:** The drop in accuracy from rank $k=128$ to $k=256$ is counter-intuitive and contradicts the noise-filtering hypothesis. The authors must explain this phenomenon or provide a deeper ablation of rank-scaling dynamics.
+5. **Transparency in BWN Results:** In Section 4.5, the text claims that BWN "consistently stabilizes activation scales and enhances multi-task merging accuracy." However, the authors' own data shows that BWN provides **zero improvement** in 3 out of 6 scaling regimes, and **actively degrades accuracy** in 2 out of 6 scaling regimes (e.g., at $\lambda=0.7$ and $\lambda=0.9$). The authors must revise their claims to be honest about these mixed results.
+6. **Explicit Distinction from TSV-Compress:** Since SVS is algorithmically identical to TSV-Compress (Gargiulo et al., 2025), the paper must tone down its claims of SVS being a novel, standalone merging operator, and instead position itself as an analysis and extension of post-hoc SVD-based task vector compression.
+
+## Potential Impact and Significance
+- **Practical Impact:** **Low.** SVS is significantly outperformed by existing coordinate pruning methods (TIES-Merging by **3.15%**, and DARE by **0.35%**) which are equally training-free and data-free. Furthermore, SVD computation is too expensive for very large models. Thus, practitioners are highly unlikely to adopt SVS or Entropy-SVS in practice.
+- **Theoretical Impact:** **Moderate.** The scale-invariance proofs are valuable and will likely influence future theoretical work on model merging and weight-space analysis. It helps the community avoid wasting effort on designing redundant weight-scaling schemes in normalized architectures.

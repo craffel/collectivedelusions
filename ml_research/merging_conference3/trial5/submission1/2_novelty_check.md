@@ -1,0 +1,17 @@
+# 2. Novelty Check
+
+## Originality and Concept Novelty
+The paper presents a highly original approach to online test-time adaptation of model-merging coefficients.
+- **Concept Originality:** While parameter-space model merging is an active research area (e.g., Task Arithmetic, TIES-Merging, DARE), most methods rely on static uniform scaling or rigid global projection subspaces (such as PolyMerge). AdaMerging was the first to adapt merging coefficients online using test-time entropy minimization but did not address the vulnerability of this optimization to transductive noise or spatial oscillations. RCR-Merge is the first framework to identify the **Overfitting-Optimizer Paradox** and resolve it by constraining the spatial trajectory of coefficients using the pre-trained base model's second-order geometry.
+- **Riemannian FIM Trace Weighting:** Using the diagonal FIM trace of a pre-trained base model as a spatial coordinate weighting factor for online test-time optimization of layer-wise coefficients is highly novel. Prior works like Fisher Merging (Matena & Raffel, 2021) use FIM diagonal weights for static offline parameter averaging. RCR-Merge uniquely repurposes the FIM trace as a localized Riemannian metric to build **analytical coordinate barriers** across network depth. It dynamically scales Total Variation penalties between adjacent layers by their base curvatures ($\sqrt{c_l c_{l-1}}$), protecting sensitive bottleneck layers while preserving adaptation capacity in flat regions.
+- **Unsupervised Self-Scaling (GNB):** Developing Gradient Norm Balancing (GNB) is a highly creative contribution. The use of the highest-frequency eigenvector of the 1D graph Laplacian (the alternating pattern $(-1)^l$) as a worst-case spectral perturbation to evaluate the regularizer's maximum sensitivity gradient is mathematically elegant and conceptually fresh, providing a robust, scale-invariant way to initialize regularization weights without validation labels.
+
+## Relation to Prior Work
+The paper positions itself very clearly and accurately relative to prior literature:
+- **Parameter-Space Merging:** It correctly distinguishes its local, conformal soft barrier approach from static methods (Task Arithmetic, TIES, DARE) and rigid global low-dimensional projections (PolyMerge).
+- **Test-Time Adaptation (TTA):** It leverages Shannon entropy minimization (similar to Tent, Wang et al., 2020) but targets the unique, previously unaddressed challenges of adaptive model merging, where low-dimensional coefficient optimization directly scales massive parameter updates.
+- **Loss Landscape Geometry:** It builds on the classic understanding of flatter minima and the Fisher Information Matrix as a Riemannian metric but shifts the application from offline training/merging to online, adaptive test-time regularization.
+- **Spectral Filtering:** Linking spatial TV regularization to spectral graph theory (Laplacian smoothing/low-pass filtering of transductive noise) provides a deep theoretical grounding that connects neural network optimization with graph signal processing.
+
+## Conclusion on Novelty
+The paper's novelty is **excellent**. It is not a marginal or incremental extension of existing methods. It introduces a brand new paradigm—grounding test-time model merging trajectories in the pre-trained base model's second-order geometry—and supports it with rigorous, non-trivial mathematical formulations and theoretical proofs.

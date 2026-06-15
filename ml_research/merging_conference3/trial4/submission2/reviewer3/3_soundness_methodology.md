@@ -1,0 +1,22 @@
+# 3. Soundness and Methodology
+
+## Clarity of the Description
+- **Mathematical Over-Specification (Obfuscation):** While the paper is well-structured, it suffers from significant mathematical over-specification. Section 4.3 presents a verbose sequence of standard textbook equations for asymmetric, symmetric, and double quantization (Equations 5 through 18). This extensive mathematical formalism is largely unnecessary and acts as obfuscation. The core idea is simple: adding Gaussian noise to the scale and zero-point factors of a standard quantization operator during test-time adaptation. Devoting over half of the methodology section to repeating well-known quantization formulas is non-elegant and pads the paper with redundant complexity.
+- **Detachment Explanation:** The explanation regarding why scale and zero-point factor parameters are detached from the autograd graph during backpropagation is useful but highlights the implementation complexity. This manual gradient detachment is a classic example of an ad-hoc fix required to make first-order STE-guided optimization work in a non-differentiable environment.
+
+## Appropriateness of Methods
+- **Over-Parameterized Consensus Regularization (TCR):** Equation (20) defines the Task-Consensus Regularization (TCR) penalty using two separate hyperparameter-dependent terms:
+  $$\mathcal{R}_{\text{con}}(\Lambda) = \frac{1}{K L} \sum\nolimits_{k, l} \left[ \beta (\lambda^l_k - \lambda_{\text{init}})^2 + \gamma (\lambda^l_k - \bar{\lambda}^l)^2 \right]$$
+  This formulation is unnecessarily complex and over-parameterized. It introduces two separate hyperparameters ($\beta = 0.1$ and $\gamma = 0.5$) that must be tuned. A much simpler, more elegant regularization would penalize only one distance metric (e.g., deviation from initial uniform coefficients or deviation from the group mean) using a single hyperparameter. The authors provide no ablation or justification for why both terms are simultaneously required, which suggests an ad-hoc design optimized to squeeze out minor performance gains on their specific testbed.
+- **Short Optimization Window (15 Steps):** Optimizing layer-wise coefficients in only 15 steps of test-time adaptation is extremely aggressive. While the authors claim this aligns with strict on-device compute budgets, it introduces high sensitivity to the optimization trajectory, initialization, and learning rate.
+
+## Potential Technical Flaws & Unfair Comparisons
+- **Asymmetric Hyperparameter Tuning:** A major potential flaw in the experimental validation is the asymmetric learning rate tuning. The authors state:
+  - "For standard AdaMerging and Q-Merge, we find that a learning rate of $\eta = 10^{-2}$ is optimal; setting $\eta = 2 \times 10^{-2}$ causes their sharp local rounding landscapes to oscillate, degrading final performance."
+  - "For OmniMerge, however, the boundary-smoothing effect of Scale and Zero-Point Noise Perturbation (SZNP) flattens the local loss landscape, permitting a slightly larger learning rate of $\eta = 2 \times 10^{-2}$ without destabilization..."
+  
+  This is a highly problematic comparison. If OmniMerge is evaluated using a learning rate that is **twice as large** as the baselines under a highly restricted budget of only 15 steps, its performance advantage may be largely an artifact of faster convergence due to the larger learning rate rather than the intrinsic superiority of the "co-optimization" framework. Under a fair, rigorous evaluation, all methods should be compared under the same learning rate or evaluated at full convergence (e.g., 50 or 100 steps) to decouple the effect of optimization speed from the final solution quality. The paper fails to provide this crucial control experiment.
+
+## Reproducibility
+- **Stochasticity and Sensitivity:** Since OmniMerge relies on two layers of stochasticity (stochastically sampling operators at each step and injecting Gaussian noise into scales and zero-points), the optimization path is highly stochastic. Combined with a very short 15-step adaptation window, the final learned coefficients are likely to exhibit high sensitivity to the random seed. The authors do not report standard deviations or run multiple seeds for their experiments, which is a major omission for a highly stochastic test-time adaptation framework.
+- **Code Availability:** The paper does not mention whether the implementation code or the pre-trained task experts will be open-sourced, which further limits reproducibility.

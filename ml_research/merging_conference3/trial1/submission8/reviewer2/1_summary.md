@@ -1,0 +1,30 @@
+# 1. Summary of the Paper
+
+## Main Topic and Approach
+The paper presents a rigorous theoretical and empirical investigation into the **limits of representational isotropy on curved manifolds** in the context of **model merging**. Model merging seeks to combine multiple task-specific expert models into a single unified network training-free. The dominant paradigms (e.g., Task Arithmetic, TIES-Merging, DARE, SAIM) operate in flat Euclidean spaces, ignoring non-linear network geometry and risking representation drift. In contrast, geometric parameterizations like Orthogonal Fine-Tuning (OFT) and OrthoMerge constrain weight updates to the orthogonal group $\mathrm{O}(d)$ and interpolate within the associated Lie algebra tangent space $\mathfrak{so}(d)$ via Cayley transforms to stabilize features.
+
+This work diagnoses the feasibility of translating Euclidean-based representational isotropy techniques (specifically, SVD-based spectral balancing like SAIM) to geometric manifolds. The authors introduce **RIMO** (Riemannian Isometry-respecting Manifold Operations) as a testbed that performs SVD directly on the skew-symmetric generators of $\mathfrak{so}(d)$ to balance rotation magnitudes. They uncover major mathematical and empirical boundaries in this process, leading to the identification of two critical phenomena:
+1. **The Orthogonality Condition:** Manifold-level merging (e.g., OrthoMerge) is highly sensitive to parameter non-orthogonality. 
+2. **The Tangent Space Spectral Pitfall:** Artificially inflating smaller singular values of tangent-space generators to force isotropy injects destructive rotational noise.
+
+## Key Findings and Evidence
+* **Sensitivity of Manifold Merging to Non-Orthogonality:** In standard networks (non-OFT), solving the Orthogonal Procrustes problem yields a high-norm linear residual $\rho$, acting as an unconstrained Euclidean displacement that causes severe representation drift and collapses OrthoMerge performance (average accuracy $42.07\%$). Introducing a soft orthogonal constraint ($\lambda_{ortho} = 2.0$) keeps weights near the orthogonal manifold, reducing residuals and boosting merged performance to $84.55\%$.
+* **Failure of Naive Post-Hoc SVD Projection:** Bypassing orthogonal pre-training by projecting a standard unconstrained base model onto $\mathrm{O}(d)$ via SVD collapses the base model's accuracy (from $88.62\%$ to $67.24\%$) and causes downstream merged expert accuracy to collapse to $15.00\%$. This demonstrates that native manifold-respecting training is essential.
+* **The Tangent Space Spectral Pitfall:** SVD-based spectral balancing in the Lie algebra (RIMO with $t > 1.0$) catastrophically collapses model accuracy to $13.66\%$ on MLPs and $18.44\%$ on Vision Transformers (ViTs).
+* **Mathematical Proof of the Pitfall:** The authors formalize this failure through:
+  * **Kernel Distortion Theorem:** Proves that standard numerical SVD solvers introduce non-symmetric coordinate gauges in the multi-dimensional null space, leading to the injection of non-zero skew-symmetric noise during the skew-symmetric projection step.
+  * **Spectrum Distortion Theorem:** Proves that if SVD modifications are non-uniform (as in isotropic smoothing), the skew-symmetry relation $R \hat{\Sigma} = -\hat{\Sigma} R^T$ is violated. The subsequent projection step required to restore skew-symmetry inevitably distorts the spectrum, pulling singular values away from their target.
+  * Under the non-linear forward Cayley map, inflating smaller singular values in tangent-space translates into massive, spurious high-dimensional rotations across inactive planes, scrambling representation features.
+* **Mitigations:** 
+  1. **RIMO-Pruned:** A rank-preserving spectral pruning scheme that zeros out small singular values, satisfying the Kernel Distortion Theorem trivially, and recovering robust merged performance ($91.49\%$ on MLP and $88.16\%$ on ViTs) without test-time calibration.
+  2. **Real Schur Decomposition:** A projection-free, symmetry-preserving spectral decomposition which eliminates post-hoc projection and kernel/spectral distortion.
+  3. **Complex Hermitian Solver:** A GPU-compatible, parallelizable complex eigen-decomposition solver that achieves identical accuracy to SVD but executes in just **7.66 ms** (an $8.1\times$ speedup over SVD).
+* **Evaluation of AdaMerging under Disjoint Setups:** SOTA unsupervised test-time adaptive merging (AdaMerging) overfits to active domain tasks in disjoint multi-task setups, causing a total collapse on inactive tasks ($0.00\%$ accuracy). In contrast, RIMO-Pruned requires no calibration and natively preserves both task domains.
+* **Hard Orthogonal Constraints Pilot:** Enforcing exact orthogonality via double-precision SVD projections after every SGD step (on the Stiefel manifold) boosts OrthoMerge to $72.08\%$.
+
+## Explicitly Claimed Contributions
+1. A rigorous study of the limits of representational isotropy on curved manifolds, exposing the **spectral balancing pitfall in Lie algebras** and deriving how small singular value inflation maps to high-dimensional rotational noise under the Cayley transform.
+2. Derivation of the **Spectrum Distortion Theorem** demonstrating the mathematical inconsistency of SVD-based spectral modifications under projection, and empirical evaluation of real Schur decomposition as a projection-free alternative.
+3. Proving that manifold merging requires native training, showing that naive post-hoc SVD projection is destructive, and running a pilot of hard-constrained orthogonal optimization (projected Riemannian SGD on the Stiefel manifold) that significantly boosts OrthoMerge.
+4. Implementing and evaluating a parallel, GPU-compatible **Complex Hermitian Solver** using `torch.linalg.eigh` that achieves a $12.2\times$ speedup over Schur and $8.1\times$ speedup over SVD, addressing the scalability bottleneck.
+5. Evaluating SOTA test-time adaptive merging (AdaMerging) under disjoint setups, exposing its catastrophic domain-specific overfitting, and demonstrating that **RIMO-Pruned** recovers robust merged performance without calibration.

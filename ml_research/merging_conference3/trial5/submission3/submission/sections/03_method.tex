@@ -1,0 +1,56 @@
+\section{Methodology}
+\label{sec:method}
+
+We present \textbf{Robust Linear Routing (RLR)}, a minimalist, highly performant framework for dynamic model merging. RLR consists of an extremely lightweight, classical linear gating network that processes input representations on-the-fly and generates task-blending coefficients. Crucially, RLR stabilizes this routing process through standard, classical regularizations rather than structural over-engineering.
+
+\subsection{Dynamic Parameter Blending}
+
+Let $N$ be the number of task-specific expert models to be merged, and let $\theta_k$ denote the fine-tuned parameters of expert $k \in \{1, 2, \dots, N\}$. We assume all experts share a common architecture (e.g., a Vision Transformer backbone) and reside in the same weight space, which is standard in model merging literature~\cite{Wortsman2022, Yadav2023}. 
+
+When an input image is fed into the network, we extract a representation $x \in \mathbb{R}^d$ from the transformer backbone. While early layers (first patch embedding) capture broad task-agnostic features, deep layers (such as Block 11) capture rich semantic representations. In our main model configuration, we default to extracting representations from the deep layers (globally average-pooled representation of Block 11), which capture rich semantic features and enable outstanding, near-ceiling dynamic blending performance. We also evaluate other layer representation sources in our ablation study (Section 4.5).
+
+The 192-dimensional representation vector $x$ is mapped directly to a raw routing logit vector $z \in \mathbb{R}^N$ via a single, classical linear projection:
+\begin{equation}
+z = W x + b
+\end{equation}
+where $W \in \mathbb{R}^{N \times d}$ is the router's weight matrix and $b \in \mathbb{R}^N$ is the bias vector. Since $N=4$ and $d=192$ in our multitask vision benchmarks, the routing network contains a total of only $768$ weights and $4$ biases (772 trainable parameters).
+
+To convert these raw logits into non-negative task-blending coefficients that sum to 1, we employ a softmax function. Crucially, we introduce a temperature scaling parameter $T \ge 1$:
+\begin{equation}
+\label{eq:softmax}
+a_k = \frac{\exp\left(\frac{z_k}{T}\right)}{\sum_{j=1}^N \exp\left(\frac{z_j}{T}\right)}
+\end{equation}
+The blending coefficients $a = [a_1, a_2, \dots, a_N]^T \in \mathbb{R}^N$ represent the input-dependent mixture weight allocated to each expert.
+
+Using these on-the-fly blending coefficients, the dynamically merged model weights $\theta_l(x)$ at layer $l$ are constructed as a linear combination of the task-specific parameters:
+\begin{equation}
+\theta_l(x) = \sum_{k=1}^N a_k \theta_{k, l}
+\end{equation}
+The blended parameters process the input representation to compute class logits and produce the final multi-task prediction.
+
+\subsection{Why Standard Regularization Suffices}
+
+The central hypothesis of this work is that the failure of classical linear routing (i.e., catastrophic collapse on SVHN as reported in prior work~\cite{vance2025quantum}) is not due to structural limitations of linear projections, but rather due to high-variance out-of-distribution representations causing saturated softmax gates. 
+
+We identify a key representational mechanism that triggers this failure: \emph{deep task-warped representation shift}. When routing representations $x$ are extracted from deep layers of the backbone, they are highly specialized; the experts' deep layers warp the representational coordinates in disparate, task-specific directions. For an out-of-distribution task like SVHN, this representational warping produces inputs $x$ to the router that have extreme, high-variance coordinate values. When passed through the linear projection $z = W x + b$, these high-variance inputs produce extreme, large-magnitude raw logits $z_k$. 
+
+Because the standard softmax function maps logits exponentially ($\exp(z_k)$), any slight increase in logit magnitude is exponentially magnified. This drives the routing coefficients $a_k \to 1.0$ (resulting in near-deterministic, hard expert selection) and completely silences complementary representations ($a_j \to 0.0$ for $j \neq k$). In model weight space, this hard selection behaves like a non-smooth discrete switch, destroying the soft, continuous blending of parameter spaces. Under extreme out-of-distribution shifts, a hard, erroneous switch to an incompatible expert (e.g., routing an SVHN sample to an MNIST expert) causes complete representational collapse.
+
+RLR elegantly resolves this via two simple, classical, and time-tested regularization techniques:
+\begin{enumerate}
+    \item \textbf{$L_2$ Weight Regularization (Weight Decay):} We apply a Frobenius norm penalty to the router's weights during optimization. This constrains the magnitude of $W$, bounding the raw logits and smoothing decision boundaries across different domains.
+    \item \textbf{Softmax Temperature Scaling:} In Equation~\ref{eq:softmax}, setting $T > 1$ acts as a continuous scaling factor that directly dampens the sensitivity of the softmax output to logit variance. This prevents the router from collapsing to a hard, single-expert delta distribution, guaranteeing a stable, continuous mixture of experts even under representation shift.
+\end{enumerate}
+
+\subsection{Calibration Optimization}
+
+To train the 772 parameters of our router ($W$ and $b$), we utilize a small, offline few-shot calibration set consisting of only 16 samples per task (64 samples in total). This extreme data-efficiency aligns with the minimalist ethos of training-free model merging.
+
+We optimize $W$ and $b$ to minimize the regularized uniform multi-task calibration loss:
+\begin{equation}
+\label{eq:loss}
+\mathcal{L}(W, b) = \sum_{t=1}^N \mathcal{L}_{\text{task}, t}(W, b) + \alpha \|W\|_F^2
+\end{equation}
+where $\mathcal{L}_{\text{task}, t}$ is the standard cross-entropy loss on task $t$, and $\alpha$ is the $L_2$ regularization coefficient. This unweighted formulation requires no heuristics, task-difficulty proxies, or calibration-biases, keeping our dynamic gating framework exceptionally simple and transparent.
+
+The entire calibration optimization runs for only 100 steps using the standard Adam optimizer with a learning rate of $0.01$, taking less than a second on a standard GPU.

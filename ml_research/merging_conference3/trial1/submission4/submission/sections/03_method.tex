@@ -1,0 +1,157 @@
+\section{Methodology: The FluidMerge Paradigm}
+\label{sec:method}
+
+Instead of performing static algebraic combinations or coordinate-wise masking in Euclidean space, we introduce \textbf{FluidMerge} (Fluid-Dynamic Parameter Coalescence). This framework models the path of neural parameters during merging as a continuous-time physical fluid-dynamic simulation, guiding weights through a non-convex loss landscape via cooperating physical vector fields.
+
+In this section, we formalize the continuous-time parameter dynamics, specify the self-supervised advection force derived from teacher-student losses, define the spatial Laplacian viscosity (diffusion) operator, and describe our numerical integration solver.
+
+\subsection{Continuous-Time Parameter Dynamics}
+Let $\theta_0 \in \mathbb{R}^d$ represent the parameters of a pretrained base model, and let $\theta_1, \theta_2, \dots, \theta_K \in \mathbb{R}^d$ represent the parameters of $K$ distinct task-specific expert models that have been fine-tuned from $\theta_0$. We define a virtual time trajectory for the merged parameters as a continuous-time vector-valued function $\theta(t)$ for $t \in [0, T]$, where $T > 0$ represents the total virtual time horizon. The trajectory is initialized at the pretrained base state:
+\begin{equation}
+    \theta(0) = \theta_0
+\end{equation}
+The evolution of the parameters $\theta(t)$ is governed by a continuous-time advection-diffusion ordinary differential equation (ODE) of the form:
+\begin{equation}
+    \frac{d\theta(t)}{dt} = \sum_{k=1}^K w_k(t) \mathbf{F}_k(\theta(t)) + \nu \mathbf{D}(\theta(t))
+\end{equation}
+where:
+\begin{itemize}
+    \item $w_k(t) \in \mathbb{R}^+$ is a time-varying coefficient representing the relative importance or pressure of task $k$ at virtual time $t$ (in our experiments, we utilize uniform static weighting $w_k(t) = 1/K$). Importantly, our continuous-time ODE formulation is fully compatible with dynamic task-weighting schemes (such as GradNorm \cite{chen2018gradnorm} or Multi-Gradient Descent Algorithms \cite{sener2018multi}) that dynamically scale $w_k(t)$ based on relative task gradient magnitudes to prevent task-interference asymmetries and balance the advection forces dynamically.
+    \item $\mathbf{F}_k(\theta(t)) \in \mathbb{R}^d$ is the task-specific \emph{advection force field} that pulls parameters along low-loss streamlines.
+    \item $\mathbf{D}(\theta(t)) \in \mathbb{R}^d$ is the structural \emph{diffusion operator} acting as physical fluid viscosity.
+    \item $\nu \in \mathbb{R}^+$ is the viscosity coefficient controlling the strength of parameter diffusion relative to advection.
+\end{itemize}
+
+\subsection{Advection Force Field via Self-Supervised Teacher Guidance}
+In practical settings, ground-truth labels are unavailable at test time. To generate stable and accurate advection forces, we employ a self-supervised teacher-student objective extending the framework of \citet{jung2025symerge}. For each task $k$, the fixed task expert $\theta_k$ acts as a stationary teacher, while the evolving parameters $\theta(t)$ represent the student model.
+
+Given a collection of task-specific unlabeled test-time data batches $\{X_1, X_2, \dots, X_K\}$ where $X_k$ consists of unlabeled samples belonging strictly to the native domain of task $k$, we feed $X_k$ through its corresponding native fine-tuned teacher expert model $\theta_k$ to obtain fixed soft-probability predictions:
+\begin{equation}
+    P_k^{\text{ft}} = C_k^{\text{ft}}(X_k; \theta_k)
+\end{equation}
+where $C_k^{\text{ft}}$ denotes the classification head of the $k$-th expert. This task-aligned data routing ensures that each expert teacher is only evaluated on its native, in-distribution data, completely avoiding any out-of-distribution (OOD) soft-label noise injection across tasks. Concurrently, we compute the student's current soft predictions on the same task-specific batch:
+\begin{equation}
+    P_k^{\text{merged}}(\theta(t)) = C_k^{\text{merged}}(X_k; \theta(t))
+\end{equation}
+where $C_k^{\text{merged}}$ is the classification head for task $k$ attached to the evolving student model $\theta(t)$. We define the self-supervised advection loss $\mathcal{L}_k$ as the cross-entropy between the student's predictions and the fixed teacher's soft labels:
+\begin{equation}
+    \mathcal{L}_k(\theta(t)) = \mathcal{H}\left(P_k^{\text{merged}}(\theta(t)), P_k^{\text{ft}}\right)
+\end{equation}
+where $\mathcal{H}$ represents the cross-entropy function. 
+
+To protect the student parameter fluid from destructive advection forces when expert teachers generate noisy predictions under severe out-of-distribution (OOD) test-time shifts, our self-supervised advection framework can easily incorporate confidence-based filtering. Specifically, we can ignore teacher predictions for any samples whose prediction entropy exceeds a pre-defined threshold:
+\begin{equation}
+    \tilde{P}_k^{\text{ft}} = P_k^{\text{ft}} \cdot \mathbb{I}\left(\mathcal{H}\left(P_k^{\text{ft}}\right) \le \tau\right)
+\end{equation}
+where $\tau$ is a maximum entropy threshold and $\mathbb{I}$ is the indicator function. This ensures that only high-confidence, robust teacher knowledge guides the physical parameter flow.
+
+The task-specific advection force $\mathbf{F}_k$ is then defined as the negative gradient of this self-supervised loss with respect to the student's parameters:
+\begin{equation}
+    \mathbf{F}_k(\theta(t)) = -\nabla_{\theta(t)} \mathcal{L}_k(\theta(t))
+\end{equation}
+This force field generates a gravitational pull that moves the parameters towards regions of the parameter space that are functionally consistent with the task experts.
+
+\subsection{Intuitive but Flawed Baseline Metaphor: Spatial Laplacian Diffusion}
+While the advection forces pull parameters towards low-loss regions, unconstrained gradient-based optimization on high-dimensional model parameters can be destructive. It can tear apart the coordinate-wise functional alignments between adjacent neurons, channels, and layers, leading to rapid representation collapse and severe task interference.
+
+To prevent this functional tearing, we initially introduce structural viscosity via a localized spatial Laplacian diffusion operator $\mathbf{D}(\theta)$. Rather than treating the parameters as an unstructured 1D vector, we respect the multi-dimensional tensor layout of the neural network weights. For any multi-dimensional weight tensor, we flatten the outer dimensions to represent the parameter as a 2D weight matrix $W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}}$ (and handle 1D vectors as special cases).
+
+We define the spatial Laplacian operator over the 2D coordinate grid of the weight matrix. For an interior weight coordinate $(i, j)$ where $1 < i < d_{\text{in}}$ and $1 < j < d_{\text{out}}$, the discrete 2D spatial Laplacian is defined as:
+\begin{equation}
+    [\mathbf{D}(W)]_{i,j} = W_{i+1,j} + W_{i-1,j} + W_{i,j+1} + W_{i,j-1} - 4W_{i,j}
+\end{equation}
+For boundary coordinates, we apply zero padding to represent boundary conditions (no diffusion outside the matrix bounds). For a 1D parameter vector $V \in \mathbb{R}^m$, the 1D spatial Laplacian is defined as:
+\begin{equation}
+    [\mathbf{D}(V)]_i = V_{i+1} + V_{i-1} - 2V_i
+\end{equation}
+This Laplacian operator couples adjacent weights in the network structure. Physically, it acts as a localized surface tension, penalizing high-frequency gradient discontinuities and forcing adjacent parameter coordinates to adapt smoothly and cohesively. This structural smoothing preserves the integrity of internal representations, allowing the model to adapt without catastrophic structural collapse.
+
+Importantly, we note that applying a localized grid-based spatial Laplacian in this manner commits a fundamental \emph{representation category error}. A weight matrix in a modern deep neural network does not possess any inherent spatial metric or physical coordinates. Adjacent columns or rows in a PyTorch tensor have no functional proximity over row/column indices $(i, j)$ compared to $(i+2, j)$; the index layout is purely arbitrary. Nevertheless, we present this spatial Laplacian as an intuitive physical metaphor (and a flawed baseline counter-example) to contrast with our robust, coordinate-free Fisher resolution in Section~\ref{subsec:permutation_invariance}.
+
+\subsection{Numerical Integration Solver}
+To compute the final merged parameters, we solve the continuous-time parameter trajectory $\theta(t)$ over the virtual time interval $t \in [0, T]$. We discretize the continuous ODE using a 1st-order Euler integration scheme over $N$ discrete simulation steps (epochs) with a fixed step size $\Delta t = T / N$. In our primary experiments, we set $N=100$ steps and $\Delta t = 0.1$, which corresponds exactly to a total virtual time horizon of $T = N \cdot \Delta t = 10.0$. This parameter-scaled formulation ensures complete mathematical consistency between continuous theory and discrete execution, providing stable convergence along the advection streamlines.
+
+We initialize the parameters at step $n=1$ with the pretrained base weights:
+\begin{equation}
+    \theta_1 = \theta_0
+\end{equation}
+For each simulation step $n \in \{1, 2, \dots, N\}$, we compute the accumulated advection forces and structural diffusion on the current weights $\theta_n$ using a batch of unlabeled data $X_{\text{unlabeled}}$:
+\begin{equation}
+    \mathbf{F}(\theta_n) = \sum_{k=1}^K w_k(t_n) \mathbf{F}_k(\theta_n)
+\end{equation}
+\begin{equation}
+    \mathbf{D}(\theta_n) = \mathbf{lap}(\theta_n)
+\end{equation}
+The parameter state is updated using the Euler step:
+\begin{equation}
+    \theta_{n+1} = \theta_n + \Delta t \left( \mathbf{F}(\theta_n) + \nu \mathbf{D}(\theta_n) \right)
+\end{equation}
+which is equivalent to:
+\begin{equation}
+    \theta_{n+1} = \theta_n + \Delta t \left( -\mathbf{g}_n + \nu \mathbf{lap}(\theta_n) \right)
+\end{equation}
+where $\mathbf{g}_n = \sum_k w_k(t_n) \nabla_{\theta_n} \mathcal{L}_k(\theta_n)$ represents the composite self-supervised task gradient at step $n$. After $N$ integration steps, the final merged weights are yielded as $\theta_{\text{final}} = \theta_{N+1}$.
+
+\subsection{Dynamic Optimization of Classification Heads}
+\label{subsec:classification_heads}
+While the ODE formulation describes the continuous-time parameter trajectory of the shared image encoder parameters $\theta(t)$, the downstream classification performance depends on task-specific linear heads $C_k$, which map the adapted representation space to the distinct label spaces of each dataset. Since the classification heads are task-specific and have varying output dimensions, they cannot be merged or averaged into the shared encoder weights $\theta(t)$.
+
+To maintain mathematical consistency and align the classification boundaries with the evolving representation trajectory, we jointly adapt the classification heads in tandem with the encoder. At each integration step $n$, after evaluating the composite encoder updates, we perform a local optimization update on the task-specific heads $C_k$. Specifically, using the same self-supervised cross-entropy loss with teacher-provided pseudo-labels on the current batch $X_{\text{unlabeled}}$, we update each head $C_k$ using the Adam optimizer:
+\begin{equation}
+    C_k^{(n+1)} = C_k^{(n)} - \eta_{\text{head}} \cdot \texttt{Adam}\left(\nabla_{C_k} \mathcal{L}_k\left(\theta_n, C_k^{(n)}; X_{\text{unlabeled}}\right)\right)
+\end{equation}
+where $\eta_{\text{head}} = 10^{-2}$ is the discrete learning rate of the classification heads. 
+
+This joint optimization formulation yields a \textbf{hybrid continuous-discrete optimization dynamical system}: the shared encoder $\theta_n$ evolves under a discretized continuous physical flow (Euler-integrated advection-diffusion), while the task-specific classification heads $C_k$ evolve under standard discrete-time momentum-based optimization. We provide a rigorous justification for this hybrid coupling:
+\begin{enumerate}
+    \item \textbf{Decoupling of Curvature and Scales:} The linear classification head $C_k$ operates on the representation embeddings, defining a highly convex quadratic loss surface for any fixed state of $\theta_n$. Consequently, the local optimization of $C_k$ has extremely fast convergence and high stability, contrasting with the highly non-convex, massive parameter landscape of the shared encoder.
+    \item \textbf{Role of Adam Momentum Buffers:} The first- and second-moment buffers in the Adam optimizer act as a physical low-pass filter on the gradient forces acting on the head. This temporal smoothing prevents high-frequency optimization noise and temporary pseudo-label errors from destabilizing the classification boundaries while the shared representation coordinates slowly and smoothly coalesce under EWC-stabilized fluid forces.
+\end{enumerate}
+Since the linear heads contain a negligible number of parameters (e.g., 512 parameters per head for 10-class datasets) compared to the encoder ($86\text{M}$ parameters), this head-tuning is extremely cheap computationally and ensures that the decision boundaries adapt dynamically to the adapted representation manifolds, preventing representation mismatch.
+
+\subsection{The Permutation Invariance Paradox and Coordinate-Free Viscosity}
+\label{subsec:permutation_invariance}
+
+While the 2D discrete spatial Laplacian operator $\mathbf{D}(W)$ introduces an intuitive physical metaphor of fluid viscosity, it exhibits a fundamental theoretical limitation when applied to standard neural network layers. This limitation stems from the \textbf{permutation invariance} of neural network representations \cite{ainsworth2022git}.
+
+For any fully connected or projection weight matrix $W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}}$, let $\mathbf{\Pi}_{\text{in}} \in \mathcal{P}(d_{\text{in}})$ and $\mathbf{\Pi}_{\text{out}} \in \mathcal{P}(d_{\text{out}})$ denote permutation matrices acting on the input and output dimensions, respectively. The transformed weight matrix is defined as:
+\begin{equation}
+    \tilde{W} = \mathbf{\Pi}_{\text{in}} W \mathbf{\Pi}_{\text{out}}
+\end{equation}
+Since shuffling the row and column indices of $W$ does not alter the underlying functional representation of the neural network (provided the adjacent layers are permuted accordingly), $W$ and $\tilde{W}$ are functionally identical. However, the discrete 2D spatial Laplacian is coordinate-dependent:
+\begin{equation}
+    \mathbf{D}(\tilde{W}) \neq \mathbf{\Pi}_{\text{in}} \mathbf{D}(W) \mathbf{\Pi}_{\text{out}}
+\end{equation}
+Consequently, enforcing smoothness over the grid index space makes the viscosity penalty highly dependent on the arbitrary tensor index layout used during PyTorch initialization. Shuffling the rows of $W$ prior to the simulation would yield a completely different viscosity penalty and optimization path, which is mathematically unsound for functional models.
+
+To resolve this permutation invariance paradox, we design, implement, and evaluate a mathematically rigorous, coordinate-free, and function-preserving viscosity operator based on the \textbf{Fisher Information Matrix (FIM)} of the self-supervised loss:
+
+\paragraph{Empirical Diagonal Fisher-Information-based Viscosity}
+Instead of regularizing the spatial coordinates of weights, we define viscosity using the Fisher Information Matrix, which defines a natural Riemannian metric $\mathbf{G}(\theta)$ on the parameter manifold $\mathcal{M}$:
+\begin{equation}
+    \mathbf{G}(\theta) = \mathbb{E}_{x \sim p(x)} \left[ \nabla_{\theta} \log p(y|x; \theta) \nabla_{\theta} \log p(y|x; \theta)^T \right]
+\end{equation}
+To ensure computational efficiency and avoid storing the full $O(d^2)$ Fisher matrix, we employ the standard diagonal empirical approximation computed once at the initial boundary condition state $\theta(0)$, where each parameter coordinate $\theta_i$ has a Fisher information coordinate $F_i^{(0)}$ approximated by the squared gradient of the self-supervised loss:
+\begin{equation}
+    F_i^{(0)} = \left( \nabla_{\theta_i} \mathcal{L}(\theta(0)) \right)^2
+\end{equation}
+We formulate the Fisher-Information-based viscosity force $\mathbf{D}_{\text{Fisher}}(\theta)$ as a coordinate-free restorative force that pulls parameters back towards their initial high-performing boundary condition state $\theta(0)$, scaled by their local functional sensitivity:
+\begin{equation}
+    [\mathbf{D}_{\text{Fisher}}(\theta)]_i = - F_i^{(0)} \left( \theta_i - \theta_i(0) \right)
+\end{equation}
+Under this formulation, the diffusion of weight trajectories is guided directly by the functional sensitivity of the network. High-information coordinates (where $F_i^{(0)}$ is large) are heavily damped and prevented from drifting far from their aligned initial state, while low-information, redundant coordinates (where $F_i^{(0)}$ is near zero) are allowed to adapt freely. Because the update rules only depend on the parameter values and their own gradients, this regularizer is completely permutation-invariant: permuting the rows or columns of a weight matrix permutes the gradients and parameters in the exact same manner, ensuring a function-preserving and coordinate-free integration.
+
+While this diagonal approximation is highly computationally efficient, we note that it assumes complete independence across parameter coordinates. To capture the joint, block-structured parameter correlations across adjacent layer dimensions, future work can scale this Fisher viscosity operator to use Kronecker-Factored Approximate Curvature (K-FAC) \cite{martens2015optimizing}. K-FAC factorizes the Fisher information block of each neural network layer into Kronecker products of input activation and output gradient covariance matrices, allowing the parameter fluid flow to be regularized by a highly structured Riemannian metric that preserves multi-dimensional layer-wise correlations without the intractable $O(d^2)$ storage and computation cost.
+
+\paragraph{Theoretical Equivalence to Elastic Weight Consolidation (EWC)}
+A rigorous mathematical deconstruction of this Fisher-Information viscosity operator under our discretized Euler integration scheme reveals an elegant, unifying connection to established Bayesian continual learning. When solving the continuous-time parameter trajectory $\theta(t)$ numerically, the Euler step update for each coordinate $i$ at iteration $n$ is defined as:
+\begin{equation}
+    \theta_{n+1, i} = \theta_{n, i} - \Delta t \left( \nabla_{\theta_{n, i}} \mathcal{L}(\theta_n) + \nu F_i^{(0)} \left( \theta_{n, i} - \theta_i(0) \right) \right)
+\end{equation}
+This update is mathematically isomorphic to running standard gradient descent on a loss function augmented by the standard Elastic Weight Consolidation (EWC) penalty \cite{kirkpatrick2017overcoming} with quadratic anchoring relative to the initial state $\theta(0)$:
+\begin{equation}
+    \mathcal{L}_{\text{total}}(\theta) = \mathcal{L}(\theta) + \frac{\nu}{2} \sum_i F_i^{(0)} \left( \theta_i - \theta_i(0) \right)^2
+\end{equation}
+Thus, while EWC was originally derived from a Bayesian perspective to minimize catastrophic forgetting by penalizing updates to functionally critical parameters, our framework arrives at the identical mathematical update from a completely independent direction: continuous-time advection-diffusion fluid simulation on a parameter manifold under the empirical Fisher metric. This convergence of fluid mechanics and Bayesian continual learning provides a robust theoretical foundation for our viscosity mechanism.
+
+We transparently note a physical distinction in our formulation: because the diagonal empirical Fisher operator is coordinate-wise and decoupled across dimensions, it mathematically acts as a point-wise restorative spring force (a harmonic anchor) rather than a physical spatial viscosity (which would require spatial neighbor-to-neighbor momentum transfer). We maintain this "viscosity" nomenclature to honor the continuous fluid flow analogy, but emphasize its mathematical grounding as a coordinate-free functional anchor.

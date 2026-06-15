@@ -1,0 +1,17 @@
+# Evaluation Component 2: Novelty and Originality
+
+## Assessment of Key Novel Aspects
+1. **Shifting Merging to Activation-Space:** Evaluating multiple parallel adapters and taking a weighted sum in activation-space is a known structural concept. It is utilized in Mixture of Experts (MoE) and Low-Rank MoE serving frameworks (e.g., S-LoRA, Punica) to serve multi-tenant adapter registries. The paper itself acknowledges this architectural equivalence.
+2. **Non-Parametric, Zero-Shot Gating:** The primary novelty of this paper lies in its **gating strategy**. Rather than learning complex parametric routing networks or relying on training data/active few-shot calibration, PFAB utilizes frozen, pre-trained classification heads and penultimate activations to compute routing coefficients.
+3. **Unit-Norm Calibration (UNC) and Class-Size Scaling:** Normalizing features and classification weights onto a unit hypersphere, combined with extreme-value statistical corrections ($\sqrt{2\log C'_k / D}$) to neutralize asymmetric classification-space vocabulary bias, is a practical, training-free calibration mechanism.
+4. **Layer-Wise Adapter Scaling (LAS):** A non-parametric scaling heuristic that normalizes intermediate expert adapter outputs by their Frobenius norms, which is a straightforward and practical approach to handle representation scale drift across independently trained adapters.
+5. **Generative LLM Extensions (PLSP, TSVHA with DGR):** These theoretical/simulated gating strategies extend non-parametric activation blending to massive shared vocabularies.
+
+## The 'Delta' from Prior Work
+- **Static Merging (Task Arithmetic, TIES, DARE):** The delta is that PFAB performs dynamic test-time routing rather than settling for a single, global compromise in parameter-space, eliminating parameter-level cross-task interference.
+- **Dynamic Parameter-Space Routing (AdaMerging, etc.):** Standard routers collapse under heterogeneous batching because they average coefficients batch-wide. PFAB's delta is executing the blending sample-wise in activation-space, which preserves fine-grained sample-specific coordinates ($\alpha_{k, b}$) and avoids heterogeneity collapse.
+- **PFSR + MBH (Prior SOTA):** PFSR is also parameter-free but operates in parameter-space, requiring MBH (batch partitioning and sequential execution of homogenous micro-batches) to avoid collapse. PFAB's delta is doing it in activation-space directly, allowing concurrent sample processing in a single parallelized forward pass of the backbone, bypassing all serving-level infrastructure complexity and the $O(G)$ latency scaling bottleneck.
+- **LoRA-MoE (S-LoRA, Punica):** The delta is that while those systems focus on learned, parametric gating networks that require extensive training data and complex systems-level batch schedulers, PFAB serves as a non-parametric, calibration-free gating alternative that uses pure PyTorch-native tensor operations (`torch.bmm`).
+
+## Characterization of Novelty
+The overall novelty is **moderate**. Shifting operations to activation-space to achieve sample-wise granularity is a logical progression given the limitations of parameter-space routing and the existing literature on LoRA-MoE. However, the specific integration of non-parametric gating mechanics (UNC, Class-Size Scaling, LAS, and DGR) provides an elegant, highly practical, and training-free solution to a complex systems-ML bottleneck. It represents a creative and effective combination of representation-space mathematics and systems-level ML simplicity.

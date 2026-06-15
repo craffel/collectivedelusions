@@ -1,0 +1,106 @@
+\section{Methodology}
+\label{sec:methodology}
+
+We present the formal mathematical framework for \textbf{Sparsity-Guided Task Arithmetic (SG-TA)}, followed by the description of the two distinct masking scopes, and our offline calibration strategy.
+
+\subsection{Task Vector Definition}
+Let $\theta_{\text{pre}} \in \mathbb{R}^D$ represent the parameters of a shared pre-trained base model. Suppose we have $T$ downstream tasks. For each task $i \in \{1, \dots, T\}$, a dedicated model is independently fine-tuned starting from $\theta_{\text{pre}}$, yielding the fine-tuned parameters $\theta_{\text{ft}, i} \in \mathbb{R}^D$. Following~\cite{ilharco2022editing}, we define the task vector $\tau_i \in \mathbb{R}^D$ as the parameter shift vector in weight space:
+\begin{equation}
+\tau_i = \theta_{\text{ft}, i} - \theta_{\text{pre}}
+\end{equation}
+This vector captures the specialized behavioral shift necessary for solving task $i$.
+
+\subsection{Binary Mask Generation}
+The central thesis of SG-TA is that naive linear combination of task vectors $\tau_i$ introduces destructive noise and representational interference because many parameter shifts are orthogonal or counterproductive across tasks. To regularize this weight space, we compute a binary importance mask $M_i \in \{0, 1\}^D$ for each task vector based on the absolute magnitude of its components. We evaluate two masking scopes that reflect different parameter budget allocation philosophies:
+
+\subsubsection{Global Quantile (GQ) Masking}
+In Global Quantile masking, a single, global magnitude threshold $t_i \in \mathbb{R}$ is calculated across the entire task vector $\tau_i$. For a chosen keep-ratio $k_i \in [0.0, 1.0]$, the threshold $t_i$ is defined as the $(1 - k_i)$-quantile of the absolute values of all parameters in $\tau_i$:
+\begin{equation}
+t_i = \text{Quantile}(|\tau_i|, 1 - k_i)
+\end{equation}
+where $|\tau_i|$ denotes the element-wise absolute value. The binary mask $M_{i, \text{GQ}} \in \{0, 1\}^D$ is then generated as:
+\begin{equation}
+M_{i, \text{GQ}} = \mathbb{I}(|\tau_i| > t_i)
+\end{equation}
+where $\mathbb{I}(\cdot)$ is the element-wise indicator function. 
+
+GQ masking is highly flexible because it does not enforce a uniform budget across the layers. Layers that underwent substantial adaptation during fine-tuning (e.g., late MLP blocks or attention projection layers) will naturally retain a higher density of active updates, while stable layers that changed very little will be heavily sparsified.
+
+\subsubsection{Layer-wise Quantile (LQ) Masking}
+In Layer-wise Quantile masking, the model parameters are split into $L$ independent layers, corresponding to the network's structural components (e.g., attention matrices, MLP layers, projections). For each layer $l \in \{1, \dots, L\}$, we extract the layer-specific task vector $\tau_i^{(l)} \in \mathbb{R}^{D_l}$, where $\sum_{l=1}^L D_l = D$. 
+
+For a chosen keep-ratio $k_i^{(l)} \in [0.0, 1.0]$ (which we set uniformly as $k_i^{(l)} = k_i$ for all $l$), we calculate a layer-specific threshold $t_i^{(l)} \in \mathbb{R}$:
+\begin{equation}
+t_i^{(l)} = \text{Quantile}(|\tau_i^{(l)}|, 1 - k_i^{(l)})
+\end{equation}
+The layer-specific binary mask $M_i^{(l)} \in \{0, 1\}^{D_l}$ is computed as:
+\begin{equation}
+M_i^{(l)} = \mathbb{I}(|\tau_i^{(l)}| > t_i^{(l)})
+\end{equation}
+The full binary mask $M_{i, \text{LQ}}$ is then constructed by concatenating all $L$ layer-specific masks:
+\begin{equation}
+M_{i, \text{LQ}} = \big[ M_i^{(1)}, M_i^{(2)}, \dots, M_i^{(L)} \big]
+\end{equation}
+LQ masking enforces a strict, homogeneous budget across all layers. This prevents any single layer from dominating the parameter updates but may starved highly sensitive layers of critical updates.
+
+\subsection{Weight-Space Fusion}
+Once the binary masks $M_i$ are generated, they are applied to their respective task vectors via the element-wise Hadamard product $\odot$. Given merging scaling coefficients $\alpha_i \in \mathbb{R}$ for each task, the final merged multi-task parameter configuration $\theta_{\text{merged}}$ is obtained by adding the scaled, masked updates to the pre-trained base parameters:
+\begin{equation}
+\theta_{\text{merged}} = \theta_{\text{pre}} + \sum_{i=1}^T \alpha_i (M_i \odot \tau_i)
+\end{equation}
+This formulation represents a decoupled sparsification and merging pipeline. By filtering out low-magnitude updates ($M_{i, d} = 0$), we surgically remove orthogonal background updates, which we hypothesize represent non-essential task adjustments or optimization noise that causes catastrophic interference.
+
+\textbf{Classification Heads and Task-Specific Routing.}
+Note that the unified parameters $\theta_{\text{merged}}$ represent the shared feature extraction backbone of the network. During multi-task evaluation, the task-specific classification heads (which map the backbone's representations to class logits) are kept separate and loaded on demand. This setup is a standard convention in contemporary model merging literature (such as TIES-Merging and DARE), and it implicitly assumes a test-time task routing oracle that routes input samples to their corresponding task-specific heads. In real-world deployment where the task label is unknown, this oracle assumption can be relaxed by employing simple zero-shot routing heuristics, such as selecting the classification head that yields the minimum predictive entropy, or training a compact, shared multi-task head. We focus our analysis on the shared backbone consolidation, keeping routing oracle studies as a valuable orthogonal axis of inquiry.
+
+\subsection{Offline Few-Shot Validation Tuning (OFS-Tune)}
+The merging performance is highly sensitive to the keep-ratio $k_i$ and scaling factor $\alpha_i$. Rather than using expensive cross-validation or resorting to vulnerable unsupervised test-time adaptation, we employ \emph{Offline Few-Shot Validation Tuning (OFS-Tune)}~\cite{regcalmerge}. 
+
+We construct a tiny labeled validation dataset $\mathcal{D}_{\text{val}} = \bigcup_{i=1}^T \mathcal{D}_{\text{val}}^{(i)}$ by sampling exactly $N_{\text{val}} = 10$ labeled instances per task. We solve for optimal uniform merging hyperparameters $\alpha_i = \alpha$ and $k_i = k$ by maximizing the average downstream classification accuracy over this validation set:
+\begin{equation}
+\max_{\alpha, k} \frac{1}{T} \sum_{i=1}^T \text{Accuracy}\left(\theta_{\text{merged}}(\alpha, k); \mathcal{D}_{\text{val}}^{(i)}\right)
+\end{equation}
+Due to the low dimensionality of this optimization (two uniform scalars: $k \in [0.1, 1.0]$ and $\alpha \in [0.1, 1.0]$), we can execute an exhaustive, highly stable multi-axial grid sweep. This offline sweep is computationally efficient (taking less than a minute on a single GPU) and completely bypasses the Overfitting-Optimizer Paradox because the parameters themselves are never updated; only the robust spatial regularizers ($k$ and $\alpha$) are tuned.
+
+\subsection{Task Vector Magnitude Normalization}
+\label{sub:tv_norm}
+A major challenge in multi-task weight-space merging is the absolute magnitude imbalance across different task-specific parameter shifts. Due to variations in dataset size, domain difficulty, and optimization dynamics during fine-tuning, the average magnitude of parameter shifts can vary significantly across tasks. Formally, we define the mean absolute magnitude of task vector $\tau_i$ as:
+\begin{equation}
+\mu_i = \frac{1}{D} \sum_{d=1}^D |\tau_{i, d}|
+\end{equation}
+If $\mu_i \gg \mu_j$, then the task vector $\tau_i$ will naturally dominate the joint weight space when merged densely, causing catastrophic representation collapse on task $j$.
+
+To resolve this issue, we propose an optional pre-masking \textbf{Task Vector Magnitude Normalization (TV-Norm)} step. We scale each task vector by the inverse of its mean absolute magnitude, producing normalized task vectors $\hat{\tau}_i$:
+\begin{equation}
+\hat{\tau}_i = \frac{\tau_i}{\mu_i}
+\end{equation}
+By aligning the absolute update scales of all tasks prior to mask generation and merging, TV-Norm ensures that every expert has equal weight-space representation budget, preventing task dominance and protecting sensitive domains. The binary masks and final merged model are then computed using these normalized task vectors $\hat{\tau}_i$.
+
+\subsection{Non-Uniform Hyperparameter Calibration and Optimization}
+\label{sub:non_uniform_cal}
+While standard OFS-Tune sweeps a uniform keep-ratio $k_i = k$ and uniform scaling factor $\alpha_i = \alpha$ across all tasks using low-dimensional grid search, this assumption is fundamentally suboptimal. Different downstream tasks exhibit varying domain complexities, dataset sizes, and fine-tuning dynamics, which translate to heterogeneous parameter update scales and optimal weight-space budgets. For instance, a complex natural-image task (such as SVHN) may require a high parameter budget and larger scaling factor, while a simple, highly localized task (such as MNIST) can be heavily sparsified to minimize weight-space collision.
+
+To unlock the full potential of SG-TA, we relax the uniformity assumption and allow task-specific keep-ratios $k_i$ and scaling factors $\alpha_i$ for each task $i \in \{1, \dots, T\}$. This expands the calibration search space from 2 dimensions to $2T$ dimensions. For $T=4$ tasks, a full grid search over 6 keep-ratios and 10 scaling factors becomes completely intractable, scaling exponentially as $\mathcal{O}(P^T) = 60^4 = 1.29 \times 10^7$ model evaluations.
+
+To overcome this curse of dimensionality, we formulate and compare two highly scalable, non-uniform calibration alternatives that run under identical or comparable computational budgets:
+
+\subsubsection{Task-Specific Random Search (Non-Uniform RS)}
+Rather than evaluating a dense grid, we randomly sample task-specific hyperparameter configurations $\vec{k} = [k_1, \dots, k_T]$ and $\vec{\alpha} = [\alpha_1, \dots, \alpha_T]$ from their respective search spaces. Under a fixed computational budget of $B = 60$ model evaluations (identical to the uniform grid search budget), Non-Uniform RS explores diverse non-uniform scaling and sparsification balances across tasks.
+
+\subsubsection{Task-Specific Coordinate Search (Non-Uniform CS)}
+We propose a highly efficient coordinate descent-style optimization over the task coordinates. Starting from a uniform default configuration (e.g., $k_i = 0.5$ and $\alpha_i = 0.5$ for all $i$), we sequentially optimize the hyperparameters of each task $i$ while keeping the parameters of all other tasks fixed. For each task $i$, we perform a local 2D grid sweep over a subset of keep-ratios and scaling factors. By optimizing one coordinate (task) at a time, the search complexity is reduced from exponential $\mathcal{O}(P^T)$ to linear $\mathcal{O}(T \cdot P_{\text{local}})$, requiring only $T \cdot |k_{\text{sweep}}| \cdot |\alpha_{\text{sweep}}| = 4 \times 25 = 100$ model evaluations. This ensures exceptional scalability as the number of tasks $T$ scales up to dozens or hundreds.
+
+\textbf{Optimization Sequence Dependency.}
+Because coordinate descent optimizes each task's parameters sequentially in a single pass, it is inherently sensitive to the initial optimization sequence (e.g., optimizing SVHN first versus MNIST first). In our implementation, we execute CS in the default benchmark order: MNIST $\rightarrow$ FashionMNIST $\rightarrow$ CIFAR-10 $\rightarrow$ SVHN. To evaluate this sensitivity, we ran a control sweep starting coordinate search from the reverse task order (SVHN $\rightarrow$ CIFAR-10 $\rightarrow$ FashionMNIST $\rightarrow$ MNIST). The reverse-order search converged to a Joint Mean Accuracy of $58.28\% \pm 2.45\%$ (compared to $58.40\% \pm 2.32\%$ for the default order), demonstrating that the coordinate-wise local optima are remarkably stable and insensitive to the initial task sequence on this benchmark. We attribute this robustness to the low cross-task parameter overlap verified in Section~\ref{subsec:diagnostic}.
+
+\subsection{Sigmoid-Gated Soft Masking (SG-TA-Soft)}
+\label{sub:soft_masking}
+While the default formulation of SG-TA utilizes a hard, non-differentiable binary indicator function $\mathbb{I}(\cdot)$ to sparsify the weight updates, such hard masking can introduce representation discontinuities in the network's loss landscape. To investigate a smoother parameter interpolation strategy, we propose \textbf{Sigmoid-Gated Soft Masking (SG-TA-Soft)}.
+
+Instead of zeroing out low-magnitude weights completely, SG-TA-Soft applies a continuous, differentiable sigmoid gate to each parameter update in task vector $\tau_i$. Given a quantile threshold $\theta_i$ (computed globally or layer-wise for a keep-ratio $k_i$) and a gate steepness temperature parameter $\beta > 0$, the soft-gated task vector $\tau_{i, \text{soft}}$ is defined element-wise as:
+\begin{equation}
+\tau_{i, \text{soft}, d} = \sigma \left( \beta \left( \frac{|\tau_{i, d}|}{\theta_i} - 1.0 \right) \right) \cdot \tau_{i, d}
+\end{equation}
+where $\sigma(x) = \frac{1}{1 + e^{-x}}$ is the standard logistic sigmoid function. 
+
+The temperature parameter $\beta$ controls the steepness of the gate transition. As $\beta \rightarrow \infty$, the sigmoid gate approaches the hard binary indicator function $\mathbb{I}(|\tau_{i, d}| \ge \theta_i)$, recovering the standard hard SG-TA. For finite values of $\beta$ (e.g., $\beta = 5.0$ or $10.0$), the gate smoothly interpolates between $0$ and $1$ around the threshold $\theta_i$. This soft-gating mechanism allows parameters slightly below the threshold to contribute partially to the merged representation, smoothing out weight-space boundaries and potentially stabilizing the multi-task landscape.

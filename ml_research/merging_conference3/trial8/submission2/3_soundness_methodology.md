@@ -1,0 +1,27 @@
+# 3. Soundness and Methodology Evaluation
+
+## Mathematical and Technical Soundness
+The mathematical formulation of CG-Q-SPS and its components is exceptionally rigorous, self-consistent, and technically sound.
+
+1. **Symmetric Uniform Quantization with Symmetric Clipping:** The decision to utilize symmetric uniform $[-q_{\text{max}}, q_{\text{max}}]$ quantization is mathematically and practically sound. The authors provide a strong justification: while asymmetric quantization can theoretically reduce noise for non-negative activations (such as post-GELU activations), it introduces substantial runtime computational overhead at the edge due to extra zero-point correction terms. They also empirically analyze and reject "Symmetric Quantization with Asymmetric Clipping" (which clips negative activations to zero), proving that early representation spaces carry critical task-separating directions in their negative tails, which would be permanently destroyed by asymmetric clipping (leading to a drop of -0.8% in accuracy and increased routing flicker).
+2. **Decoupled Sequential QASC Calibration:** A joint grid search of scale factors over the down-projection and up-projection matrices would require $O(N^2) = 441$ evaluations per adapter layer. By sequentially decoupling the optimization—solving for $s_A^*$ first based on the intermediate down-projection output MSE, and then solving for $s_B^*$ based on the final layer reconstruction error—QASC reduces the search complexity to a highly efficient $O(N) = 42$ evaluations. This makes the calibration extremely fast (under 0.05 seconds on CPU) and directly applicable to on-device workflows.
+3. **Diagonal Covariance GMM Safety Shield:** Restricted to a diagonal covariance structure, the Coordinate GMM maintains a highly lightweight $O(K)$ computational complexity compared to $O(K^2)$ for full covariance, which is crucial for on-device register-level constraints. Furthermore, on compact calibration splits ($|D_{\text{cal}}| = 64$), estimating the $K(K+1)/2$ free parameters of a full covariance matrix would introduce a high risk of overfitting and singular matrix exceptions. The diagonal restriction acts as an effective regularizer, ensuring stable parameter estimation.
+4. **Hardware Cost Calibration:** The DRAM and execution latency models are mathematically grounded and calibrated against a Broadcom BCM2711 ARM Cortex-A72 edge CPU. Importantly, the authors explicitly model critical systems-level overheads that are usually ignored in academic ML papers:
+   * **INT4 Dynamic Register Unpacking:** A 15% compute penalty is added to model bit-shifting and masking instructions on ARM CPUs that lack native 4-bit matrix multiplication.
+   * **Dynamic Thread Scheduling Barrier:** A $T_{\text{sync}} = 0.5$ ms synchronization barrier penalty is set to model thread wake-up and synchronization overheads.
+   * **Data-Casting Pipeline Stalls:** Factor in the cost of converting between integer (INT8/INT32) and floating-point (FP16) representations.
+
+## Methodological Appropriateness
+The choice of a **hardware-calibrated analytical simulation study** inside the Isolating Coordinate Sandbox (ICS) is highly appropriate. As the authors explain, physical on-device measurements in eager-mode or standard uncompiled deep-learning frameworks (like PyTorch) are heavily conflated by Python-to-C++ dispatching overheads, dynamic memory allocations, and background OS scheduling. By using an algebraic cost model calibrated against physical specifications, they can cleanly isolate and analyze systems-level variables (such as DRAM transfer size, cache line capacity, and rounding noise). To ground this simulation, they perform:
+1. **Empirical Multi-Layer Validation:** Running real CIFAR-10 tokens through physical pre-trained ViT-Tiny weights to measure relative reconstruction MSE and output cosine similarity.
+2. **End-to-End Compounded Quantization Simulation:** Patching all 12 block MLP layers with low-rank quantized wrappers to evaluate compounding quantization noise.
+3. **Physical CPU Benchmarking:** Running PyTorch eager and compiled code on physical CPUs to identify eager-mode dispatch and tracing overheads.
+
+This multi-tiered validation strategy bridges the gap between simulation and real-world hardware, demonstrating outstanding scientific rigor.
+
+## Critical Self-Analysis and Limitations
+The paper stands out for its high degree of intellectual honesty, dedicating an entire subsection to **Methodological Scope and Limitations** and discussing:
+1. **Idealized Sandbox Coordinate Space:** Acknowledging that the sandbox models representations using orthogonal 48-dimensional coordinate blocks, whereas real-world Vision Transformers exhibit highly entangled task manifolds.
+2. **Instruction and Thread-Level Penalties:** Detailing the dynamic register-unpacking, casting, and thread-synchronization barriers that must be managed.
+3. **Representation-Depth Trade-Off:** Explaining that routing task-agnostically at Layer 3 captures low-level spatial statistics and textures rather than high-level semantics, which fails for fine-grained tasks. They propose a pragmatic mitigation (dynamically shifting the routing block index during calibration if features are too entangled).
+4. **Simulation-to-Hardware Gap:** Highlighting that physical speedups are contingent on custom compiled runtimes (e.g., ExecuTorch or ONNX Runtime CustomOps) and that high-level compilers like `torch.compile` are unoptimized for sub-microsecond low-rank adapters on CPU.

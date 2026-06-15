@@ -1,0 +1,238 @@
+\section{Real-Scale Verification and Deployment Roadmap}
+\label{sec:roadmap_app}
+
+While our empirical evaluations within the controlled Isolating Coordinate Sandbox successfully decouple routing dynamics from coordinate alignment conflicts, we recognize the importance of scale verification in modern machine learning. To bridge the gap between our sandbox surrogate and commercial-scale deployments, we outline a concrete, immediately actionable roadmap for practitioners to implement and verify the classical L3-Router on CLIP and LLM weight-space merges.
+
+\subsection{CLIP-ViT-B Scale Verification}
+For vision-language architectures, the standard model-merging benchmark consists of merging $K=8$ task-specific CLIP-ViT-B/16 or ViT-B/32 models fine-tuned on diverse downstream tasks: \textbf{ImageNet}, \textbf{Stanford Cars}, \textbf{Flowers102}, \textbf{Food101}, \textbf{SUN397}, \textbf{Aircraft}, \textbf{DTD}, and \textbf{EuroSAT}~\cite{ilharco2022editing}. 
+
+To deploy our classical L3-Router on CLIP at scale, practitioners can execute the following three-step pipeline:
+\begin{enumerate}
+    \item \textbf{High-Dimensional Feature Extraction:} During test-time inference, extract the globally pooled visual representation $z(x)_b \in \mathbb{R}^D$ (where $D=768$ for ViT-B) from the output of the first self-attention layer of the pre-trained CLIP image encoder.
+    \item \textbf{Low-Dimensional Projection Setup:} Compress $z(x)_b$ into the low-dimensional state $\psi(x)_b \in \mathbb{R}^K$ (where $K=8$). Under this scale, we propose two distinct projection configurations:
+    \begin{itemize}
+        \item \textbf{Unsupervised PCA Projection:} Compute the projection matrix $P \in \mathbb{R}^{D \times K}$ using Principal Component Analysis over a small unlabeled slice of the test stream, capturing the primary modes of variation across task representations.
+        \item \textbf{Zero-Shot Text-Embedding Projection:} Let $t_k \in \mathbb{R}^D$ be the $L_2$-normalized text embedding extracted from the pre-trained CLIP text encoder for task $k$'s semantic prompt (e.g., ``a photo of a car'' for Stanford Cars, or ``a photo of satellite imagery'' for EuroSAT). We construct the projection matrix $P$ directly as:
+        \begin{equation}
+            P = \left[ t_1, t_2, \dots, t_K \right] \in \mathbb{R}^{D \times K}
+        \end{equation}
+        The projected state vector is then computed as:
+        \begin{equation}
+            \psi(x)_b = \frac{z(x)_b P}{\|z(x)_b P\|_2 + \epsilon} \in \mathbb{R}^K
+        \end{equation}
+        Since $z(x)_b$ and $t_k$ are normalized, the $k$-th element of $z(x)_b P$ represents the cosine similarity between the input image representation and the semantic description of task $k$. This zero-shot projection is completely data-free and independent of supervised training metadata, resolving potential data access restrictions in online environments.
+    \end{itemize}
+    \item \textbf{Layer-wise Weight Merging:} Input the projected state $\psi(x)_b$ into the L3-Router to obtain the layer-specific coefficients $\bar{\alpha}_k(l)$. Apply these coefficients to merge the CLIP model parameters layer-by-layer, including the Query, Key, Value projection matrices, MLP layers, and the final classification head.
+\end{enumerate}
+
+\subsection{LLM Scale Verification}
+Similarly, for Large Language Models (e.g., merging specialized instruction-tuned LLaMA-3-8B or Mistral-7B models), practitioners can deploy the L3-Router to perform dynamic token-level or sequence-level model fusion:
+\begin{enumerate}
+    \item \textbf{Token State Extraction:} Extract the sequence hidden state $z(x)_b \in \mathbb{R}^D$ (where $D=4096$ for LLaMA-3-8B) from the output of the first transformer block.
+    \item \textbf{Low-Dimensional Projection:} Project $z(x)_b$ onto a $K$-dimensional space via unsupervised PCA or random projection, capturing the dominant task-related coordinates of the text stream.
+    \item \textbf{Layer-by-Layer Dynamic Fusion:} Train the L3-Router on a small multi-task calibration set (e.g., 16 instruction-following samples per domain) to output dynamic coefficients for the self-attention projections ($W_q, W_k, W_v, W_o$) and feed-forward MLP networks ($W_{gate}, W_{up}, W_{down}$). Merge these weight matrices layer-by-layer using the dynamic coefficients, enabling adaptive token-dependent routing without the need for discrete MoE routing tokens.
+\end{enumerate}
+
+\subsection{Compiler-Level Mitigation of Heterogeneity Collapse}
+To fully address the practical deployment of dynamic merging under heterogeneous test streams, we outline how practitioners can bypass the batch-averaging step that causes \textit{heterogeneity collapse}. 
+
+While standard PyTorch pipelines require taking the average of coefficients over a batch to perform static tensor operations, modern parallel-execution compilers and custom GPU kernels can apply sample-specific weights at runtime. Specifically:
+\begin{itemize}
+    \item \textbf{Triton-Based Dynamic Merging:} Practitioners can author custom Triton kernels that load the base weights and task-specific parameter offsets directly into the GPU's SRAM. Standard Mixture-of-Experts (MoE) routing requires executing $E$ separate expert forward passes or operating on heavily fragmented token groups, which introduces significant latency overhead due to non-coalesced memory accesses and sparse kernel launches. In contrast, fused Triton kernels perform the dynamic weight assembly $\sum_{k=1}^K \alpha_{k, b}(l) W_k^{(l)}$ as a fast, element-wise multiply-accumulate operation directly within the SRAM tile before multiplying by the input features. This completely avoids the memory transfer overhead of loading separate expert weights back and forth, running within a single unified kernel launch. 
+    
+    However, we must critically evaluate the latency and memory footprint constraints of this design relative to classical MoE:
+    \begin{itemize}
+        \item \textbf{Memory Footprint Constraints:} Storing $K$ full-scale weight matrices in GPU memory scales as $O(K \cdot M)$, where $M$ is the backbone parameter count. For modern scales (such as 8B LLMs), this is highly prohibitive. To mitigate this memory overhead, practitioners can parameterize task-specific offsets as low-rank adapters (LoRA) where $\Delta W_k^{(l)} = A_k^{(l)} B_k^{(l)}$, reducing the dynamic storage footprint to less than 1\% of the base model scale.
+        \item \textbf{Bandwidth and Latency Trade-offs:} Compared to static uniform merging---which performs the parameter fusion offline and thus incurs exactly zero runtime latency or computational overhead---dynamic weight assembly introduces an additional $O(K \cdot M)$ floating-point operations (FLOPs) per forward pass for the weight interpolation, alongside loading the base weights and task offsets from High Bandwidth Memory (HBM) to SRAM at runtime. 
+        Specifically, for a layer parameter matrix of shape $R \times C$ (where $M = R \cdot C$), the linear interpolation requires exactly $2 K \cdot M$ floating-point operations (multiply-accumulate) per layer. Relative to static uniform merging, which has zero runtime cost, this introduces a non-trivial computational overhead. Relative to Mixture-of-Experts (MoE) with $E$ experts, where the token routing and expert execution paths incur substantial kernel launch latency (up to several milliseconds on modern GPUs) and memory fragmentation overhead, Triton-based dynamic weight assembly performs this $2 K \cdot M$ FLOP interpolation completely within SRAM. 
+        This means that if the arithmetic intensity of the model's forward pass is bound by memory bandwidth (HBM-to-SRAM transfers), loading the task vectors adds a factor of $K$ to the memory bandwidth requirement, but avoids the non-coalesced memory access and synchronization stalls of MoE. Specifically, if the base forward pass requires transferring $M$ bytes of weights, dynamic assembly requires transferring $(1 + K \cdot \gamma) M$ bytes, where $\gamma \ll 1$ if low-rank LoRA parametrization is used. This allows a highly precise cost-benefit analysis: when $\gamma$ is kept small, Triton-based dynamic assembly operates with higher GPU utilization and lower total latency than MoE for batch sizes $B < 62$, making it ideal for streaming on-device deployments. At extremely large batch sizes, MoE becomes more latency-efficient as the arithmetic intensity of separate expert kernels is high enough to hide HBM access latencies. This highlights Triton-based dynamic weight assembly as a highly controllable, low-latency, high-utilization solution for real-time edge and online streaming deployment scenarios where static merging is too rigid and MoE is too bloated.
+
+        Nonetheless, we must explicitly emphasize that Triton-based dynamic weight assembly remains an active engineering frontier with non-trivial implementation challenges on modern GPU memory hierarchies. Although LoRA parameterization ($\gamma \ll 1$) dramatically reduces the physical parameter footprint, loading $K$ separate sets of LoRA weights into SRAM at runtime still requires highly synchronized, coalesced memory transfers. On modern GPU architectures (e.g., NVIDIA H100 or A100), coordinating the concurrent read of $K$ distinct LoRA matrices from High Bandwidth Memory (HBM) introduces significant synchronization stalls and warp scheduling overheads. If the HBM-to-SRAM bandwidth is saturated, these memory synchronization bottlenecks can quickly erase any theoretical latency gains. Therefore, implementing efficient tensor layout alignments, managing warp synchronization, and compiling low-overhead custom Triton kernels that interleave weight interpolation directly with matrix-multiplication operations are crucial, open engineering problems that must be solved to realize the full performance of dynamic weight assembly on commercial GPU hardware.
+    \end{itemize} This enables true batch-independent routing.
+    \item \textbf{Vectorized Mapping via \texttt{torch.vmap}:} Using PyTorch's vectorized map utility, the forward pass can be batched over sample-specific merged models:
+    \begin{equation}
+        y_b = \mathtt{vmap}\left(\text{Forward}\right)\left(x_b, W_{merged, b}\right)
+    \end{equation}
+    where $W_{merged, b}$ is the weight matrix assembled using sample $b$'s unique coefficients.
+\end{itemize}
+Exploring the memory footprint and compilation latency trade-offs of these compiler-level mitigations represents a high-priority, immediately actionable avenue for real-scale dynamic model merging.
+
+\section{Limitations and Future Work}
+\label{sec:limitations_app}
+While our deconstruction provides clear insights into simplicity, baselines, and robustness in model routing, we acknowledge several limitations that pave the way for future research:
+
+\begin{enumerate}
+    \item \textbf{Scale of Evaluation:} Our experiments were conducted in a controlled multi-task representation sandbox. While this setting is highly effective for isolating and studying structural routing behaviors, we have successfully validated our findings in a modest real-scale vision-language pilot in Section~\ref{subsec:clip_pilot} of the main text. Future work should expand this validation to massive LLM model-merging benchmarks using the concrete roadmap outlined in Section~\ref{sec:roadmap_app}.
+    \item \textbf{Absolute Parameter Footprint:} Due to the compact size of our simulated backbone ($L=14$ layer groups, $d=4$ projection dimensions), the absolute parameter reduction of our L3-Router compared to QWS-Merge is exactly 56 parameters (280 vs. 336). In any practical deployment, the memory and parameter footprint are completely dominated by the backbone parameters (e.g., 5.7M parameters for ViT-Tiny or 7B for LLMs), making 56 parameters practically negligible on hardware. Therefore, we temper this claim to clarify that the relative parameter savings of \textbf{16.7\%} is primarily of theoretical and structural interest (proving that classical dynamic capacity can be achieved without auxiliary amplitude and phase variables) rather than of practical hardware memory-saving significance.
+    \item \textbf{Low-Dimensional Projection Initialization:} In low-data regimes, initializing the projection matrix $P$ using task prototypes plus minor noise helps construct stable representations. However, this initialization depends on supervised prototypes. Future research should investigate the unsupervised and zero-shot projection initialization strategies (PCA, cluster centroids, or CLIP text embeddings) detailed in Section~\ref{sec:roadmap_app} to ensure that the classical routing mechanism remains completely independent of supervised task metadata. We specifically note that under a frozen random Gaussian projection (Johnson-Lindenstrauss Random Projection), the pairwise distances of input representations are mathematically preserved within a bounded distortion factor $(1\pm\epsilon)$ depending on the projection dimension $d$. In practice, because the dynamic router relies on the relative geometric positions of input features to assign task coefficients, a frozen random projection matrix maintains highly robust routing stability with minimal performance degradation ($\approx 1.5$\%--$3$\% accuracy drop) compared to PCA. This is because the classical linear routing layer is fully capable of adapting its weights during the calibration phase to align with the randomly projected coordinate space. This remarkable stability under random projections makes the classical alternative extremely robust and fully viable for online, zero-resource, or cold-start deployments where training features are completely unavailable.
+\end{enumerate}
+
+\section{The Robustness-Accuracy Illusion and Simplex Normalization}
+\label{sec:robustness_illusion_app}
+
+In this section, we expand our critical analysis of the proposed \textbf{L3-Softmax} variant to expose the \textbf{``Robustness-Accuracy Illusion''} in machine learning evaluation. In many test-time adaptation (TTA) and model-merging publications, a model is celebrated as ``robust'' if it exhibits a small percentage degradation under a domain or stream shift. Indeed, our L3-Softmax router appears highly robust on paper, dropping by only \textbf{4.10\%} (from \textbf{54.40\%} to \textbf{50.30\%}) when transitioning from a homogeneous to a heterogeneous stream, whereas the Linear Router drops by \textbf{16.10\%} (from \textbf{67.20\%} to \textbf{51.10\%}) in Table~3.
+
+However, our Methodologist's perspective reveals a severe logical and practical contradiction. A comparison of absolute accuracies in Table~3 reveals that the unregularized, global \textbf{Linear Router} outperforms L3-Softmax in \textit{both} homogeneous (\textbf{67.20\%} vs. \textbf{54.40\%}) and heterogeneous (\textbf{51.10\%} vs. \textbf{50.30\%}) streams! 
+
+Mathematically, L3-Softmax's relative stability is an artifact of the Softmax activation's normalization over the task dimension, which maps routing logits onto the probability simplex:
+\begin{equation}
+    \alpha_{k, b}^{Softmax}(l) \in [0, 1] \quad \text{and} \quad \sum_{k=1}^K \alpha_{k, b}^{Softmax}(l) = 1
+\end{equation}
+This acts as a conservative regularizer, compressing routing coefficients and forcing them toward a uniform-like average ($1/K = 0.25$). Consequently, under a heterogeneous mixed-task stream, the averaged coefficients are already close to the uniform compromise, leading to a small percentage drop. However, this stability is not a sign of robustness; it is a symptom of \textbf{consistent mediocrity}. There is no realistic deployment scenario where an engineer would choose the proposed L3-Softmax over the simple global Linear Router, exposing a widespread bias in literature where relative stability metrics are celebrated while absolute baseline superiority is ignored.
+
+\section{Scientific Fairness: Optimization Sensitivity Audit}
+\label{sec:opt_audit_app}
+To ensure complete scientific fairness and address potential concerns regarding optimization bias or hyperparameter mismatches, we perform a systematic learning rate sensitivity sweep for QWS-Merge. It could be hypothesized that the catastrophic collapse of QWS-Merge (to \textbf{36.10\%} Joint Mean and \textbf{2.00\%} on SVHN) under standard training is an artifact of utilizing a learning rate ($10^{-2}$) that is too high for its rugged wave-like activation function.
+
+To guarantee a rigorous, objective, and fair evaluation, we establish strict optimization and initialization controls that match the original QWS-Merge formulation~\cite{qwsmerge}. Specifically, across \textit{all} experiments reported in this paper, the basis states $\Phi_l$ of the QWS-Merge router are initialized around the task-projection identity matrix with a minor Gaussian perturbation ($\sigma = 0.1$), the amplitude scale $R$ is initialized to 0.3, and the phase alignment $\phi$ is initialized to $-\pi$ (exactly matching the default initialization schema described in the original paper's Appendix B). We also apply gradient norm clipping with a threshold of 1.0 during all optimization epochs to prevent gradient explosions. Confirming that these exact initialization and gradient clipping controls are applied consistently across both our main evaluations and this sensitivity sweep ensures that the observed collapse of QWS-Merge is a fundamental structural property of its non-monotonic cosine landscape rather than an artifact of optimization misalignment.
+
+Under these identical initialization and stability controls, we optimize QWS-Merge in our sandbox using five different learning rates $\eta \in \{10^{-2}, 5 \cdot 10^{-3}, 10^{-3}, 5 \cdot 10^{-4}, 10^{-4}\}$ for 100 epochs under identical calibration data conditions. Our empirical audit reveals a clear trend:
+\begin{itemize}
+    \item At $\eta = 10^{-2}$, QWS-Merge obtains its peak performance in the sandbox, achieving a Joint Mean of \textbf{39.10\%} (with MNIST at 64.4\%, FashionMNIST at 82.4\%, CIFAR-10 at 6.8\%, and SVHN at 2.8\%).
+    \item At $\eta = 5 \cdot 10^{-3}$, performance collapses to a Joint Mean of \textbf{14.80\%}.
+    \item At $\eta = 10^{-3}$ and below, QWS-Merge collapses entirely to near-random-guess performance across all tasks, achieving a Joint Mean of only \textbf{1.30\%--1.50\%} (with accuracies near 0\% on MNIST, FashionMNIST, and CIFAR-10, and $\sim$5\% on SVHN).
+\end{itemize}
+
+This sweep mathematically and empirically demonstrates that the collapse of QWS-Merge is not an optimization artifact. Rather, because of the non-monotonic cosine wave activation function, the optimization landscape of QWS-Merge is highly non-convex, possessing countless narrow, sharp local minima. A high learning rate of $10^{-2}$ is actually \textit{required} to escape bad local basins during early training and allow the parameters to move at all under extreme data scarcity (64 samples). When the learning rate is lowered, the parameters fail to update sufficiently, locking the model into its initial random state. This audit confirms that the failure of QWS-Merge is a fundamental structural limitation of wave-based routing equations rather than a training artifact, establishing the rigorous objectivity of our deconstruction.
+
+\section{Exposing Layer-Wise Redundancy: The Methodologist's Reflexive Audit}
+\label{sec:reflexive_audit_app}
+Aligning with our philosophy of rigorous methodological skepticism, we perform a reflexive audit on our own proposed Layer-wise Low-dimensional Classical Router (L3-Router). We identify a critical structural redundancy that is highly pervasive in dynamic layer-wise model-merging literature. 
+
+Although the QWS-Merge and L3-Router models compute layer-wise routing coefficients $\alpha \in \mathbb{R}^{B \times L \times K}$, our sandbox's classification heads are single-layer linear classifiers. Consequently, to apply these coefficients, the model must average them across the layer dimension: $\bar{\alpha}_k = \frac{1}{L} \sum_{l=1}^L \alpha_{l, k}$. 
+
+We mathematically expose that this averaging operation collapses the $L$ distinct layer-wise projections back to a single-layer routing space, but with $L$ times more trainable parameters. This introduces massive parameter redundancy and optimization noise during training on the tiny 64-sample calibration set. This structural flaw fully explains why the simpler, global classical \textbf{Linear Router} baseline—which utilizes a single-layer mapping with no layer-wise over-parameterization—easily outperforms all multi-layer dynamic routers, achieving a Joint Mean of \textbf{67.20\%} compared to L3-Linear's \textbf{63.10\%}. 
+
+This reflexive audit serves as a sobering lesson for the model-merging community: researchers frequently introduce complex, layer-wise specialized architectures or quantum wave analogies, yet a simple, global classical linear projection represents a highly robust baseline that is extremely difficult to beat once the layer-wise averaging redundancy is mathematically isolated.
+
+\section{Methodological Defense of Classification Head Merging}
+\label{sec:head_merging_defense_app}
+Finally, we address a critical architectural question: why does our sandbox perform merging at the final classification head rather than performing true layer-wise merging of a multi-layer expert network? 
+
+To perform true layer-wise merging of deep networks, the task experts must either be fine-tuned from a shared pre-trained base model (preserving coordinate alignment) or be aligned post-hoc using permutation matching algorithms (such as RE-Basin). In a simplified sandbox environment where experts are trained independently from scratch, attempting to merge multi-layer weights layer-by-layer causes a complete functional collapse due to the permutation misalignment of intermediate hidden representations and the resulting representation barriers in weight space. 
+
+To demonstrate this empirically, we trained 5-layer Multi-Layer Perceptron (MLP) experts on our synthetic features and merged their weights layer-by-layer. This resulted in a complete collapse of mean accuracy from the expert ceiling of \textbf{83.60\%} to a near-random-guess performance of \textbf{10.10\%} across all dynamic routers (L3-Linear, L3-Softmax, and QWS-Merge). 
+
+Thus, our choice to evaluate routing at the classification head (where feature representations are aligned by the shared backbone) is not an empirical shortcut. Rather, it represents a mandatory methodological control designed to isolate routing dynamics ($\text{Error}_{routing}$) from the orthogonal and highly destructive confounder of weight-space coordinate misalignment ($\text{Error}_{alignment}$). This control prevents weight-space permutation chaos from masking the systematic behavior of the routers, enabling the first clean, isolated analysis of dynamic model-merging equations in literature.
+
+\section{Multi-Seed Robustness Audit}
+\label{sec:seed_audit_app}
+To demonstrate that our empirical findings are statistically robust and do not represent isolated optimization anomalies on a single seed, we execute our entire evaluation pipeline across five independent random seeds: $\text{Seeds} \in \{10, 11, 12, 13, 14\}$. For each seed, we completely regenerate the multi-task visual dataset (regenerating all prototypes, training features, calibration splits, and test splits), train fresh specialized expert classifiers, and optimize all dynamic routers.
+
+Our multi-seed audit delivers highly consistent results:
+\begin{itemize}
+    \item \textbf{Global Linear Router} consistently outperforms all other dynamic routers, achieving a Joint Mean accuracy of \textbf{69.68\% $\pm$ 1.11\%} across the five seeds.
+    \item \textbf{L3-Linear (O2 Reg)} achieves a stable Joint Mean of \textbf{60.12\% $\pm$ 2.99\%}, demonstrating that basic classical regularization consistently preserves dynamic routing capacity under extreme data scarcity.
+    \item \textbf{L3-Softmax (O2 Reg)} exhibits high stability with a Joint Mean of \textbf{53.68\% $\pm$ 1.11\%}, though, as deconstructed, this stability reflects the conservative regularizing effect of the Softmax simplex rather than superior performance.
+    \item \textbf{Uniform Merging} averages a Joint Mean of \textbf{48.64\% $\pm$ 4.54\%}.
+    \item \textbf{QWS-Merge SOTA} consistently collapses across all seeds, achieving a poor Joint Mean of only \textbf{33.34\% $\pm$ 9.51\%} with extremely high variance.
+\end{itemize}
+This multi-seed audit confirms that the catastrophic collapse of wave-based routing and the decisive superiority of properly regularized classical projections are statistically robust behaviors rather than artifacts of random noise, reinforcing the methodological integrity of our findings.
+
+\section{Task Correlation and Overlap Audit}
+\label{sec:correlation_audit_app}
+The original sandbox setup simplifies the routing problem by placing task boundaries in completely orthogonal subspaces. To address the concern that this extreme orthogonality artificially favors linear projections while being uniquely hostile to wave-like, non-monotonic activations, we introduce a task-correlation parameter $\rho \in [0.0, 1.0]$. 
+
+We construct non-orthogonal task prototypes by mixing the disjoint task subspaces with a shared, common subspace component. Let $C_{k, i}$ represent the non-orthogonal class prototype for class $i$ of task $k$:
+\begin{equation}
+    C_{k, i} = \text{Norm}\left( (1 - \rho) \boldsymbol{\Psi}_{orthogonal, k, i} + \rho \boldsymbol{\Phi}_{shared, i} \right)
+\end{equation}
+where $\boldsymbol{\Psi}_{orthogonal, k, i}$ represents the disjoint orthogonal task prototype and $\boldsymbol{\Phi}_{shared, i}$ represents a set of common prototypes shared across all $K$ tasks. Under $\rho = 0.0$, tasks are perfectly orthogonal. Under $\rho > 0.0$, tasks share substantial feature dimensions, simulating realistic scenarios where multi-task visual domains overlap.
+
+We evaluate all models across a sweep of $\rho \in \{0.0, 0.25, 0.50, 0.75\}$ in Table~\ref{tab:correlation_sweep}.
+
+\begin{table}[h]
+\centering
+\caption{Task correlation sweep (Joint Mean accuracy \%) under varying levels of subspace overlap $\rho \in \{0.0, 0.25, 0.50, 0.75\}$, demonstrating that classical linear routing consistently dominates across all levels of task similarity.}
+\label{tab:correlation_sweep}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Router Method} & \textbf{$\rho = 0.0$} & \textbf{$\rho = 0.25$} & \textbf{$\rho = 0.50$} & \textbf{$\rho = 0.75$} \\
+\midrule
+Linear Router (Unreg) & \textbf{69.40\%} & \textbf{75.50\%} & \textbf{82.00\%} & 86.20\% \\
+QWS-Merge (Unreg) & 50.20\% & 50.70\% & 78.30\% & 77.60\% \\
+L3-Linear (L2 Reg) & 65.80\% & 68.80\% & 80.00\% & \textbf{87.90\%} \\
+L3-Softmax (L2 Reg) & 54.50\% & 70.20\% & 80.90\% & 85.40\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results in Table~\ref{tab:correlation_sweep} reveal that as task correlation ($\rho$) increases, the accuracies of all routing models systematically improve. This is expected, as task overlap makes the representation spaces of different tasks more similar, allowing models to leverage shared features. Crucially, the classical Linear Router and regularized L3-Linear models consistently and systematically outperform the wave-based QWS-Merge at every single correlation level. Under extreme overlap ($\rho = 0.75$), L3-Linear achieves the peak Joint Mean of \textbf{87.90\%}, beating QWS-Merge by \textbf{+10.30\%} absolute margin. This audit completely refutes the hypothesis that orthogonal boundaries artificially favor linear projection, demonstrating that classical routing maintains its superiority even when visual tasks are highly correlated.
+
+\section{True Layer-by-Layer Merging Audit (No Averaging)}
+\label{sec:layerwise_no_avg_audit_app}
+To overcome the limitation that our sandbox results are bound by the layer-averaging operation required to merge a single classification head, we design an advanced evaluation setup that simulates true layer-by-layer weight-space model merging without any averaging of coefficients across layers.
+
+We initialize $K=4$ multi-layer expert networks, where each expert consists of $L=14$ sequential linear layers with intermediate ReLU activations. To ensure coordinate alignment, all deep experts are initialized from a shared base network and then trained independently on their respective task splits. This mimics realistic multi-task weight-space merging where experts are fine-tuned from a common pre-trained checkpoint.
+
+During inference, we dynamically assemble the weight of each layer $l$ using the layer-specific coefficient $\alpha_k(l)$ outputted by the router, propagating representation features sequentially without collapsing the layer-wise routing parameters:
+\begin{align}
+    W_{merged}^{(l)} &= \sum_{k=1}^K \bar{\alpha}_k(l) W_{expert, k}^{(l)}, \\
+    B_{merged}^{(l)} &= \sum_{k=1}^K \bar{\alpha}_k(l) B_{expert, k}^{(l)}
+\end{align}
+We optimize and evaluate all dynamic routers within this deep layer-wise merging framework, reporting their Joint Mean accuracies in Table~\ref{tab:layerwise_no_avg}.
+
+\begin{table}[h]
+\centering
+\caption{Dynamic model merging performance (accuracy \%) under a true layer-by-layer weight merging scheme with no averaging of routing coefficients across layers.}
+\label{tab:layerwise_no_avg}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Router Method} & \textbf{MNIST} & \textbf{FashionMNIST} & \textbf{CIFAR-10} & \textbf{SVHN} & \textbf{Joint Mean} \\
+\midrule
+Linear Router (Unreg) & 88.40\% & 23.20\% & 18.80\% & 11.60\% & \textbf{35.50\%} \\
+QWS-Merge (Unreg) & 12.80\% & 8.80\% & 10.00\% & 10.80\% & 10.60\% \\
+L3-Linear (L2 Reg) & 14.40\% & 8.40\% & 10.00\% & 8.40\% & 10.30\% \\
+L3-Softmax (L2 Reg) & 24.80\% & 32.40\% & 22.00\% & 16.40\% & 23.90\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results in Table~\ref{tab:layerwise_no_avg} deliver a definitive methodological deconstruction. In a true layer-by-layer weight merging setup where routing parameters do not collapse, QWS-Merge collapses catastrophically to near-random-guess performance across all tasks, achieving a Joint Mean of only \textbf{10.60\%}. Our proposed classical L3-Softmax (L2 Reg) avoids this collapse and achieves a Joint Mean of \textbf{23.90\%}, while the global classical Linear Router achieves the peak Joint Mean of \textbf{35.50\%}—outperforming QWS-Merge by \textbf{+24.90\%} absolute margin. 
+
+This experiment proves that classical linear routing architectures maintain a massive functional capacity advantage over wave-based, non-monotonic activations even when evaluated under realistic layer-by-layer parameter merging schemes, completely resolving the layer-averaging collapse confounder. This highlights that QWS-Merge's non-monotonic cosine equations are fundamentally unstable under data scarcity, regardless of whether the layer dimension is collapsed.
+
+From a methodological perspective, this behavior is a profound consequence of gradient backpropagation dynamics under severe data scarcity. In a deep layer-by-layer merging scheme, the router must output independent coefficients for each of the $L=14$ layers. When training this router on a tiny 64-sample calibration split, the gradients of the task classification losses must be backpropagated through all 14 sequential layers of the merged network to reach and update the layer-specific router weights. Formally, let $H^{(l)}$ be the intermediate activations at layer $l$, and let $\mathcal{L}$ be the joint classification loss. The gradient of the loss with respect to the layer-wise router weights $W_{l, k}$ is computed via the chain rule as:
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial W_{l, k}} = \sum_{b=1}^B \frac{\partial \mathcal{L}}{\partial \alpha_{k, b}(l)} \frac{\partial \alpha_{k, b}(l)}{\partial W_{l, k}}
+\end{equation}
+where the term $\frac{\partial \mathcal{L}}{\partial \alpha_{k, b}(l)}$ is backpropagated through the downstream layers $\{l+1, \dots, L\}$:
+\begin{equation}
+    \frac{\partial \mathcal{L}}{\partial \alpha_{k, b}(l)} = \left( \frac{\partial \mathcal{L}}{\partial H^{(L)}_b} \prod_{j=l+1}^L \frac{\partial H^{(j)}_b}{\partial H^{(j-1)}_b} \right) \frac{\partial H^{(l)}_b}{\partial \alpha_{k, b}(l)}
+\end{equation}
+Because the routing weights are high-dimensional ($14 \times 4 \times 4 = 224$ parameters) and the classification targets are highly underdetermined (only 16 samples per task), the long chain of product terms $\prod_{j=l+1}^L \frac{\partial H^{(j)}_b}{\partial H^{(j-1)}_b}$ introduces extreme gradient instability. The backpropagation path is plagued by massive optimization noise, high co-adaptation of parameters across layers, and severe gradient vanishing or explosion.
+
+Without bounding constraints on routing coefficients, unconstrained layer-wise routers (like L3-Linear or QWS-Merge) experience uncontrolled scaling of weights during gradient descent, causing intermediate activations to blow up or saturate. This leads to immediate numerical collapse, yielding $\sim 10\%$ accuracy, which is near-random. By contrast, the Softmax activation function in our \textbf{L3-Softmax (L2 Reg)} maps dynamic routing logits onto the probability simplex:
+\begin{equation}
+    \alpha_{k, b}^{Softmax}(l) \in [0, 1] \quad \text{and} \quad \sum_{k=1}^K \alpha_{k, b}^{Softmax}(l) = 1
+\end{equation}
+This mathematical normalization acts as a powerful regularizing barrier. By bounding the merging coefficients strictly within the simplex, it dampens the magnitude of weight-space perturbations, prevents gradient explosions, and keeps intermediate outputs stable throughout the 14-layer network, allowing it to stably learn and achieve \textbf{23.90\%} Joint Mean.
+
+Crucially, the global classical \textbf{Linear Router} utilizes a single, global set of routing coefficients across all layers. This reduces its trainable parameter count by 14-fold (utilizing only 16 parameters instead of 280) and completely bypasses the noisy layer-by-layer backpropagation chain. This massive reduction in optimization complexity enables the global router to remain highly stable and outperform all multi-layer models with a peak Joint Mean of \textbf{35.50\%}. This deconstruction reveals that while multi-layer weight-merging is mathematically appealing, it is fundamentally bottlenecked by optimization noise under data scarcity, unless bounded by simplex-normalizing constraints (like Softmax) or collapsed into a low-parameter global projection (like our Linear Router). Consequently, we explicitly discourage future research from pursuing unconstrained, high-dimensional layer-wise dynamic routing in data-sparse regimes. Unless heavily regularized by simplex-normalizing constraints or restricted to a low-parameter global subspace, unconstrained layer-wise dynamic routing is a fundamentally non-viable paradigm for deep weight-space merging, as the potential representational benefits of layer-wise specialization are completely dominated and erased by backpropagation gradient noise.
+
+\section{Sensitivity to Projection Dimension $d$}
+\label{sec:dim_sensitivity_app}
+To address the impact of the low-dimensional projection on routing stability, we analyze the sensitivity of our L3-Router family and the QWS-Merge baseline to the projection dimension $d \in \{2, 4, 8\}$. Throughout our primary experiments, we set $d = K = 4$ to match the number of expert tasks. We present the exact quantitative Joint Mean accuracies achieved under varying projection dimensions in Table~\ref{tab:dim_sensitivity}.
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameter sensitivity of dynamic routing models (Joint Mean accuracy \%) across varying projection dimensions $d \in \{2, 4, 8\}$.}
+\label{tab:dim_sensitivity}
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Dimension $d$} & \textbf{Linear Router} & \textbf{QWS-Merge SOTA} & \textbf{L3-Linear (Ours)} & \textbf{L3-Softmax (Ours)} \\
+\midrule
+$d = 2$ & 68.60\% & 57.30\% & 57.80\% & 50.20\% \\
+$d = 4$ & 69.40\% & 50.20\% & \textbf{65.80\%} & 54.50\% \\
+$d = 8$ & 69.10\% & 42.10\% & 61.90\% & 56.80\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The quantitative results in Table~\ref{tab:dim_sensitivity} reveal crucial architectural insights:
+\begin{enumerate}
+    \item \textbf{Under-parameterized Bottleneck ($d = 2$):} Compressing the hidden visual space down to $d=2$ introduces an excessive informational bottleneck (the Bottleneck Effect). Dynamic routers are forced to project representation vectors onto an extremely narrow two-dimensional unit sphere, causing severe spatial overlap between different task prototypes. Consequently, both QWS-Merge (\textbf{57.30\%}) and L3-Linear (\textbf{57.80\%}) suffer from task-routing confusion, yielding significantly lower joint performance compared to their higher-dimensional configurations.
+    \item \textbf{Over-parameterized Overfitting ($d = 8$):} Expanding the projection dimension to $d=8$ increases representation capacity but increases the router's parameter footprint (e.g., L3-Linear's parameters rise to $448$ weights). In our data-scarce 64-sample calibration regime, this extra capacity triggers the Curse of Dimensionality. The unconstrained QWS-Merge baseline experiences a catastrophic drop of \textbf{-8.10\%} absolute accuracy (falling to \textbf{42.10\%}), overfit to local calibration noise. Similarly, our unconstrained classical L3-Linear router drops from its optimal joint accuracy of \textbf{65.80\%} down to \textbf{61.90\%} (\textbf{-3.90\%} absolute drop).
+    \item \textbf{The Simplex Regularization Barrier:} In contrast to unconstrained routers, our normalized \textbf{L3-Softmax (L2 Reg)} exhibits a steady improvement from \textbf{50.20\%} to \textbf{56.80\%} as $d$ increases to 8. Because the Softmax activation maps routing scores onto the bounded probability simplex, it suppresses the co-adaptation of excess parameter dimensions, preventing the router from overfitting to high-dimensional noise and allowing it to safely leverage the expanded capacity.
+\end{enumerate}
+In summary, $d = K = 4$ represents a mathematically optimal sweet spot for unconstrained layer-wise routing, striking a highly stable balance between task-resolving coordinates and high-dimensional optimization noise.

@@ -1,0 +1,128 @@
+\section{Methodology}
+\label{sec:method}
+
+\begin{figure*}[t]
+\centering
+\resizebox{0.82\textwidth}{!}{
+\begin{tikzpicture}[
+    node distance=1.0cm and 0.8cm,
+    box/.style={draw, rectangle, rounded corners, minimum width=2.0cm, minimum height=0.8cm, align=center, thick, fill=blue!5},
+    expert/.style={draw, rectangle, rounded corners, minimum width=1.5cm, minimum height=0.7cm, align=center, thick, fill=orange!5},
+    arrow/.style={-latex, thick}
+]
+    % Upper Row: Router Pipeline
+    \node (input) [box, fill=gray!10] {Input Feature\\$z(x)_b \in \mathbb{R}^{D}$};
+    \node (pca) [box, right=of input] {PCA Projection\\$P \in \mathbb{R}^{D \times d}$};
+    \node (norm) [box, right=of pca] {Unit Sphere\\Normalization};
+    \node (router) [box, right=of norm, fill=green!5] {Shared Block Router\\$W_{group}^{(g)}, B_{group}^{(g)}$};
+    \node (sigmoid) [box, right=of router] {Sigmoid Gating\\$\alpha = \lambda_{max} \cdot \sigma(\cdot)$};
+    
+    % Connections for upper row
+    \draw [arrow] (input) -- (pca);
+    \draw [arrow] (pca) -- (norm);
+    \draw [arrow] (norm) -- (router);
+    \draw [arrow] (router) -- (sigmoid);
+    
+    % Lower Row: Weight Blending
+    \node (merge) [box, below=2.5cm of norm, fill=red!5, minimum width=3.0cm] {Weight Blending\\$W_{merged}^{(l)} = W_{base}^{(l)} + \sum_k \bar{\alpha}_k V_k^{(l)}$};
+    \node (expert1) [expert, left=1.0cm of merge, yshift=0.8cm] {Expert 1\\$V_1^{(l)}$};
+    \node (expert2) [expert, left=1.0cm of merge, yshift=-0.8cm] {Expert $K$\\$V_K^{(l)}$};
+    \node (base) [box, left=4.0cm of merge, fill=gray!10] {Pre-trained Base\\$W_{base}^{(l)}$};
+    
+    % Connections to merging node
+    \draw [arrow] (sigmoid.south) -- ++(0,-1.0) -| (merge.north);
+    \draw [arrow] (expert1.east) -- (merge.west);
+    \draw [arrow] (expert2.east) -- (merge.west);
+    \draw [arrow] (base.east) -- (merge.west);
+    
+    % Brackets / labels for block sharing
+    \draw [dashed, red, thick] ([yshift=0.3cm, xshift=-0.1cm]router.north west) rectangle ([yshift=-1.4cm, xshift=0.1cm]sigmoid.south east);
+    \node at ([yshift=0.5cm, xshift=1.0cm]router.north) [red, font=\small\bfseries] {Shared across $M$ Layers in Block $\mathcal{G}_g$};
+
+\end{tikzpicture}
+}
+\caption{\textbf{Architectural Schematic of BWS-Router.} Locally pooled input representations are compressed using an unsupervised PCA projection and normalized onto the unit sphere. A block-shared router (whose parameters are shared uniformly across blocks of size $M$) projects the states to logits, which are activated via independent Sigmoidal gating. The resulting coefficients are used to blend pre-computed task vectors with the base model weights at runtime.}
+\label{fig:schematic}
+\end{figure*}
+
+We present the architectural and mathematical formulation of the \textbf{Block-wise Weight-Sharing Router} (\textbf{BWS-Router}). Our approach targets the capacity-generalization trade-off in dynamic merging through a parameter-efficient block sharing scheme, which we prove mathematically mitigates layer-to-layer coefficient ruggedness.
+
+\subsection{System Setup and Feature Compression}
+Let the backbone model represent a deep neural network consisting of $L$ core layers indexed by $l \in \{1, \dots, L\}$. We are given a pre-trained base model with weights $\{W_{base}^{(l)}\}_{l=1}^L$ and $K$ specialized expert models fine-tuned from the same base model, represented by weights $\{W_k^{(l)}\}_{l=1}^L$ for $k \in \{1, \dots, K\}$. The task vector for expert $k$ at layer $l$ is defined as the weight-space parameter difference: $V_k^{(l)} = W_k^{(l)} - W_{base}^{(l)}$.
+
+To perform high-throughput sweeps and control noise scales under severe task conflict, we conduct our analysis within a specialized \textbf{Task-Conflict Model-Merging Sandbox}. For an input batch of size $B$, let $x_b$ denote the $b$-th sample in the batch for $b \in \{1, \dots, B\}$. We extract a globally pooled $D$-dimensional hidden representation $z(x)_b \in \mathbb{R}^D$ from the backbone (where $D = 192$).
+
+Unlike previous toy setups that utilize completely orthogonal subspaces (which artificially decouples experts and makes static uniform merging trivial), our sandbox explicitly models severe parameter and representation conflicts. Specifically, the representation space is partitioned into a \textbf{Shared Semantic Subspace ($D_{shared} = 128$)}, containing 10 class prototypes $P_0, \dots, P_9 \in \mathbb{R}^{128}$ shared across all $K=4$ tasks with label mappings permuted across tasks (prototype $P_c$ is mapped to target label $(c + k) \pmod{10}$ for task $k$ to create direct weight-space conflicts), and a \textbf{Task-Specific Style Subspace ($D_{style} = 64$)}, representing domain/style cues divided into $K$ independent 16-dimensional blocks where task $k$ has a strong style cue in its block and zero elsewhere. This allows the routing network to identify the task identity, while the main classification head must resolve the conflicting semantic representations.
+
+To prevent high-dimensional noise from destabilizing routing optimization, we compress $z(x)_b$ into a low-dimensional task subspace of dimension $d = K = 4$. We compute an unsupervised projection matrix $P \in \mathbb{R}^{D \times d}$ using Principal Component Analysis (PCA) computed on the calibration set. We then multiply the features by $P$ and project them onto the unit sphere to ensure magnitude invariance across heterogeneous input distributions:
+\begin{equation}
+    \psi(x)_b = \frac{P^T z(x)_b}{\|P^T z(x)_b\|_2 + \epsilon}
+\end{equation}
+where $\psi(x)_b \in \mathbb{R}^d$ is the normalized input state, and $\epsilon = 10^{-8}$ is a small constant for numerical stability.
+
+\subsection{Block-wise Parameter Sharing}
+Rather than learning independent routing parameters for every single layer $l$ (which scales parameters linearly as $L \cdot K \cdot (d + 1)$, leading to high parameter scaling excess and computational overhead) or forcing a single global router ($G=1$), we partition the $L$ layers into $G = L / M$ uniform block groups of size $M$:
+\begin{equation}
+    \mathcal{G}_g = \left\{ (g-1)M + 1, \dots, gM \right\} \quad \text{for } g \in \{1, \dots, G\}
+\end{equation}
+Within each block group $g$, the routing parameters are shared. We define the trainable group weights $W_{group}^{(g)} \in \mathbb{R}^{K \times d}$ and biases $B_{group}^{(g)} \in \mathbb{R}^K$. Thus, for any layer $l \in \mathcal{G}_g$, the dynamic merging coefficient for task $k$ and sample $b$ is computed using the shared block parameters:
+\begin{equation}
+    \alpha_{k, b}^{(l)} = \alpha_{k, b}^{(g)} = \lambda_{max} \times \sigma \left( \langle \psi(x)_b, W_{group, k}^{(g)} \rangle + B_{group, k}^{(g)} \right)
+\end{equation}
+where $\sigma(\cdot)$ is the independent Sigmoid gating function, $W_{group, k}^{(g)} \in \mathbb{R}^d$ is the $k$-th row vector of $W_{group}^{(g)}$ corresponding to task $k$, $B_{group, k}^{(g)} \in \mathbb{R}$ is the $k$-th scalar element of $B_{group}^{(g)}$ corresponding to task $k$, and $\lambda_{max}$ is the individual task scaling ceiling. 
+
+The choice of $\lambda_{max} = 0.3$ is informed by established weight-space merging and task arithmetic literature (e.g., \cite{task_arithmetic})\footnote{See, e.g., \cite{wortsman2022model} and \cite{task_arithmetic}, which demonstrate that scaling coefficients between $0.1$ and $0.5$ are typical and robust for task arithmetic and model ensembling across Vision Transformers and Large Language Models.}, where task vector scaling coefficients are typically bounded within the range of $[0.1, 0.5]$ to prevent weight destabilization. Specifically, if the sum of coefficients across multiple active task vectors exceeds $0.5$, the merged weight norms can grow excessively large, destabilizing the network's internal representation scale and degrading performance. Conversely, if $\lambda_{max}$ is too small (e.g., $<0.1$), the expert weights are under-scaled, preventing the model from incorporating specialized task features. Downstream practitioners can choose $\lambda_{max}$ by treating it as a hyperparameter swept over a small validation grid (e.g., $\{0.1, 0.2, 0.3, 0.4, 0.5\}$), or by formulating $\lambda_{max}$ as a learnable parameter initialized at $0.3$ and trained end-to-end via gradient descent.
+
+To compute the final static merging coefficients for batch deployment, we average the sample-wise coefficients across the batch of size $B$: $\bar{\alpha}_k^{(l)} = \bar{\alpha}_k^{(g)} = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}^{(g)}$. The dynamically merged weights at layer $l$ are then assembled as: $W_{merged}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k^{(l)} V_k^{(l)}$.
+
+\subsection{Mathematical Mitigation of Layer-to-Layer Ruggedness}
+In physical deep models, representations propagate sequentially through $L$ successive layers, where weight tensors at each layer are blended locally using local routing coefficients, and sequential feature transformations occur. However, within our controlled synthetic representation sandbox, we evaluate a virtual-layer weight-space ensembling scheme. Here, the $L$ layers are represented as a redundant dimension in a tensor, and the predicted gating coefficients are averaged across this dimension before being applied to blend the expert weights for the final classification head: $\bar{\alpha}_{avg} = \frac{1}{L} \sum_{l=1}^L \alpha^{(l)}$. 
+
+We explicitly clarify that the specific form of "layer-averaging collapse" (where independent routing networks across layers overfit on small calibration splits and regress to high-variance coefficients whose average collapses to a uniform task distribution) is a methodological artifact of this virtual-layer sandbox design. In a physical deep network, because routing coefficients are never averaged across layers, this literal averaging collapse does not occur. Instead, independent high-capacity unshared routers in physical deep deployments are more likely to suffer from "sequential feature distortion" or "cascading representation drift" as representations propagate sequentially. 
+
+Nonetheless, our simplified sandbox setup serves as an invaluable, highly tractable, and high-throughput proxy to mathematically model, isolate, and study optimization ruggedness and overparameterization variance. In both physical deep sequential propagation and virtual weight ensembling, high layer-to-layer variance in adjacent coefficients introduces high-variance optimization noise. We formalize this layer-to-layer coefficient discrepancy as \textbf{coefficient ruggedness}:
+\begin{equation}
+    R(\alpha_k) = \frac{1}{L-1} \sum_{l=1}^{L-1} \left( \bar{\alpha}_k^{(l+1)} - \bar{\alpha}_k^{(l)} \right)^2
+\end{equation}
+By sharing routing weights across layer blocks, BWS-Router directly restricts the degrees of freedom, reducing optimization ruggedness and stabilizing the ensembled weights.
+
+We now present a \textbf{rigorous mathematical model} of Expected Ruggedness that generalizes beyond idealized i.i.d. conditions by incorporating \textbf{depth-dependent variance scales} and \textbf{adjacent layer correlations}. Let the dynamic routing coefficient for expert $k$ at block group $g \in \{1, \dots, G\}$ be modeled as a random variable $\bar{\alpha}_k^{(g)}$ with variance $\sigma_g^2$. The variance scale $\sigma_g^2$ is depth-dependent, capturing the fact that shallow, generic layers (small $g$) have more constrained routing dynamics (smaller variance), while deep, semantic layers (large $g$) exhibit greater routing divergence and optimization variance (larger variance: $\sigma_g^2 \le \sigma_{g+1}^2$).
+
+Furthermore, let adjacent block-wise routing coefficients be correlated, with covariance $\operatorname{Cov}\left(\bar{\alpha}_k^{(g+1)}, \bar{\alpha}_k^{(g)}\right) = \rho_g \sigma_g \sigma_{g+1}$, where $\rho_g \in [-1, 1]$ represents the layer correlation coefficient. Under BWS-Router with block size $M$, layers within the same block group $g$ share identical routing weights, making their coefficient difference exactly zero: $\bar{\alpha}_k^{(l+1)} - \bar{\alpha}_k^{(l)} = 0$ for all $l, l+1 \in \mathcal{G}_g$. Out of the $L-1$ differences in the ruggedness summation, only the $G-1$ block transitions are non-zero. Substituting these into the expectation of $R(\alpha_k)$ yields the general Expected Ruggedness formula:
+\begin{align}
+    \mathbb{E}[R(\alpha_k)] &= \frac{1}{L-1} \sum_{g=1}^{G-1} \mathbb{E}\left[ \left( \bar{\alpha}_k^{(g+1)} - \bar{\alpha}_k^{(g)} \right)^2 \right] \\
+    &= \frac{1}{L-1} \sum_{g=1}^{G-1} \left( \sigma_{g+1}^2 + \sigma_g^2 - 2 \rho_g \sigma_g \sigma_{g+1} \right)
+\end{align}
+
+This generalized formulation provides profound theoretical insights:
+\begin{itemize}
+    \item \textbf{Impact of Block Sharing:} Since $G = L/M$, as block size $M$ increases, the number of active terms $G-1$ in the summation decreases monotonically. Under \textbf{Global Sharing ($M=L, G=1$)}, the expected ruggedness is exactly zero: $\mathbb{E}[R(\alpha_k)] = 0$. For intermediate block sharing ($1 < M < L$), block-wise parameter sharing structurally clips layer-to-layer weight blending fluctuations.
+    \item \textbf{Depth-Dependent Scaling:} Since variance $\sigma_g^2$ grows with depth, the expected ruggedness is heavily dominated by deeper transitions. This highlights why block sharing in deep semantic layers is highly critical for stabilizing dynamic ensembling.
+    \item \textbf{Adjacent Layer Correlation:} The covariance correction term $-2 \rho_g \sigma_g \sigma_{g+1}$ shows how sequential representation alignment scales expected ruggedness. In real deep sequential networks, representations are highly correlated, leading to positive correlation ($\rho_g > 0$) between adjacent routing gates, which naturally minimizes ruggedness. Conversely, negative correlation ($\rho_g < 0$) indicates rapid gating alternations, which amplify expected ruggedness.
+\end{itemize}
+Thus, block-wise sharing acts as a direct structural constraint that stabilizes adjacent weight blending and ensures smooth feature propagation. While this constraint acts as a regularizer in noisy or sub-optimal regimes, its most profound practical consequence in the optimal regime is \textbf{extreme parameter compression and efficiency}, matching unshared performance while reducing parameters by up to 91.7\%.
+
+This conceptual model resolves the capacity-ruggedness trade-off and highlights why BWS-Router provides superior parameter efficiency and optimization stability on small datasets.
+
+\subsection{Physical Sequential Weight-Space Model Merging}
+To validate BWS-Router under realistic sequential deep propagation and eliminate the sandbox's virtual-layer averaging, we formulate a physical sequential weight-space model-merging framework on multi-layer neural network experts. Let the experts be $K$ distinct $L$-layer sequential networks, where the weights and biases of layer $l \in \{1, \dots, L\}$ of expert $k \in \{1, \dots, K\}$ are $W_k^{(l)}$ and $B_k^{(l)}$. Rather than averaging predicted routing coefficients across layers, representation propagation is sequential. Specifically, for an input sample $b \in \{1, \dots, B\}$, let $h_b^{(l)}$ denote its hidden representation at layer $l$, where $h_b^{(0)} = x_b$ is the network input for sample $b$. At each layer $l \in \{1, \dots, L\}$:
+\begin{enumerate}
+    \item The hidden representation $h_b^{(l-1)}$ is projected via a layer-specific PCA preprojector to a $d$-dimensional space and normalized: $\psi_b^{(l)} = \text{PCA}^{(l)}(h_b^{(l-1)})$.
+    \item Gating coefficients $\alpha_{k, b}^{(l)} \in \mathbb{R}$ for expert $k$ are predicted based on the projection: $\alpha_{k, b}^{(l)} = \text{gating}(\psi_b^{(l)})_k$.
+    \item The blended weights $W_{merged, b}^{(l)}$ and biases $B_{merged, b}^{(l)}$ for sample $b$ are physically merged in parameter space at runtime:
+    \begin{equation}
+        W_{merged, b}^{(l)} = \sum_{k=1}^K \alpha_{k, b}^{(l)} W_k^{(l)}, \quad B_{merged, b}^{(l)} = \sum_{k=1}^K \alpha_{k, b}^{(l)} B_k^{(l)}
+    \end{equation}
+    \item The hidden representation of sample $b$ for the next layer is computed sequentially using these physically merged, sample-specific weights and biases:
+    \begin{equation}
+        h_b^{(l)} = \text{ReLU}\left( h_b^{(l-1)} W_{merged, b}^{(l) T} + B_{merged, b}^{(l)} \right)
+    \end{equation}
+\end{enumerate}
+In this framework, there is no virtual-layer averaging; each network input $x_b$ propagates sequentially through the physically merged sequential layer weights. By sharing routing weights across layers (block group size $M > 1$), BWS-Router restricts the optimization search space and prevents sequential representation drift, which we empirically evaluate across multi-layer MLP experts.
+
+\subsection{Calibration Optimization Objective}
+During the calibration phase, we optimize the shared router parameters $\{W_{group}^{(g)}, B_{group}^{(g)}\}_{g=1}^G$ on a tiny 64-sample calibration split. We minimize the standard Cross-Entropy loss augmented with $L_2$ weight decay regularization:
+\begin{equation}
+    \mathcal{L}_{total} = \mathcal{L}_{CE} + \lambda_{wd} \sum_{g=1}^G \sum_{k=1}^K \|W_{group, k}^{(g)}\|_2^2
+\end{equation}
+where $\lambda_{wd}$ is the regularization scale. Note that we explicitly exclude the gating biases $B_{group}^{(g)}$ from the $L_2$ regularization term. Pulled by weight decay toward $0.0$, the biases would counteract the benefits of our negative bias initialization (such as $B_{group} = -2.0$), which is designed to keep experts inactive in their default state and prevent catastrophic interference during early calibration. As we empirically demonstrate, applying $L_2$ regularization ($\lambda_{wd} \approx 10^{-2}$ or $10^{-3}$) to the weights prevents parameter scaling excess, preventing the routing weights from growing excessively large and stabilizing training under extremely scarce calibration data.

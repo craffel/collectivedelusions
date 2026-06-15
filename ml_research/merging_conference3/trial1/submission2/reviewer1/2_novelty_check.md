@@ -1,0 +1,21 @@
+# 2. Novelty and Originality Evaluation
+
+## Key Novel Aspects and 'Delta' from Prior Work
+Rather than proposing an overly engineered, complex new merging pipeline, this paper takes a highly refreshing, meta-scientific approach: it serves as a **methodological audit** that deconstructs an existing complex, dual-stage pipeline (SAIM). The 'delta' from prior work is characterized by several distinct contributions:
+1. **Systematic Component Decoupling:** Prior model merging literature often presents "synergistic" pipelines as unified, non-separable blocks. This work is the first to systematically cross-evaluate the optimization and merging axes (on a $5 \times 3$ grid) to isolate the true causal drivers of performance, demonstrating that post-hoc SVD is completely dependent on and secondary to training-stage flatness.
+2. **Boundary-Condition Mapping:** The paper identifies that SVD's utility is highly sensitive to the parameter-mixing parameter ($\lambda$). Under sequential parity ($\lambda=0$), SVD is shown to be mathematically redundant and actively harmful to un-mixed weights. It only acts as a beneficial regularizer when active mixing ($\lambda=0.2$) is engaged.
+3. **Formalization of Flatness-Pruning Synergy (Proposition 3.1):** While empirical papers have combined flatness with post-hoc modifications, this paper is the first to provide a formal mathematical proof showing that the loss increase from post-hoc weight consolidation (e.g., pruning in TIES or random dropping in DARE) is linearly bounded by the spectral norm of the Hessian matrix. This links optimizer-driven flatness to post-hoc structural robustness.
+4. **Exposure of Literature Discrepancies:** The paper identifies and exposes a fatal mathematical typo in SAIM's published SA-BCD formula, proving that the literal published formula leads to immediate divergence, and providing corrected baselines for the community.
+5. **PEFT Merging Generalization (LoRA-SAM):** It demonstrates that on low-rank manifolds, post-hoc spectral adjustments (SVD) are mathematically redundant. By introducing LoRA-SAM, it demonstrates that training-stage flatness can be achieved with negligible overhead (<2.5% wall-clock time and <1.5% VRAM), enabling a simple, zero-overhead, SVD-free merging pipeline for parameter-efficient adaptation.
+
+## Characterization of Novelty
+The novelty of this submission is **significant and highly valuable**, though it is primarily *analytical* and *methodological* rather than algorithmic:
+- **De-escalation of Pipeline Complexity:** In deep learning, there is a constant tendency to build increasingly complex, over-engineered architectures and post-processing steps. This work acts as a critical counterweight, proving that a simpler, more elegant, and unconstrained method (standard global SAM + naive Task Arithmetic) consistently outperforms or matches convoluted, coordinate-restricted pipelines. This represents a substantial conceptual contribution to the community.
+- **Strong Mathematical Grounding:** The proof of Proposition 3.1 is elegant and clean. It uses simple second-order Taylor expansion and the Rayleigh-Ritz theorem to connect the maximum eigenvalue of the Hessian (flatness) to the error tolerance of pruning. This adds high-signal theoretical depth to an empirical field.
+- **High Practical Utility:** By showing that coordinate-restricted optimizers like SA-BCD actually run *slower* on GPUs (+18.5% training time) due to sparse indexing and masking, the paper warns practitioners away from a common over-engineering trap, advocating instead for simple, globally-vectorized updates.
+
+## Positioning relative to Broader Literature
+The paper is excellently positioned in the context of recent literature on:
+- **Linear Mode Connectivity (LMC):** Directly building on the geometric insights that flat basins allow barrier-free interpolation.
+- **Advanced Model Merging (TIES, DARE):** Elevating these post-hoc sparsification methods from isolated empirical tricks to mathematically supported operators whose success is enabled by pre-merging flatness.
+- **PEFT Adaptation:** Aligning with the modern drift toward low-rank parameter-efficient fine-tuning (LoRA), and showing that SVD-free linear task arithmetic is fully sufficient when adapters are optimized for flatness.

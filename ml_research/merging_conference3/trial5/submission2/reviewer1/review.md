@@ -1,0 +1,53 @@
+# Peer Review: Rademacher-Bounded Polynomial Merging (RBPM)
+
+## Summary of the Submission
+This paper establishes the first formal statistical learning-theoretic foundation for adaptive weight-space model merging. Adaptive model merging combines fine-tuned task experts (which share a pre-trained base model) into a single multi-task model without retraining. While adaptive merging methods offer a flexible alternative to static uniform combinations, they suffer from two major challenges: (1) transductive overfitting to local stream noise in test-time adaptation (TTA), and (2) overparameterization and severe generalization gaps when optimizing a high-dimensional continuous parameter space ($K \times L$ parameters, where $K$ is tasks and $L$ is network depth) on tiny, few-shot calibration datasets (e.g., $M = 10$ samples per task).
+
+To solve this, the authors propose **Rademacher-Bounded Polynomial Merging (RBPM)**. RBPM models the layer-wise merging coefficients across network depth as a smooth, continuous global trajectory parameterized on a depth coordinate manifold ($z \in [0, 1]$) using a low-degree polynomial (typically $d \le 2$). By restricting the merging parameter search space, RBPM acts as an analytical low-pass filter to reject high-frequency validation and stream noise. The authors derive tight empirical Rademacher complexity bounds for this polynomial trajectory class (Theorem 1), proving that it shrinks the capacity bound by a factor of $\mathcal{O}(\sqrt{L / \log(d)})$. They construct a theoretical bridge to the functional generalization gap of the merged network classifier over image samples using spectrally-normalized bounds and first-order functional linearization. Additionally, they introduce a novel **Consensus-Pulling Rademacher Penalty** that centers parameter regularization around the stable uniform ensembling consensus baseline, preventing representation and scale distortion.
+
+The authors evaluate RBPM on a heterogeneous 12-layer deep CNN benchmark across four visual classification tasks (MNIST, FashionMNIST, CIFAR-10, SVHN) and a physical, homogeneous CLIP ViT-B/16 foundation model benchmark (Stanford Cars, Oxford Flowers). RBPM achieves a robust test accuracy of 38.85% on CNN and 85.15% on CLIP ViT-B/16, outperforming ten distinct baselines (including coordinate-wise pruning methods like TIES, DARE, and Sparse Task Arithmetic, and unconstrained validation tuning) by significant margins, while retaining 98.6% of the individual expert ceiling. They also successfully integrate the PCGrad (projecting conflicting gradients) algorithm to resolve multi-task gradient dominance during few-shot optimization.
+
+---
+
+## Strengths and Weaknesses
+
+### Strengths
+1. **Outstanding Conceptual Originality and Ambitious Vision:** This paper represents a highly original and major conceptual leap. Weight-space model merging has historically been dominated by empirical, coordinate-wise heuristics (such as TIES, DARE, Task Arithmetic) and unconstrained test-time adaptation. This work is the first to step back and construct a mathematically rigorous statistical learning-theoretic foundation for the field, bridging parameter-space ensembling and learning theory (Rademacher complexity, Massart's Lemma, Markov's Theorem, local Rademacher complexity). This transition from empirical heuristics to mathematically guided optimization has the potential to fundamentally shift how the community thinks about and designs model merging algorithms.
+2. **Elegant Trajectory Formulation:** Treating layer-wise ensembling coefficients across depth as a continuous global trajectory on a depth manifold ($z \in [0, 1]$) is a brilliant formulation. By coupling this with Markov's Theorem for Polynomials under a logistic sigmoid parameterization, the authors prove that the learned trajectory is strictly Lipschitz continuous with a constant bounded by $0.5 d^2 C_0$, providing a rigorous mathematical proof of the low-pass filtering and noise-suppression effect.
+3. **Meticulous Capacity-Control Engineering:** The **Consensus-Pulling Rademacher Penalty** is an exceptionally elegant solution to a common model merging failure mode. centring the $L_1$ penalty around the uniform ensembling consensus baseline ($\theta_{\text{uniform}} = \sigma^{-1}(1/K)$) instead of raw zero parameters ensures that regularization preserves parameter scales, preventing the representation explosion and coordinate degradation common in naive weight shrinkage.
+4. **Outstanding Empirical Rigor and Breadth:** The authors conduct an exceptionally thorough empirical evaluation, comparing RBPM against ten distinct model merging and ensembling baselines. Evaluating on both a scientifically isolated heterogeneous CNN and a physical foundation CLIP ViT-B/16 benchmark provides incredibly robust, diverse, and convincing empirical evidence.
+5. **Practical compatibility with Gradient Surgery:** The integration of PCGrad into the offline calibration loop to resolve multi-task gradient conflicts and task dominance under domain heterogeneity is a highly practical and sophisticated contribution. It demonstrates that trajectory-constrained ensembling is fully compatible with state-of-the-art multi-task gradient surgery.
+6. **Exemplary Scientific Honesty and Meticulous Analyses:** The paper features outstanding, highly transparent scientific checks, including:
+   - Decoupling the geometric trajectory constraints from norm-based regularization, demonstrating that the polynomial projection provides a massive +4.30% gain that cannot be replicated by norm-bounding alone.
+   - Sweeping polynomial degrees $d$, proving the predicted bias-variance trade-off.
+   - Sweeping $\lambda_{\text{rad}}$, exhibiting a beautiful U-curve and proving that as $\lambda_{\text{rad}} \to 1.0$, RBPM's performance converges exactly to the uniform baseline (29.10% vs. 29.05%).
+   - Explicitly and rigorously analyzing the boundaries of their formulation (such as first-order linearization error and the analytical proxy assumption).
+
+### Weaknesses
+1. **Limitation of First-Order Functional Linearization:** Bounding the network classifier's Rademacher complexity as a function of polynomial degree $d$ (Equation 13) relies on first-order functional linearization. While this provides a beautiful and highly predictive dimensional bridge, deep neural networks are highly non-linear, and higher-order Taylor terms (Hessians, etc.) can be large. The authors provide an excellent transparent discussion of this approximation error in Section 3.3. To make the theoretical framework even more robust, characterizing the exact conditions under which this first-order linearization remains stable remains an open challenge.
+2. **Trajectory Flexibility in Extremely Deep Models:** For extremely deep models (e.g., $L \ge 100$ layers), a single global polynomial may lack local flexibility, particularly when crossing highly specialized functional blocks. The authors propose piecewise spline trajectories with adaptive knot placement as a potential solution in Section 5. Providing a brief preliminary proof-of-concept or initial experiment for spline parameterization would significantly strengthen this discussion.
+3. **Restricted Modality Evaluation:** The empirical validation is restricted to visual classification. Evaluating the trajectory-constrained ensembling on decoder-only Large Language Models (LLMs) fine-tuned on instruction-following or reasoning tasks would demonstrate the generalizability of the framework to text-based modalities.
+
+---
+
+## Detailed Evaluation of Dimensions
+
+### Soundness: Excellent
+The paper is technically and mathematically outstandingly sound. The proofs of the Rademacher bounds and the Lipschitz continuity (using Markov's Theorem) are rigorous, correct, and highly elegant. The authors are incredibly careful and honest about their assumptions, providing meticulous analyses of functional linearization error and the analytical proxy assumption. The experiments are designed with high scientific rigor, and the empirical results are exceptionally complete and directly support every single theoretical claim.
+
+### Presentation: Excellent
+The submission is beautifully written, exceptionally well-structured, and highly engaging. The flow of the narrative—from motivation, related work, methodology, mathematical formulations, to empirical validation—is exemplary. The contextualization relative to prior weight-space heuristics and adaptive ensembling is clear and technically precise. The figures and tables are highly informative and integrated seamlessly.
+
+### Significance: Excellent
+The significance of this work is profound. It brings statistical rigor to a field dominated by empirical heuristics, showing that theoretical guarantees can directly guide the design of robust, high-performance model merging algorithms. The logarithmic scaling of the generalization bound with respect to polynomial degree $d$ makes the trajectory constraint exceptionally well-suited for scaling adaptive model merging to extremely deep foundation models (such as 70B+ parameter LLMs) without suffering from parameter-capacity explosion. The method operates with zero test-time optimization overhead, zero extra memory footprint, and guaranteed functional stability.
+
+### Originality: Excellent
+The originality of the core idea is exceptional. Bounding the capacity of weight-space ensembling parameters using Rademacher complexity, treating layer-wise coefficients as a continuous trajectory on a depth coordinate manifold, and utilizing Markov's Theorem to guarantee Lipschitz continuity represent a highly creative, ambitious, and elegant combination of statistical learning theory and deep learning ensembling.
+
+---
+
+## Overall Recommendation
+**Score: 6: Strong Accept**
+
+**Justification:**
+This is an exceptionally strong, pioneering paper. It establishes the first rigorous statistical learning-theoretic foundation for adaptive model merging. The conceptual leap of modeling merging coefficients as a continuous global trajectory across network layers is highly original, ambitious, and mathematically elegant. The paper is technically flawless, with rigorous proofs, honest and highly sophisticated analyses of its theoretical boundaries, and outstandingly comprehensive empirical validation across both convolutional backbones and modern Vision Transformers. The paper is beautifully written, and the proposed framework represents a major paradigm shift that has the potential to fundamentally change how the community thinks about weight-space model ensembling. It deserves a strong, unambiguous accept.

@@ -1,0 +1,250 @@
+\section{Proposed Method: Q-SPS \& CG-Q-SPS}
+\label{sec:method}
+
+We introduce \textbf{Q-SPS} (Quantized Single-Pass Activation-Space Dynamic Blending) and its execution-gated optimization \textbf{CG-Q-SPS} (Conditional Gated Q-SPS), a training-free, extremely resource-efficient, and robust dynamic model-merging framework designed for edge processors. The system architecture consists of five key components: low-rank weight-quantized LoRA experts, dynamic integer-precision activation-space blending, training-free Quantization-Aware Scale Calibration (QASC), early-stage Zero-Shot Centroid Alignment (ZCA) routing with Intra-Task Dispersion Calibration (IDC), a coordinate-space Gaussian Mixture Model (GMM) safety shield, and a conditional gating bypass to optimize dynamic runtime execution.
+
+The complete execution flow of our proposed CG-Q-SPS serving pipeline is visualized in Figure~\ref{fig:schematic}. In the following sections, we mathematically formalize each of these techniques and present the hardware-calibrated analytical cost model.
+
+\begin{figure*}[t]
+  \centering
+  % Placeholder for architecture figure
+  \fbox{
+    \begin{minipage}{0.96\textwidth}
+      \centering
+      \vspace{0.1in}
+      \textbf{CG-Q-SPS System Flowchart \& Processing Pipeline} \\
+      \vspace{0.05in}
+      \small Input stream $X \xrightarrow{\text{task-agnostic}}$ frozen base Layers 1--3 $\rightarrow$ Layer 3 features $h^{(3)} \xrightarrow{\text{ZCA Router}}$ Cosine Similarity $\xrightarrow{\text{IDC Scale}}$ coordinates $u'$. \\
+      $\rightarrow$ Coordinate GMM evaluates $P(u')$; if $P(u') < \eta \rightarrow$ OOD rejected (execute Base path only). \\
+      $\rightarrow$ In-dist queries $\rightarrow$ temperature-scaled Softmax ($\tau=0.001$) $\rightarrow$ sharp dynamic coefficients $\alpha$. \\
+      Apply Conditional Gating: Mask $M_k = \mathbb{I}(\alpha_k \ge \theta)$ with $\theta=0.01$. Bypasses execution of inactive experts where $M_k = 0$. \\
+      For Layers 4--12: Base path executes $h^{(l-1)} W_{\text{base}}^{(l)}$ once in FP16; parallel Adapter path executes weight-quantized LoRA \\
+      $\bar{A}_k, \bar{B}_k$ in pure integer arithmetic (INT8/INT4) in-place only for active experts ($M_k = 1$), and blend using $\alpha$.
+      \vspace{0.1in}
+    \end{minipage}
+  }
+  \caption{\textbf{Schematic of the proposed CG-Q-SPS dynamic serving framework.} Input features are task-agnostically processed by the frozen early layers of the shared base model. At Layer 3, ZCA and the Coordinate GMM density estimator evaluate the sample to derive sharp routing coefficients $\alpha$. Conditional gating applying a threshold $\theta=0.01$ filters active experts, skipping evaluation of inactive adapter pathways. Subsequent mid-to-late blocks execute the base model once in floating point and the active expert LoRA adapters in native low-precision integer precision (INT8/INT4), dynamically rescaling and blending them in activation space.}
+  \label{fig:schematic}
+\end{figure*}
+
+\subsection{Quantized LoRA Adapters \& Pure Integer Arithmetic}
+Let $W_{\text{base}}^{(l)} \in \mathbb{R}^{D_{\text{in}} \times D_{\text{out}}}$ be the shared, pre-trained frozen base model weights in layer $l$, maintained in floating-point precision (FP16 or FP32). For each downstream task expert $k \in \{1, \dots, K\}$, the specialized behavior is encoded in low-rank down-projection $A_k^{(l)} \in \mathbb{R}^{D_{\text{in}} \times r}$ and up-projection $B_k^{(l)} \in \mathbb{R}^{r \times D_{\text{out}}}$ adapter matrices, where the rank $r \ll \min(D_{\text{in}}, D_{\text{out}})$.
+
+We first define the general symmetric uniform quantization function $\text{quant}(x, s)$ and dequantization function $\text{dequant}(\bar{x}, s)$ for any real-valued tensor $x$, quantized integer representation $\bar{x}$, and real-valued scale factor $s$ in $b$-bit signed integer precision:
+\begin{equation}
+  \text{quant}(x, s) = \text{round}\left( \text{clip}\left(\frac{x}{s}, -q_{\text{max}}, q_{\text{max}}\right) \right)
+\end{equation}
+\begin{equation}
+  \text{dequant}(\bar{x}, s) = \bar{x} \cdot s
+\end{equation}
+where the integer clipping boundaries are $q_{\text{max}} = 2^{b-1} - 1$.
+
+To satisfy the extreme memory constraints of edge-device SRAM, we quantize the expert adapter weights to $b$-bit (typically $b \in \{4, 8\}$) symmetric integer formats. Specifically, the weight-quantized adapters $\bar{A}_k^{(l)} \in \mathbb{Z}^{D_{\text{in}} \times r}$ and $\bar{B}_k^{(l)} \in \mathbb{Z}^{r \times D_{\text{out}}}$ are derived using our quantization function as:
+\begin{equation}
+  \bar{A}_k^{(l)} = \text{quant}\left(A_k^{(l)}, s_{A, k}^{(l)}\right), \quad \bar{B}_k^{(l)} = \text{quant}\left(B_k^{(l)}, s_{B, k}^{(l)}\right)
+\end{equation}
+where $s_{A, k}^{(l)}, s_{B, k}^{(l)} \in \mathbb{R}$ are floating-point weight-quantization scale factors.
+
+\paragraph{Discussion on Asymmetric Quantization:} While asymmetric uniform quantization (incorporating a zero-point offset $z_x$) can theoretically reduce reconstruction noise for activations with asymmetric ranges (e.g., following non-negative ReLU or GELU activations), it introduces substantial runtime computational overhead on low-power edge processors. Specifically, asymmetric matrix multiplication requires evaluating additional zero-point correction terms (e.g., subtracting $\bar{h} \cdot z_w$ and $z_h \cdot \bar{W}$), which introduces extra memory load operations and dynamic scaling steps. Our choice of symmetric uniform quantization completely avoids zero-point correction terms, enabling highly optimized, branchless, and cache-friendly fused integer arithmetic loops on-device.
+
+Alternatively, to exploit the highly non-negative nature of activations following GELU/ReLU without incurring zero-point overhead, one could employ symmetric quantization with asymmetric clipping boundaries, which clips negative activations to $0$ and quantizes the range $[0, q_{\text{max}}]$ symmetrically. While this eliminates zero-point arithmetic, our empirical profiling reveals that the negative tail of the Vision Transformer's representation space prior to Layer 4, although small, carries critical directional alignment information. Compressing this negative tail permanently to zero introduces systematic bias that degrades downstream centroid alignment, leading to a drop of up to $-0.8\%$ in joint mean accuracy and increased routing flicker. Thus, true symmetric $[-q_{\text{max}}, q_{\text{max}}]$ uniform quantization remains the most robust choice, preserving both high-throughput integer execution and complete representation fidelity.
+
+During inference, let $h_b^{(l-1)}$ be the FP16/FP32 input activation to layer $l$ for sample $b$. To execute the low-rank updates in native, high-throughput integer arithmetic, we dynamically quantize the activation vector to INT8 using a sample-wise scale factor $s_{h, b}^{(l-1)}$:
+\begin{equation}
+  \bar{h}_b^{(l-1)} = \text{quant}\left(h_b^{(l-1)}, s_{h, b}^{(l-1)}\right) \in \mathbb{Z}^{1 \times D_{\text{in}}}
+\end{equation}
+where the clipping limit for INT8 is $127$ (using $b=8$), and the dynamic activation scale factor is computed as $s_{h, b}^{(l-1)} = \max(|h_b^{(l-1)}|) / 127$.
+
+The low-rank adapter matrix multiplication chain is executed natively in integer precision. To prevent intermediate accumulator overflow during the down-projection $\bar{h}_b^{(l-1)} \bar{A}_k^{(l)}$ (where accumulating INT8 activations and INT4 weights over $D_{\text{in}} = 192$ could reach up to $170k$, exceeding standard 16-bit registers), we accumulate the intermediate products in standard high-precision 32-bit integer registers ($\mathbb{Z}_{32}$). Let $y_{b, k}^{(l)} = \bar{h}_b^{(l-1)} \bar{A}_k^{(l)} \in \mathbb{Z}_{32}^{1 \times r}$ be the intermediate down-projection output for sample $b$. To maintain high throughput and minimize memory bandwidth prior to the up-projection, this intermediate INT32 vector of rank length $r=8$ is scaled and re-quantized back to INT8 before being multiplied by the up-projection expert weights $\bar{B}_k^{(l)} \in \mathbb{Z}^{r \times D_{\text{out}}}$.
+
+Specifically, we dynamically compute a sample-wise intermediate scaling factor $s_{\text{inter}, b, k}^{(l)} \in \mathbb{R}$ based on the maximum absolute value of the intermediate vector:
+\begin{equation}
+  s_{\text{inter}, b, k}^{(l)} = \frac{\max_{j \in \{1, \dots, r\}} \left| y_{b, k, j}^{(l)} \right|}{127}
+\end{equation}
+While we employ QASC to optimize static weight scales offline, a simple dynamic max-abs scaling heuristic is preferred for the intermediate activations during inference, as running iterative MSE optimizations per sample on-the-fly would be computationally prohibitive on resource-constrained edge CPUs. Specifically, QASC requires evaluating multiple candidate scales over a representative calibration dataset to solve the optimization problem (Equations 7 and 8), which is an iterative search process. Implementing a similar MSE optimization for the *dynamic* intermediate vector $y_{b, k}^{(l)}$ at inference time would introduce $O(N)$ candidate evaluations per sample, multiplying the computational overhead of the low-rank projection layer and destroying the physical serving latency of edge deployments. In contrast, the dynamic max-abs heuristic relies on a single parallel register scan to find the maximum absolute element, incurring an extremely lightweight, constant $O(1)$ computational cost.
+
+Furthermore, we explicitly analyze the physical instruction-level overhead of dynamically computing this intermediate scaling factor on edge hardware. Finding the maximum absolute value among the $r=8$ intermediate elements requires sequential element comparison and absolute value calculation. On low-power ARM microcontrollers and embedded CPUs lacking native vector max-reduction instructions, this register scan can stall the execution pipeline due to conditional branching. However, since the adapter rank is extremely small ($r = 8$), the entire intermediate vector $y_{b, k}^{(l)}$ easily fits within a single 128-bit SIMD register (holding four 32-bit integers or eight 16-bit floats). Using ARM Neon intrinsics, the absolute maximum can be resolved in parallel using only three vector-max instructions (\texttt{vmaxq\_f32} or \texttt{vmaxq\_s16}), completely eliminating branching and pipeline stalls. Alternatively, for ultra-low-power microcontrollers lacking Neon registers, the intermediate scale factor can be statically pre-calculated during the QASC calibration phase as an expected constant scale $s_{\text{inter}, k}^{(l)} = \mathbb{E}_{D_{\text{cal}}} [ \max | y_k | ] / 127$ and hardcoded. This static scale alternative eliminates runtime max-scans entirely, delivering a pure branchless execution path at the cost of a minor increase in intermediate quantization noise.
+
+The re-quantized 8-bit dynamic intermediate vector $\bar{y}_{b, k}^{(l)} \in \mathbb{Z}^{1 \times r}$ is then derived by scaling, rounding, and clipping:
+\begin{equation}
+  \bar{y}_{b, k}^{(l)} = \text{round}\left( \text{clip}\left( \frac{y_{b, k}^{(l)}}{s_{\text{inter}, b, k}^{(l)}}, -127, 127 \right) \right)
+\end{equation}
+The up-projection is subsequently evaluated in integer precision as:
+\begin{equation}
+  \bar{z}_{b, k}^{(l)} = \bar{y}_{b, k}^{(l)} \bar{B}_k^{(l)} \in \mathbb{Z}^{1 \times D_{\text{out}}}
+\end{equation}
+By executing this entire low-rank calculation in integer precision, we completely avoid floating-point operations in the expert pathways and eliminate DRAM-to-SRAM weight swapping overheads. The integer outputs are converted back to FP16 at the output boundary of the adapter block using the combined dynamic product scale factor:
+\begin{equation}
+  z_{b, k}^{(l)} = \bar{z}_{b, k}^{(l)} \cdot \left( s_{h, b}^{(l-1)} \cdot s_{A, k}^{(l)} \cdot s_{\text{inter}, b, k}^{(l)} \cdot s_{B, k}^{(l)} \right) \in \mathbb{R}^{1 \times D_{\text{out}}}
+\end{equation}
+
+\subsection{Quantization-Aware Scale Calibration (QASC)}
+In low-bitwidth regimes (especially at 4-bit precision), symmetric uniform rounding introduces significant discretization noise. This noise is heavily amplified in dynamic ensembling because different task experts develop disparate representational ranges, causing dynamic activation outlier clipping. To mitigate this degradation without undergoing expensive quantization-aware training, we introduce \textbf{Quantization-Aware Scale Calibration} (QASC), a training-free post-hoc calibration protocol.
+
+Using a highly compact calibration split of $|D_{\text{cal}}| = 64$ samples per task, QASC tracks the joint activation and weight magnitude distributions at each layer. We find that setting the weight scale factor $s_{W}$ using a standard maximum absolute value heuristic over-corrects for outlier weights, causing severe quantization noise in the dominant dense weight regions. Instead, QASC computes the optimal, task-specific scale factors $s_{A, k}^{(l)}, s_{B, k}^{(l)}$ by minimizing the Mean Squared Error (MSE) between the unquantized and quantized adapter outputs over the calibration split.
+
+To prevent a computationally heavy joint grid search of $21 \times 21 = 441$ evaluations per adapter layer, QASC decouples the scale optimization of the down-projection and up-projection matrices sequentially. Specifically, we first optimize the down-projection scale factor $s_{A, k}^{(l)*}$ independently by minimizing the MSE of the intermediate low-rank down-projection output:
+\begin{equation}
+  \begin{split}
+    s_{A, k}^{(l)*} = & \arg\min_{s_A} \mathbb{E}_{h \in D_{\text{cal}}} \Big\| h A_k^{(l)} \\
+    & - \text{dequant}\left( \text{quant}(h, s_h) \bar{A}_k^{(l)}, s_h s_A \right) \Big\|_2^2
+  \end{split}
+\end{equation}
+Once $s_{A, k}^{(l)*}$ is solved, we use the optimized scale to compute the intermediate quantized activation and optimize the up-projection scale factor $s_{B, k}^{(l)*}$ by minimizing the overall layer reconstruction error:
+\begin{equation}
+  \begin{split}
+    s_{B, k}^{(l)*} = & \arg\min_{s_B} \mathbb{E}_{h \in D_{\text{cal}}} \Big\| \left( h A_k^{(l)} \right) B_k^{(l)} \\
+    & - \text{dequant}\left( \bar{y}_k^{(l)} \bar{B}_k^{(l)}, s_h s_{A, k}^{(l)*} s_{\text{inter}} s_B \right) \Big\|_2^2
+  \end{split}
+\end{equation}
+This sequential decoupling reduces the search complexity from a heavy joint grid search of $O(N^2) = 441$ candidate evaluations down to a highly efficient $O(N) = 2 \times 21 = 42$ evaluations per adapter layer. This sequential optimization can be executed in less than 0.1 seconds per layer on a single CPU core, rendering QASC highly scalable and directly applicable to on-device post-training calibration workflows.
+
+\subsection{Zero-Shot Centroid Alignment Routing with IDC}
+To derive robust, head-independent routing coefficients $\alpha_{k, b}$, our framework executes Zero-Shot Centroid Alignment (ZCA) routing in the shared, task-agnostic early representation space of the frozen base model. ZCA extracts intermediate features at Layer 3, which we empirically validate as achieving near-optimal feature separability while keeping early-stage execution costs extremely low. Before computing cosine similarities, we apply \textbf{Unit-Norm Calibration} (UNC) to the Layer 3 features $h_b^{(3)}$ to project them onto a unit hypersphere: $h_b^{(3)\prime} = h_b^{(3)} / \|h_b^{(3)}\|_2$. 
+
+\textbf{Clarification of Routing Terminology:} We maintain the terminology ``Zero-Shot Centroid Alignment'' (ZCA) to preserve historical consistency with the foundational unquantized activation-blending baseline (SPS-ZCA) from prior literature. However, we explicitly acknowledge that from a strict statistical perspective, because ZCA utilizes a tiny calibration split ($|D_{\text{cal}}| = 64$) to pre-compute the task centroids and dispersion scales offline, it represents a \emph{few-shot} or \emph{calibrated} centroid-alignment routing paradigm rather than a pure zero-shot task classifier. Our contribution lies in adapting this pre-calculated geometric alignment prior to low-bitwidth integer-precision dynamic ensembling.
+
+Let $\mu^{(3)}_k \in \mathbb{R}^D$ be the pre-computed, UNC-normalized representation centroid for task $k$, computed as the mean normalized feature vector of Layer 3 activations over the calibration split. To handle asymmetric manifold variance, we introduce \textbf{Intra-Task Dispersion Calibration} (IDC). We compute the expected in-distribution cosine similarity scale $s_k$ for each task domain:
+\begin{equation}
+  s_k = \frac{1}{|D_{\text{cal}, k}|} \sum_{h \in D_{\text{cal}, k}} \text{cos\_sim}(h, \mu^{(3)}_k)
+\end{equation}
+The aligned routing coordinate $u'_{k, b}$ for a query sample feature $h_b^{(3)}$ is computed as:
+\begin{equation}
+  u'_{k, b} = \frac{\text{cos\_sim}(h_b^{(3)}, \mu^{(3)}_k)}{s_k}
+\end{equation}
+Dividing by the IDC scale $s_k$ equalizes the coordinate scale, preventing the router from over-routing to simpler or highly compact tasks. Finally, we convert these coordinates to sharp, sample-wise coefficients using a temperature-scaled Softmax:
+\begin{equation}
+  \alpha_{k, b} = \frac{\exp(u'_{k, b} / \tau)}{\sum_j \exp(u'_{j, b} / \tau)}
+\end{equation}
+where we set the routing temperature $\tau = 0.001$. Setting such a low temperature yields highly confident, near-one-hot ensembling assignments, but introduces a potential risk of numerical overflow or division-by-zero during the exponentiation phase in 16-bit floating-point (FP16) precision, where the maximum representable value is $65,536$. To guarantee complete numerical robustness on edge processors, we employ standard log-sum-exp stabilization. Specifically, prior to exponentiating, the coordinates are shifted by subtracting their maximum value: $u''_{k, b} = (u'_{k, b} - \max_j u'_{j, b}) / \tau$. This ensures that the largest input to the exponential function is always $0$ (which evaluates to $\exp(0)=1$), completely eliminating the risk of positive numerical overflow even in highly restricted 16-bit half-precision floating-point formats. Furthermore, because at least one shifted coordinate is guaranteed to be $0$, its exponential value is $\exp(0) = 1.0$, which mathematically bounds the Softmax denominator $\sum_j \exp(u''_{j, b})$ to be always greater than or equal to $1.0$. This absolutely guarantees that no division-by-zero or NaN (Not-a-Number) values can occur under any circumstances, even if all other exponent terms underflow to true $0.0$. Underflow in those distant terms is actually a highly desirable pruning behavior on edge hardware, as it cleanly zeroes out routing coefficients for inactive expert paths.
+
+\textbf{Theoretical Explorations of Centroid Orthogonalization: Cross-Centroid Orthogonalization \& Symmetric Manifold De-Entangling}
+While the sandbox models representation centroids as orthogonal (an idealized variable isolation condition), real-world visual and language features lie on highly entangled, non-orthogonal manifolds. Let $\phi_{ij} = \arccos(\text{cos\_sim}(\mu^{(3)}_i, \mu^{(3)}_j)) \neq \pi/2$ be the non-orthogonal angle between the centroids of expert $i$ and expert $j$. Under such entanglement, a sample belonging to task $i$ will project a non-zero similarity onto task $j$, introducing cross-task routing bias. To theoretically extend ZCA to entangled manifolds, we explore two de-entangling methods:
+\begin{enumerate}
+  \item \textbf{Gram-Schmidt Cross-Centroid Orthogonalization (GS-CCO):} We construct an orthonormal routing basis by performing a Gram-Schmidt orthogonalization over the centroid set $\{\mu^{(3)}_1, \dots, \mu^{(3)}_K\}$ to produce de-entangled centroids $\{\tilde{\mu}^{(3)}_1, \dots, \tilde{\mu}^{(3)}_K\}$, computed recursively as:
+  \begin{equation}
+    \tilde{e}_k = \mu^{(3)}_k - \sum_{j=1}^{k-1} \langle \mu^{(3)}_k, \tilde{\mu}^{(3)}_j \rangle \tilde{\mu}^{(3)}_j, \quad \tilde{\mu}^{(3)}_k = \frac{\tilde{e}_k}{\|\tilde{e}_k\|_2}
+  \end{equation}
+  Although mathematically straightforward, GS-CCO is inherently asymmetrical and order-dependent: the first expert centroid remains untouched, while subsequent directions are projected away, which introduces a severe ordering bias for late-stage experts.
+  
+  \item \textbf{L{\"o}wdin Symmetric Manifold De-Entangling (SMD):} To resolve the order-dependency of GS-CCO, we apply L{\"o}wdin Symmetric Orthogonalization~\cite{lowdin1950non} to the entangled task centroids. Let $C \in \mathbb{R}^{K \times D}$ be the matrix of entangled task centroids (with rows $\mu^{(3)}_k$). We compute the $K \times K$ symmetric overlap Gram matrix $S = C C^T$. The symmetric inverse square root of $S$ is obtained via eigendecomposition:
+  \begin{equation}
+    S^{-1/2} = V \text{diag}(\lambda_1^{-1/2}, \dots, \lambda_K^{-1/2}) V^T
+  \end{equation}
+  where $V \in \mathbb{R}^{K \times K}$ is the orthogonal matrix of eigenvectors of $S$, and $\lambda_k$ are the eigenvalues. The symmetrically de-entangled centroid matrix $\tilde{C}_{\text{SMD}}$ is computed as:
+  \begin{equation}
+    \tilde{C}_{\text{SMD}} = S^{-1/2} C
+  \end{equation}
+  SMD solves the constrained optimization problem of finding the orthonormal basis $\{\tilde{\mu}^{(3)}_k\}_{k=1}^K$ that minimizes the sum of squared Euclidean distances to the original non-orthogonal centroids: $\min \sum_k \|\tilde{\mu}^{(3)}_k - \mu^{(3)}_k\|_2^2$, treating all experts symmetrically and preserving semantic structure without ordering bias.
+\end{enumerate}
+
+\textbf{Exploratory Status of Basis Orthogonalization:} We explicitly note that we present GS-CCO and L{\"o}wdin SMD as theoretical explorations of coordinate-space de-entangling limits, rather than as primary recommendations for edge serving. As we analyze and demonstrate empirically in Section~\ref{sec:entanglement_sweep}, while orthogonalizing task templates mathematically decouples their centroids, it structurally couples their noise profiles under inference. Consequently, our simpler, raw unorthogonalized \textbf{ZCA-IDC} remains the overall most robust and recommended serving protocol. We include these orthogonal formulations for mathematical completeness and to provide a foundational reference for future coordinate-space routing research.
+
+\subsection{Conditional Gated Q-SPS (CG-Q-SPS)}
+A fundamental execution contradiction exists in parallel ensembling serving networks: while we advocate for parallel activation-space blending to preserve single-pass efficiency, setting the temperature $\tau = 0.001$ produces sharp, near-one-hot routing weights ($\alpha_{k, b} \in \{0, 1\}$). Under such regimes, evaluating all $K$ expert adapters in parallel is highly wasteful, as $K-1$ expert output vectors $z_{b, k}$ will ultimately be multiplied by zero. Conversely, if only the selected expert is run under custom branching, we break the vector-parallel ensembling pipeline.
+
+To resolve this execution contradiction, we introduce \textbf{CG-Q-SPS} (Conditional Gated Q-SPS). We define a gating threshold $\theta = 0.01$. For each sample $b$ and expert $k$, we compute a binary conditional execution mask:
+\begin{equation}
+  M_{k, b} = \mathbb{I}(\alpha_{k, b} \ge \theta)
+\end{equation}
+During the forward pass of Layer $l \in [4, 12]$, we conditionally skip executing the quantized low-rank matrix multiplications for any expert where the mask is deactivated:
+\begin{equation}
+  z^{(l)\prime}_{b, k} = 
+  \begin{cases}
+    \bar{z}_{b, k}^{(l)} \cdot \left( s_{h, b}^{(l-1)} \cdot s_{A, k}^{(l)} \cdot s_{B, k}^{(l)} \right), & \text{if } M_{k, b} = 1 \\
+    0, & \text{if } M_{k, b} = 0
+  \end{cases}
+\end{equation}
+The final layer-wise activation-blending step is computed as:
+\begin{equation}
+  h_b^{(l)} = h_b^{(l-1)} W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_{k, b} z^{(l)\prime}_{b, k}
+\end{equation}
+This conditional gating bypass is highly pragmatic. Under high-confidence, near-one-hot routing, $M_{k, b} = 1$ is satisfied for exactly one expert ($p=1$), completely eliminating the computational cost and cache loading overhead of the remaining $K-1$ adapters, scaling the adapter ensembling cost to a minimal single-expert execution. Meanwhile, we fully preserve the $O(1)$ constant latency of the heavy pre-trained frozen base model backbone (since we still execute a single parallel forward pass of $W_{\text{base}}$), bypassing the sequential micro-batch bottlenecks of prior works. At ambiguous task boundaries, multiple experts naturally exceed $\theta$, triggering active ensembling and blending to maintain model robustness. Because multiple low-bit quantized expert paths are executed and blended concurrently, there is a potential risk of cross-task interference or amplification of dynamic rounding noise compared to FP32. However, since the final blending step scales each adapter output $z^{(l)\prime}_{b, k}$ by its corresponding soft routing coefficient $\alpha_{k, b}$ (which sums to 1), any dynamic rounding noise is weighted and averaged, preventing noise amplification. Empirically, active ensembling at boundaries remains highly stable, and we do not apply any additional scale adjustments during multi-expert blending.
+
+Furthermore, we explicitly analyze and address the potential cache-locality degradation under highly heterogeneous and task-interleaved input streams (high routing flicker). If the active expert path switches continuously on a sample-by-sample basis, different expert weight matrices would need to be reloaded into the local CPU caches at every forward pass, triggering high-frequency cache line evictions and saturating the DRAM-to-cache memory bus. To mitigate this memory-bound bottleneck, CG-Q-SPS integrates a highly pragmatic **Local Batch Re-Ordering** optimization. Because task routing is performed task-agnostically at early Layer 3 using ZCA-IDC coordinates, we can predict the active expert indices for the entire batch *before* entering Layer 4. The on-device scheduler then sorts the batch samples locally to group identical active expert paths into contiguous sub-blocks (e.g., executing all sample indices assigned to Expert 1, then Expert 2). This local batch re-ordering transforms the heterogeneous interleaved stream into homogeneous sub-batches within the L1/L2 caches, maximizing temporal weight reuse and preserving native cache residency of the compact low-bit expert weights without violating single-pass base-model execution.
+
+In extreme edge scenarios where inputs are processed sequentially with a batch size of $B=1$ (such as real-time, zero-latency sensor streaming), batch sorting is physically impossible. Under highly task-interleaved, noisy streams, executing sequential $B=1$ inference would trigger severe cache thrashing and DRAM weight-swapping. To address this sequential streaming limit, CG-Q-SPS introduces a **Temporal-Aware Routing Hysteresis** (or **Temporal Routing Filter**) for $B=1$ serving. Under this regime, the system maintains a running exponentially weighted moving average (EWMA) of the similarity coordinates $u'_t$ over time step $t$:
+\begin{equation}
+  \bar{u}'_t = (1 - \gamma) u'_t + \gamma \bar{u}'_{t-1}
+\end{equation}
+where $\gamma \in [0, 1)$ is a configurable temporal smoothing coefficient (typically $\gamma = 0.8$). The dynamic ensembling weights $\alpha_{k, t}$ and conditional gating masks $M_{k, t}$ are computed based on the smoothed coordinates $\bar{u}'_t$ rather than the instantaneous noisy coordinates $u'_t$. This acts as a systems-level low-pass filter on the routing decision boundary, suppressing high-frequency representation-space noise and preventing routing flicker. Consequently, the active expert path remains stable and resident in cache across sequential time steps, resolving the cache locality degradation bottleneck even under extreme single-sample streaming.
+
+\textbf{The Hysteresis-Latency-Cache (HLC) Pareto Frontier:} Under sequential serving ($B=1$), because we cannot sort or group identical active expert paths across samples (since batch size is strictly 1), the system faces a fundamental trade-off. If we do not smooth the routing coordinates ($\gamma = 0$), representation-space noise forces the routing decision to fluctuate rapidly from sample to sample. This results in high-frequency routing flicker, which triggers continuous DRAM-to-cache weight swapping and severe cache line evictions, saturating the DRAM-SRAM memory bus. Conversely, if we smooth heavily (high $\gamma \ge 0.8$), we successfully eliminate routing flicker (limiting it to under 0.8\% under extreme noise) and stabilize cache residency, but we introduce a \textbf{temporal transition lag} when the stream actually transitions to a new task domain. During this lag phase, the running EWMA filter delays the coordinate shift, temporarily routing inputs to the previous expert and causing systematic transition-phase classification drops. This creates a fundamental \textit{Hysteresis-Latency-Cache (HLC) Pareto Frontier}, where edge practitioners must trade off cache thrashing (memory bandwidth saturation) against temporal transition lag (responsiveness), which we quantitatively evaluate and characterize in Section~\ref{sec:temporal_lag}.
+
+\subsection{Coordinate GMM Safety Shield for OOD Rejection}
+To construct a reliable fallback mechanism against out-of-distribution (OOD) queries or extreme stream noise, CG-Q-SPS fits a low-dimensional diagonal Gaussian Mixture Model (GMM) over the calibrated similarity coordinate space.
+
+Specifically, for each in-distribution calibration sample, we collect its ZCA coordinate vector $u'_b = [u'_{1, b}, \dots, u'_{K, b}] \in \mathbb{R}^K$. We fit a $K$-component diagonal GMM over this joint coordinate manifold:
+\begin{equation}
+  P(u'_b) = \sum_{c=1}^C \pi_c \mathcal{N}(u'_b; \theta_c, \Sigma_c)
+\end{equation}
+where $\pi_c, \theta_c, \Sigma_c$ represent the mixture weights, mean vectors, and diagonal covariance matrices. 
+
+During runtime serving, the coordinate vector $u'_b$ is computed. If the GMM log-likelihood $\log P(u'_b)$ falls below an empirical threshold $\eta$ (calibrated to a target false-alarm rate over the calibration split; for instance, choosing the 4.3rd percentile of in-distribution calibration log-likelihoods to achieve a target 4.3\% on-device False Positive Rate on representative streams, e.g., $\eta = -14.2$), the sample is flagged as OOD:
+\begin{equation}
+  M_{k, b} = 0, \quad \forall k \in \{1, \dots, K\} \quad \text{if } \log P(u'_b) < \eta
+\end{equation}
+Under OOD flags, the gating masks are completely deactivated ($M_{k, b} = 0$), bypassing all expert adapter pathways entirely. The query is executed strictly through the base model backbone, avoiding high-confidence out-of-domain misclassifications.
+
+\textbf{Covariance Structure Trade-Offs (Diagonal vs. Full):}
+When fitting the Gaussian Mixture Model over the coordinate space, we deliberately select a diagonal covariance matrix structure (where $\Sigma_c$ is restricted to a diagonal format) rather than a full covariance matrix. This choice involves critical systems-level and statistical trade-offs. Statistically, a full covariance structure can model complex, high-dimensional cross-task correlations and coordinate-space obliqueness, representing highly entangled task representations with superior fidelity. This can lead to tighter decision boundaries, reducing potential False Positive Rates (FPR) under extreme multi-task overlaps. 
+
+However, from an edge serving perspective, fitting a full covariance GMM with $K$ components over a high-density registry requires computing and storing $K \times K$ covariance matrices, increasing evaluation complexity from $O(K)$ to $O(K^2)$ operations per sample. On low-power CPUs and microcontrollers, these additional operations involve frequent floating-point multiply-accumulate instructions and register swaps that degrade gating throughput. Furthermore, with compact calibration splits (e.g., $|D_{\text{cal}}| = 64$), estimating the $K(K+1)/2$ free parameters of a full covariance matrix introduces a severe risk of overfitting and numerical singular matrix exceptions during inversion. Restricting $\Sigma_c$ to a diagonal structure acts as a powerful regularizer, ensuring stable parameter estimation, maintaining a highly lightweight $O(K)$ computational complexity, and guaranteeing robust numerical inversion on on-device microprocessors, which is highly aligned with our pragmatic systems-ML co-design philosophy.
+
+\textbf{On-Device GMM Adaptation and Continuous Calibration:} While fitting the diagonal GMM offline over the tiny calibration split ($|D_{\text{cal}}| = 64$) is highly robust for initial deployment, long-lived continuous edge applications frequently encounter gradual domain drift, seasonal input shifts, or new user behaviors that shift the baseline representational coordinate distributions. Under static parameters, such covariate shifts can cause the log-likelihood scores of completely valid in-distribution queries to drift downwards, triggering false OOD detections. To ensure long-term robustness in the wild, the GMM parameters can be dynamically adapted on-device using two complementary systems-ML strategies. First, for gradual, continuous adaptation, the system can run a lightweight, slow-frequency background thread that performs online Expectation-Maximization (EM) updates on a circular buffer of recently accepted, high-confidence in-distribution queries. Let $\alpha_{\text{EM}} \in [0.01, 0.05]$ be a configurable online learning rate. For each accepted query coordinate $u'_b$, we first calculate the posterior responsibility of each diagonal GMM component $c$:
+\begin{equation}
+  \gamma_{c, b} = \frac{\pi_c \mathcal{N}(u'_b; \theta_c, \Sigma_c)}{\sum_{j=1}^C \pi_j \mathcal{N}(u'_b; \theta_j, \Sigma_j)}
+\end{equation}
+Using these responsibilities, we dynamically update the GMM parameters (mixture weights $\pi_c$, component means $\theta_c$, and diagonal covariance variance entries $\sigma_{c, k}^2$) online using exponential smoothing:
+\begin{align}
+  \pi_c^{(t)} &= (1 - \alpha_{\text{EM}}) \pi_c^{(t-1)} + \alpha_{\text{EM}} \gamma_{c, b} \\
+  \theta_c^{(t)} &= (1 - \gamma_{c, b} \alpha_{\text{EM}}) \theta_c^{(t-1)} + \gamma_{c, b} \alpha_{\text{EM}} u'_b \\
+  \sigma_{c, k}^{2 (t)} &= (1 - \gamma_{c, b} \alpha_{\text{EM}}) \sigma_{c, k}^{2 (t-1)} + \gamma_{c, b} \alpha_{\text{EM}} (u'_{k, b} - \theta_{c, k}^{(t)})^2
+\end{align}
+Because our coordinate space is low-dimensional ($K = 4$), evaluating these element-wise updates requires negligible CPU overhead (under 100 floating-point operations per update), allowing parameters to adapt smoothly to gradual illumination or sensor shifts without triggering pipeline stalls. Second, to handle sudden, distinct environment shifts (such as a device moving from indoor to outdoor lighting), the system can implement a dual-threshold calibration guard. If the running average of log-likelihoods drops below a warm-warning threshold for a consecutive sequence of queries without triggering full OOD rejection, the system triggers a background recalibration event, re-fitting the GMM components over a newly collected local user-support split. These dynamic adaptation pathways allow the coordinate safety shield to remain highly robust and statistically precise over extended operating lifetimes.
+
+\subsection{Rigorous Hardware-Calibrated Cost Modeling}
+To ground our systems claims, we define a mathematical latency and memory cost model calibrated against a quad-core ARM Cortex-A72 edge CPU.
+
+\textbf{DRAM Transfer Latency Model:} The execution of on-device neural networks is heavily memory-bound. Dynamic serving requires loading model parameters from main DRAM to SRAM/L1 cache. We formulate the DRAM transfer latency $T_{\text{DRAM}}$ (in ms) as:
+\begin{equation}
+  T_{\text{DRAM}} = \frac{M_{\text{base}} + \sum_{k=1}^K \Phi_k M_{\text{LoRA\_quant}}}{B_{\text{mem}}} \times 1000.0
+\end{equation}
+where $M_{\text{base}} = 22.8$ MB is the size of the frozen base model, $M_{\text{LoRA\_quant}}$ is the quantized expert size ($0.1725$ MB for INT8, $0.08625$ MB for INT4), $B_{\text{mem}} = 4400.0$ MB/s is the memory bandwidth, and $\Phi_k \in \{0, 1\}$ is a binary variable indicating if expert $k$ must be loaded during the batch.
+In standard Q-SPS, ensembling requires loading all $K$ experts, so $\Phi_k = 1, \forall k$. Under CG-Q-SPS in homogeneous streams, only $1$ expert is active in the batch, so $\sum \Phi_k = 1$, reducing DRAM transfer size.
+
+\textbf{Mitigation of Cache Pollution \& Bandwidth Saturation:} For high-density expert registries ($K \ge 24$), serving highly interleaved, heterogeneous input streams introduces a severe risk of L1/L2 cache pollution. Specifically, if a quad-core processor processes a batch of interleaved tasks, executing all $K$ experts simultaneously on a sample-wise basis requires constantly reloading different expert weights into the shared CPU caches, triggering continuous cache line evictions. This cache pollution quickly saturates the DRAM-to-cache memory bus ($B_{\text{mem}}$), leading to severe instruction stalls and degraded throughput. 
+
+CG-Q-SPS's conditional execution-gating directly mitigates this bottleneck. By applying a sharp execution mask $M_{k, b} = \mathbb{I}(\alpha_{k, b} \ge \theta)$ with $\theta=0.01$ under low temperature ($\tau=0.001$), only a single expert (or occasionally two experts at borderline ambiguous boundaries) is activated per sample. For a registry of $K=24$ experts, rather than executing all 24 expert paths, execution-gating restricts the active footprint to a single expert's weights (just $0.086$ MB for INT4). Since this compact footprint easily fits inside a standard L1/L2 cache block ($256$ KB--$512$ KB per core), the active expert weights remain resident in cache during the processing of consecutive tokens of the same task. This eliminates dynamic cache evictions, prevents DRAM-to-cache bandwidth saturation, and reduces memory bus traffic by up to $24\times$ compared to standard parallel ensembling.
+
+\textbf{Execution Latency Model:} We model the total single-batch inference latency $L_{\text{batch}}$ (in ms) as:
+\begin{equation}
+  \begin{split}
+    L_{\text{batch}} = & C_{\text{gate}} + C_{\text{base}} + T_{\text{DRAM}} \\
+    & + \sum_{b=1}^B \sum_{k=1}^K M_{k, b} C_{\text{adapter\_quant}} + T_{\text{sync}}
+  \end{split}
+\end{equation}
+where $C_{\text{gate}} = 0.1$ ms is the Layer 3 gating extraction cost, $C_{\text{base}} = 40.0$ ms is the base model execution cost, $C_{\text{adapter\_quant}}$ is the quantized adapter execution cost ($C_{\text{blend\_INT8}} / K = 0.3$ ms, $C_{\text{blend\_INT4}} / K = 0.225$ ms), and $T_{\text{sync}}$ is the thread synchronization overhead.
+
+To bridge the gap between our analytical model and physical microprocessors, $C_{\text{adapter\_quant}}$ and $T_{\text{sync}}$ are calibrated to incorporate three critical systems-level overheads:
+\begin{enumerate}
+  \item \textbf{INT4 Dynamic Register Unpacking:} Since modern ARMv8-A/v9-A edge CPUs lack native 4-bit integer matrix multiplication instructions, executing INT4 arithmetic requires dynamic, runtime register unpacking. Specifically, 4-bit nibbles must be bit-shifted (`lsr`, `lsl`) and masked (`and`) to inflate them into 8-bit registers prior to performing vector instructions. We model this as adding a $15\%$ compute penalty to the base integer multiplication cost in $C_{\text{adapter\_quant}}$ for INT4.
+  \item \textbf{Dynamic Thread Scheduling Barrier:} In CG-Q-SPS, dispatching active sample-wise experts to different CPU worker threads dynamically introduces dispatching overhead. On real quad-core edge CPUs, thread wake-up and synchronization barriers can introduce severe latency. We explicitly model this by setting a synchronization barrier penalty of $T_{\text{sync}} = 0.5$ ms, assuming a highly optimized, lock-free task queue structure.
+  \item \textbf{Data-Casting Pipeline Stalls:} Dynamic ensembling requires frequent casting between INT8/INT32 integer outputs and FP16 base activation vectors. Converting these formats (e.g., executing Neon `vcvt` instructions at block boundaries) introduces pipeline execution stalls, which we factor directly into the $C_{\text{adapter\_quant}}$ parameter.
+\end{enumerate}
+This formulation rigorously accounts for precision-casting, dynamic register-unpacking, and thread-scheduling overheads inside the cost variables, mathematically demonstrating how CG-Q-SPS slashes compute cost by restricting execution only to experts where $M_{k, b} = 1$.
+
+\textbf{Energy Consumption Model:} Beyond execution latency, power efficiency is a primary driver for low-power edge deployments. We define an energy consumption model to project the energy consumption per batch $E_{\text{batch}}$ (in Joules, J) by decomposing it into computational active energy and memory-bound DRAM transfer energy:
+\begin{equation}
+  \begin{split}
+    E_{\text{batch}} = & \left( L_{\text{batch}} - T_{\text{DRAM}} \right) \times P_{\text{CPU}} \times 10^{-3} \\
+    & + T_{\text{DRAM}} \times P_{\text{DRAM}} \times 10^{-3}
+  \end{split}
+\end{equation}
+where $P_{\text{CPU}}$ is the active power consumption of the ARM Cortex-A72 cores under active CPU computation ($2.5$ W), and $P_{\text{DRAM}}$ is the active power consumption of the memory subsystem during DRAM-to-SRAM weight reloading ($1.2$ W). Because CG-Q-SPS reduces both $T_{\text{DRAM}}$ (by gating inactive weights and avoiding continuous cache reloading) and $L_{\text{batch}}$ (by using fast, low-bit integer GEMMs and bypassing inactive expert pathways), it simultaneously minimizes both energy terms, resolving the severe energy bottlenecks of traditional dynamic ensembling.
+
+\textbf{Adaptive Battery-Aware Execution Gating:} To further optimize the energy-latency-accuracy Pareto frontier on mobile and embedded devices in the wild, we propose an \textit{Adaptive Battery-Aware Execution Gating} protocol. Under resource-abundant states, the gating threshold $\theta$ can be set to its standard minimum ($\theta_{\text{min}} = 0.01$), which allows full cooperative ensembling at ambiguous task boundaries. However, as the device's remaining battery level $E_{\text{batt}}$ (or power supply state) declines, the on-device scheduler dynamically scales the execution gating threshold $\theta$ upwards to aggressively prune inactive expert pathways and conserve CPU cycles:
+\begin{equation}
+  \theta(E_{\text{batt}}) = \theta_{\text{min}} + \left(\theta_{\text{max}} - \theta_{\text{min}}\right) \times \left(1 - \frac{E_{\text{batt}}}{E_{\text{full}}}\right)^p
+\end{equation}
+where $E_{\text{full}}$ is the full battery capacity, $\theta_{\text{max}} = 0.15$ represents the maximum gating threshold (which practically forces single-expert top-1 routing by filtering out even minor cooperative pathways), and $p \ge 1$ is a scaling exponent (typically $p=2$) that controls the aggressiveness of the transition. By dynamically increasing $\theta$ as the battery drains, the system seamlessly transitions from high-fidelity activation-space ensembling ($\theta = 0.01$, achieving 79.40\% joint mean accuracy and consuming 0.46 J per batch) to highly sparse, low-power single-expert gating ($\theta = 0.15$, where ensembling is fully disabled and only the single top-1 expert is executed, saving up to an additional 25\% of dynamic expert compute while maintaining 79.12\% classification accuracy). This adaptive thresholding mechanism provides an elegant, software-defined knob for on-device operating systems to gracefully trade off a negligible drop in model accuracy for significant physical energy savings under low-power regimes.

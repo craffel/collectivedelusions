@@ -1,0 +1,214 @@
+\section{SABLE Methodology}
+\label{sec:method}
+
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[auto, >=latex, node distance=2.2cm]
+    % Nodes
+    \node [block, fill=blue!15] (input) {Heterogeneous Batch $X$ \\ (Mixed-Task Samples)};
+    \node [block, right=1.0cm of input] (early_base) {Early Base Layers \\ $W_{\text{base}, 0 \dots L_{\text{route}}-1}$};
+    \node [coordinate, right=0.6cm of early_base] (split) {};
+    
+    % Routing path
+    \node [routing, below=1.0cm of split] (router) {Cosine Routing \\ \& Softmax};
+    \node [block, fill=green!15, below=0.6cm of router] (centroids) {Frozen Centroids \\ $\{w_1, \dots, w_K\}$};
+    
+    % Main Base Path
+    \node [block, right=1.4cm of split] (late_base) {Late Base Layers \\ $W_{\text{base}, L_{\text{route}} \dots L}$};
+    
+    % Parallel Adapters
+    \node [adapter, above=0.6cm of late_base] (lora1) {Expert LoRA 1 \\ $A_1 B_1$};
+    \node [adapter, above=1.6cm of late_base] (lora2) {Expert LoRA 2 \\ $A_2 B_2$};
+    
+    % Multiplier/scaler circles
+    \node [draw, circle, inner sep=1pt, fill=orange!10, right=0.4cm of lora1] (mult1) {$\times$};
+    \node [draw, circle, inner sep=1pt, fill=orange!10, right=0.4cm of lora2] (mult2) {$\times$};
+    
+    % Blending summation
+    \node [draw, circle, inner sep=2pt, right=1.2cm of late_base] (sum) {$+$};
+    
+    % Head Blending
+    \node [block, right=1.0cm of sum] (heads) {Dynamic Head Blending \\ Top-$M$ Heads ($O(M)$)};
+    \node [block, fill=purple!15, right=0.8cm of heads] (logits) {Final Logits \\ $\operatorname{Logits}_b$};
+    
+    % Paths / connections
+    \draw [->, thick] (input) -- (early_base);
+    \draw [-, thick] (early_base) -- (split);
+    \draw [->, thick] (split) -- (late_base);
+    \draw [->, thick] (split) |- (lora1);
+    \draw [->, thick] (split) |- (lora2);
+    \draw [->, thick] (split) -- (router);
+    \draw [<->, dashed] (router) -- (centroids) node[midway, right] {Cosine Sim};
+    
+    \draw [->, thick] (lora1) -- (mult1);
+    \draw [->, thick] (lora2) -- (mult2);
+    
+    % Routing coefficients feeding into multipliers
+    \draw [->, thick, green!60!black, rounded corners] (router.east) -- +(0.4,0) |- (mult1.west) node[near start, above] {$\alpha_{1, b}$};
+    \draw [->, thick, green!60!black, rounded corners] (router.east) -- +(0.4,0) |- (mult2.west) node[near start, above] {$\alpha_{2, b}$};
+    
+    % From multipliers and late base to summation
+    \draw [->, thick] (late_base) -- (sum);
+    \draw [->, thick, rounded corners] (mult1) -| (sum);
+    \draw [->, thick, rounded corners] (mult2) -| (sum);
+    
+    % Output
+    \draw [->, thick] (sum) -- (heads) node[midway, above] {$Y_b$};
+    \draw [->, thick] (heads) -- (logits);
+    
+    % Label/group box for SABLE Late Adaptation block
+    \node [draw, dashed, gray, inner sep=0.3cm, fit=(lora2) (lora1) (late_base) (mult2) (mult1) (sum), label=above:\textbf{SABLE Late Adaptation Block}] (fit_sable) {};
+    
+\end{tikzpicture}%
+}
+\caption{\textbf{SABLE Late Adaptation Architectural Schematic.} A heterogeneous batch flows through shared task-agnostic early base layers. At the routing depth, intermediate representation $z_b$ is projected onto frozen expert centroids to derive sample-wise routing coefficients $\alpha_{k, b}$. These coefficients dynamically blend activations from parallel expert adapters with the late-stage base network activations. Finally, dynamic head blending evaluates only the top $M$ classification heads to output final logits, bounding complexity at $O(M)$ end-to-end.}
+\label{fig:schematic}
+\end{figure*}
+
+In this section, we present the formal mathematical framework of \textbf{SABLE (Sample-wise Activation Blending of Low-Rank Experts)}. SABLE achieves test-time model merging under dynamic streaming heterogeneity by ensembling model predictions in activation space, eliminating the parameter averaging constraints that lead to heterogeneity collapse.
+
+\subsection{Problem Formulation: Streaming Heterogeneity}
+Consider a pre-trained base model parameterized by weights $W_{\text{base}}$ and a set of $K$ specialized downstream task experts. Under PEFT fine-tuning, each expert is parameterized as a low-rank weight update $V_k = A_k B_k$ added to the base weights, where $A_k \in \mathbb{R}^{D_{\text{in}} \times r}$ and $B_k \in \mathbb{R}^{r \times D_{\text{out}}}$ are low-rank matrices with rank $r \ll \min(D_{\text{in}}, D_{\text{out}})$.
+
+During deployment, the model receives an incoming query stream formatted as batches of size $B$. In a \emph{heterogeneous stream}, a single batch $X \in \mathbb{R}^{B \times D_{\text{in}}}$ contains mixed-task samples. That is, sample $X_{b_1}$ may belong to task $k_1$ while sample $X_{b_2}$ belongs to task $k_2$. Traditional parameter-space routing methods must compute a single set of merged weights to process the entire batch:
+\begin{equation}
+W_{\text{merged}} = W_{\text{base}} + \sum_{k=1}^K \bar{\alpha}_k A_k B_k
+\label{eq:param_merged}
+\end{equation}
+Thus, they must average the routing coefficients across the batch dimension: $\bar{\alpha}_k = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}$. This averaging collapses task specialization (heterogeneity collapse), especially as $B$ scales.
+
+\subsection{Subspace Cosine Projection}
+To route samples to their respective experts without introducing trainable routing parameters or requiring calibration data, SABLE leverages non-parametric coordinate projection. Let $z_b \in \mathbb{R}^D$ be the globally pooled penultimate layer representation of sample $b$ in the batch. Let $w_k \in \mathbb{R}^D$ be the frozen classification weight vector (or prototype centroid) corresponding to the $k$-th task expert, extracted directly from the pre-trained classification heads.
+
+The similarity score $s_{k, b}$ between sample $b$ and expert $k$ is computed as the cosine similarity between the representation $z_b$ and the prototype $w_k$:
+\begin{equation}
+s_{k, b} = \frac{z_b \cdot w_k}{\|z_b\|_2 \|w_k\|_2}
+\label{eq:similarity}
+\end{equation}
+By utilizing cosine similarity, the scores are bounded within $[-1, 1]$ and are invariant to the norm of the feature representation, ensuring stable routing behavior across varying input domains.
+
+\subsection{Out-of-Distribution Rejection}
+In multi-task streams, queries may belong to tasks not represented in the expert set, or to out-of-distribution (OOD) tasks. To protect the experts from noisy out-of-domain features, SABLE implements a hard threshold $\gamma_{\text{OOD}} > 0$. If the maximum similarity score for a given sample is below this threshold, the routing coefficients for all experts are set to zero, defaulting the computation to the pre-trained base model:
+\begin{equation}
+\text{If } \max_{j} s_{j, b} < \gamma_{\text{OOD}}, \text{ then } \alpha_{k, b} = 0 \quad \forall k \in \{1, \dots, K\}
+\label{eq:ood}
+\end{equation}
+
+\subsection{Temperature-Scaled Softmax Routing}
+For in-distribution samples (where $\max_j s_{j, b} \ge \gamma_{\text{OOD}}$), the similarity scores are converted into dynamic blending coefficients $\alpha_{k, b}$ using a temperature-scaled Softmax:
+\begin{equation}
+\alpha_{k, b} = \frac{\exp(s_{k, b} / \tau)}{\sum_{j=1}^K \exp(s_{j, b} / \tau)}
+\label{eq:softmax}
+\end{equation}
+where $\tau > 0$ is a temperature hyperparameter that controls the entropy of the routing distribution. A smaller $\tau$ concentrates the ensembling weights onto a single expert (approaching hard routing), whereas a larger $\tau$ encourages smoother blending across multiple experts.
+
+\subsection{Dynamic Activation Blending Layer}
+At each layer $l \in \{1, \dots, L\}$ of the network, the output is computed in activation space. For a given input representation $X_b \in \mathbb{R}^{D_{\text{in}}}$ of sample $b$ in the batch, the output $Y_b \in \mathbb{R}^{D_{\text{out}}}$ is computed as:
+\begin{equation}
+Y_b = X_b W_{\text{base}} + \sum_{k=1}^K \alpha_{k, b} \cdot \left( (X_b A_k) B_k \right)
+\label{eq:blending}
+\end{equation}
+Here, the base model projection $X_b W_{\text{base}}$ is computed once for the entire batch. In parallel, the lightweight low-rank adapter projections $(X_b A_k) B_k$ are computed for each active expert (where $\alpha_{k, b} > 0$) and scaled on-the-fly by the sample-specific coefficient $\alpha_{k, b}$.
+
+\subsection{Early-Layer Routing for Single-Pass Execution}
+To resolve the $2\times$ forward pass efficiency paradox without introducing complex, memory-intensive activation caching across all $L$ layers, SABLE employs a highly elegant \emph{Early-Layer Routing} mechanism. 
+
+Instead of waiting for the penultimate representation $z_b$ at the very end of the network, SABLE runs only the very first layer of the base model (Layer 0):
+\begin{equation}
+H_{\text{base}, 0, b} = X_b W_{\text{base}, 0} + b_{\text{base}, 0}
+\label{eq:layer0_base}
+\end{equation}
+Because Layer 0 projects inputs into the aligned representational space of the network, the output features contain highly distinct signatures of the active task subspaces. SABLE computes the routing coefficients $\alpha_{k, b}$ directly from the Layer 0 base output features $H_{\text{base}, 0, b}$ using Subspace Cosine Projection (Equation~\ref{eq:similarity}).
+
+Once computed, these routing coefficients are immediately applied to perform activation blending starting at Layer 0:
+\begin{equation}
+\begin{aligned}
+Y_{0, b} = \operatorname{ReLU}\Big( &H_{\text{base}, 0, b} + \\
+&\sum_{k=1}^K \alpha_{k, b} \cdot \left( (X_b A_{k, 0}) B_{k, 0} + \Delta b_{k, 0} \right) \Big)
+\end{aligned}
+\label{eq:layer0_blending}
+\end{equation}
+and then propagated sequentially through all subsequent layers $l \in \{1, \dots, L-1\}$ in exactly a single, unified forward pass:
+\begin{equation}
+\begin{aligned}
+Y_{l, b} = \operatorname{ReLU}\Big( &Y_{l-1, b} W_{\text{base}, l} + b_{\text{base}, l} + \\
+&\sum_{k=1}^K \alpha_{k, b} \cdot \left( (Y_{l-1, b} A_{k, l}) B_{k, l} + \Delta b_{k, l} \right) \Big)
+\end{aligned}
+\label{eq:subsequent_blending}
+\end{equation}
+This architectural adjustment guarantees a strictly \emph{single-pass} execution of both the backbone network and the low-rank adapters, with absolutely zero redundant base passes and zero activation caching memory overhead. SABLE's total compute overhead is thus restricted to the lightweight parallel low-rank forward passes, maintaining our 1.2\% FLOP overhead guarantee.
+
+\paragraph{The Representational Alignment Paradox and Its Resolutions.} We must address a fundamental conceptual limitation regarding Early-Layer Routing in hierarchical deep networks: the \emph{Representational Alignment Paradox}. In real-world hierarchical architectures (e.g., Convolutional Neural Networks, Vision Transformers, or deep ResNets), lower-layer features represent low-level sensory patterns (edges, patches, textures), whereas final-layer classification heads $w_k$ expect highly abstract, semantic penultimate representations. Consequently, computing the cosine similarity between the raw inputs or Layer 0 features and final heads $w_k$ is semantically unaligned, leading to highly noisy routing.
+
+To resolve this paradox, SABLE proposes two highly effective solutions:
+\begin{enumerate}
+    \item \textbf{Mid-Layer Routing (Default Configuration \& Primary Minimalist Resolution):} SABLE adopts Mid-Layer Routing configured for \emph{Late Adaptation} (setting $L_{\text{route}} > 0$, e.g., $L_{\text{route}} = L - 2$) as its default architecture. In this setup, early layers are left completely unadapted and run strictly through the pre-trained, task-agnostic base network:
+    \begin{equation}
+    \begin{aligned}
+    Y_{l, b} = Y_{l-1, b} W_{\text{base}, l} + b_{\text{base}, l}, \\
+    \forall l \in \{0, \dots, L_{\text{route}} - 1\}
+    \end{aligned}
+    \label{eq:mid_layer_early}
+    \end{equation}
+    At the routing depth $L_{\text{route}}$, SABLE extracts the intermediate representation $z_b$ from the output of the unadapted base layers, and computes the non-parametric routing coefficients $\alpha_{k, b}$ directly using Subspace Cosine Projection (Equation~\ref{eq:similarity}). 
+    For all late-stage layers $l \ge L_{\text{route}}$, we then apply SABLE activation blending using these routing coefficients:
+    \begin{equation}
+    \begin{aligned}
+    Y_{l, b} = \operatorname{ReLU}\Big( &Y_{l-1, b} W_{\text{base}, l} + b_{\text{base}, l} \,+ \\
+    &\sum_{k=1}^K \alpha_{k, b} \big( (Y_{l-1, b} A_{k, l}) B_{k, l} + \Delta b_{k, l} \big) \Big)
+    \end{aligned}
+    \label{eq:mid_layer_blending}
+    \end{equation}
+    By restricting activation blending to late-stage layers, we completely resolve the Representational Alignment Paradox and significantly improve joint ensembling accuracy (as shown in Section~\ref{sec:experiments}). This configuration requires zero extra parameters, zero calibration data, and zero external models. Furthermore, it saves massive computational and memory overhead by leaving the first $L_{\text{route}}$ layers unadapted, perfectly embodying our minimalist design.
+
+    \paragraph{The Early-Feature Loss Trade-Off.} Despite its strong empirical advantages, Mid-Layer Routing (Late Adaptation) introduces a key architectural trade-off and theoretical limitation that must be explicitly acknowledged: \emph{the complete loss of early task-specific expert features}. Because layers $l < L_{\text{route}}$ are left entirely unadapted and run strictly through the pre-trained base network, any task-specific specialized features or representation manifolds learned in the early-to-mid layers of the experts during fine-tuning are completely discarded and unused. 
+    
+    SABLE's Late Adaptation configuration is therefore structurally limited to expert pools whose task-specific adaptation is concentrated in late-stage layers, or where the early-layer parameters of the experts are identical (or highly similar) to those of the base network. If downstream experts are trained with full full-parameter fine-tuning or low-level PEFT adapters that aggressively specialize early-layer feature extractors (e.g., for low-level domain adaptation or sensor-modality shifts), SABLE Late Adaptation is structurally unable to leverage those early features. In such scenarios, practitioners must either accept representational drift across early layers by routing from Layer 0, or utilize SABLE's alternative \emph{Lightweight External Routing Backbone} to route ensembling across all layers, highlighting a key design choice of the SABLE framework.
+    \item \textbf{Lightweight External Routing Backbone (Optional Non-Default Fallback):} For deep networks where full-network adaptation is desired but late-stage routing is not preferred, we can optionally route incoming queries using an ultra-lightweight, frozen, pre-trained semantic encoder (e.g., a 4M parameter MobileNet-v3 for vision, or a 22M parameter MiniLM for NLP). This routing backbone projects inputs into a high-level semantic coordinate space in a single parallel pass to compute accurate routing coefficients, which are then applied across all layers of the primary base network. We emphasize that this external backbone is an optional fallback and is not SABLE's default setup. SABLE's default is Mid-Layer Routing, which operates entirely within a single model and requires no external models or weights, preserving SABLE's pure network-level simplicity.
+\end{enumerate}
+
+\subsection{Scalable Top-$M$ Expert Pruning}
+As the pool of specialized experts $K$ grows, executing parallel low-rank forward passes for all experts at each layer can introduce substantial CUDA kernel launch overhead and GPU memory bandwidth limitations. To guarantee scalability and maintain a bounded real-time serving latency, SABLE implements a highly efficient \emph{Top-$M$ Expert Pruning} strategy. 
+
+Let $\mathcal{E}_b \subset \{1, \dots, K\}$ be the pruned active expert set for sample $b$. We select only the top $M \ll K$ experts with the highest similarity coefficients $\alpha_{k, b}$:
+\begin{equation}
+\mathcal{E}_b = \operatorname{arg~top}_{k \in \{1,\dots,K\}}^M \alpha_{k, b}
+\label{eq:topm}
+\end{equation}
+We then re-normalize the routing coefficients of these active experts:
+\begin{equation}
+\hat{\alpha}_{k, b} = \frac{\alpha_{k, b}}{\sum_{j \in \mathcal{E}_b} \alpha_{j, b}} \quad \forall k \in \mathcal{E}_b
+\label{eq:renormalize}
+\end{equation}
+and set $\hat{\alpha}_{k, b} = 0$ for all $k \notin \mathcal{E}_b$. The activation blending layer is then computed strictly over the active expert subset:
+\begin{equation}
+Y_b = X_b W_{\text{base}} + \sum_{k \in \mathcal{E}_b} \hat{\alpha}_{k, b} \cdot \left( (X_b A_k) B_k \right)
+\label{eq:pruned_blending}
+\end{equation}
+By executing low-rank adapters only for the top $M$ experts (typically $M=1$ or $M=2$), SABLE caps the computational complexity at $O(M)$ instead of $O(K)$. This ensures that serving latency remains completely flat and invariant to the size of the expert pool $K$.
+
+\subsection{Task-Agnostic Dynamic Head Blending with Bounded Complexity}
+In a realistic streaming environment, the task category or dataset membership of an incoming query sample is typically unknown at test time. SABLE is naturally designed to operate under these zero-knowledge serving conditions. 
+
+Let $\{h_1, \dots, h_K\}$ be the specialized prediction classification heads (or vocabulary layers) corresponding to the $K$ experts. To guarantee end-to-end scalability and avoid a potential $O(K)$ computational and memory bottleneck when evaluating large expert pools, SABLE applies the same \emph{Top-$M$ Expert Pruning} strategy (Section 3.7) to the final classification heads. Instead of executing and blending all $K$ heads in parallel, SABLE evaluates only the $M \ll K$ active heads in the subset $\mathcal{E}_b$, capping head blending complexity at $O(M)$ and ensuring that the entire network forward pass is completely bounded at $O(M)$ complexity:
+\begin{equation}
+\operatorname{Logits}_b = \sum_{k \in \mathcal{E}_b} \hat{\alpha}_{k, b} \cdot h_k\left( Y_{\text{final}, b} \right)
+\label{eq:head_blending}
+\end{equation}
+This formulation ensures that SABLE is completely task-agnostic, requiring absolutely zero oracle knowledge of task IDs at test time. Under high-confidence routing (where $\hat{\alpha}_{k, b}$ is close to 1 for the correct task), Equation~\ref{eq:head_blending} converges to evaluating only the correct specialized head, natively preserving specialized expert performance while executing a stateless, real-time, low-latency prediction pass with bounded $O(M)$ compute.
+
+\paragraph{Handling Disjoint Output Spaces.} In multi-task settings where downstream experts are trained on entirely disjoint classification label spaces (e.g., MNIST's 10 classes vs. CIFAR-100's 100 classes), adding logit vectors directly as in Equation~\ref{eq:head_blending} is structurally impossible due to mismatched output dimensions. SABLE elegantly resolves this by falling back to hard expert selection ($M=1$) strictly at the final classification head layer, while maintaining soft, dynamic ensembling ($M \ge 2$) across all intermediate hidden layers of the network. This hybrid routing strategy enriches latent representations in shared hidden coordinates while producing mathematically sound and well-defined output predictions on disjoint tasks.
+
+\subsection{The Minimalist Advantage}
+The formulation in Equation~\ref{eq:blending} is mathematically equivalent to ensembling in weight space with sample-wise merged weights $W_{\text{merged}, b} = W_{\text{base}} + \sum_k \alpha_{k, b} A_k B_k$ under a single-sample batch $B=1$. However, unlike parameter-space methods, SABLE generalizes seamlessly to any batch size $B > 1$ because the blending occurs in activation space \emph{after} the projection.
+
+By performing sample-wise ensembling natively in the forward pass, SABLE achieves several key minimalist objectives:
+\begin{itemize}
+    \item \textbf{No Stateful Queues:} Samples are processed immediately upon arrival, avoiding any systems-level scheduling or temporal buffering.
+    \item \textbf{No Training or Calibration splits:} The projection uses frozen pre-trained weights, avoiding complex calibration algorithms or training data dependency.
+    \item \textbf{High Efficiency:} Because the rank $r$ is extremely small (e.g., $r=8$), the low-rank projection $(X_b A_k) B_k$ is computationally trivial, resulting in a negligible compute footprint compared to the massive base model.
+\end{itemize}
+SABLE thus offers an elegant, self-contained network-level solution that satisfies Occam's razor.
+
+\paragraph{Preservation of Exact Equivalence across Non-linear Boundaries.} We highlight a key technical boundary of our ensembling formulation: SABLE's exact mathematical equivalence to parameter-space ensembling holds strictly when ensembling is applied to linear projection layers (such as dense projections, convolutions, or self-attention query/key/value projections) prior to the application of non-linear activation functions (e.g., ReLU, Swish, or Softmax). In deep architectures with multiple nested non-linearities or if ensembling is applied after a non-linear operator, the distributive property of linear algebra ($X(W_1 + W_2) = X W_1 + X W_2$) is no longer exact, resulting in representation divergence. SABLE naturally sidesteps this boundary by placing activation blending layers directly inside the linear projection interfaces of modern transformer blocks or feed-forward heads, guaranteeing exact equivalence and zero representational distortion.

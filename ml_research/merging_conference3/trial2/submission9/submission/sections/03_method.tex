@@ -1,0 +1,127 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the mathematical formulation and architectural details of {\bf Barycentric Proximity-Anchored Merging (BPAM)}. BPAM focuses strictly on physical constraints and low parameterizations, stripping away all overparameterized deep flow models or high-dimensional layer-wise adapters.
+
+\subsection{Problem Setup and Notation}
+Let $f(x; \theta)$ represent a pre-trained base model (e.g., CLIP ViT-B/32) parameterized by weights $\theta$. Suppose we have a set of $K$ experts fine-tuned from the same base model on $K$ distinct tasks, denoted by $\{\theta_k\}_{k=1}^K$. Let $w_{base}^{(j)}$ be the weight matrix of the $j$-th layer in the pre-trained base model, and let $\{w_k^{(j)}\}_{k=1}^K$ represent the corresponding weights of the $K$ fine-tuned expert models for that layer. Our objective is to construct a merged weight matrix $w_{MTL}^{(j)}$ for each layer $j$ that generalizes robustly across all $K$ tasks simultaneously during test-time adaptation.
+
+\subsection{Convex Barycentric Simplex Projection}
+Unconstrained linear task vector addition (as in Task Arithmetic \cite{ilharco2022editing}) often scales up the magnitude of weight matrices as more task vectors are added:
+\begin{equation}
+    w_{arith}^{(j)} = w_{base}^{(j)} + \sum_{k=1}^K \lambda_k (w_k^{(j)} - w_{base}^{(j)})
+\end{equation}
+When the norm of the weight matrix increases, it shifts activations into saturated regions of subsequent non-linear activation functions (e.g., GELU or LayerNorm) or distorts the scale of attention maps, leading to {\it scale distortion} or {\it activation collapse}. Competing methods (e.g., FoldMerge) employ deep normalizing flows of millions of parameters to warp coordinates and prevent these scale distortions.
+
+BPAM resolves scale distortion mathematically and parameter-free. We formulate the merged weights $w_{MTL}^{(j)}$ as a convex barycentric combination of the base and expert weights:
+\begin{equation}
+    w_{MTL}^{(j)}(\Lambda) = \left(1.0 - \sum_{k=1}^K \lambda_k^{(j)}\right) w_{base}^{(j)} + \sum_{k=1}^K \lambda_k^{(j)} w_k^{(j)}
+\end{equation}
+subject to the constraints:
+\begin{equation}
+    \lambda_k^{(j)} \geq 0, \ \ \forall k \in [K], \quad \sum_{k=1}^K \lambda_k^{(j)} \leq 1.0
+\end{equation}
+where $\lambda_k^{(j)}$ is the merging coefficient for task $k$ and layer $j$, and $\Lambda = \{\lambda_1^{(j)}, \dots, \lambda_K^{(j)}\}$ is the set of global task-wise merging coefficients.
+
+By restricting the coefficients $\Lambda$ to a convex simplex, we guarantee that the merged weight matrix lies strictly within the convex hull of the pre-trained base and expert weights. By the triangle inequality, the Frobenius norm of the merged weight matrix is bounded:
+\begin{equation}
+    \|w_{MTL}^{(j)}\|_F \leq \Big(1 - \sum_{k=1}^K \lambda_k^{(j)}\Big) \|w_{base}^{(j)}\|_F + \sum_{k=1}^K \lambda_k^{(j)} \|w_k^{(j)}\|_F
+\end{equation}
+Since the expert models are fine-tuned from the base and their parameter norms remain close to $\|w_{base}^{(j)}\|_F$, the norm of the merged layer is mathematically guaranteed to remain within a stable range. This simple, elegant convex constraint preserves activation scales in a fully closed-form manner, eliminating the need for complex, flow-based coordinate warps.
+
+\subsection{Localized vs. Whole-Model Blending}
+To systematically analyze the necessity of whole-model blending and resolve layer mismatches, we evaluate two spatial configurations of our coefficients:
+\begin{itemize}
+    \item {\bf Whole-Model Merging (BPAM-Static \& BPAM-Full):} We broadcast the $K$ global task coefficients across all $L$ layers of the network. Thus, we have exactly $K$ optimized parameters, and $\lambda_k^{(j)} = \lambda_k$ for all layers $j \in \{1, \dots, L\}$.
+    \item {\bf Localized Bottleneck Merging (BPAM-Restricted):} We restrict task-vector blending strictly to the visual projection layer (`model.visual.proj`) of the image encoder. For all other layers $j$, the task coefficients are set to zero, and the pre-trained base weights are kept fixed. That is:
+    \begin{equation}
+        \lambda_k^{(j)} = 
+        \begin{cases} 
+          \lambda_k & \text{if } j \text{ is the visual projection layer} \\ 
+          0 & \text{otherwise} 
+        \end{cases}
+    \end{equation}
+    This isolates weight-space merging to a single bottle-necking layer with exactly $K$ optimized parameters, keeping the rest of the encoder static in its pre-trained state.
+\end{itemize}
+
+\subsection{Mean-Field Proximity Regularization}
+Test-time adaptation is notoriously prone to transductive overfitting, where the model adjusts its parameters to fit a small, local batch of unlabeled test data at the expense of generalizability on unseen data. 
+
+To prevent transductive overfitting, BPAM introduces a **Mean-Field Proximity Penalty** $\mathcal{R}(\Lambda)$. This penalty anchors the task-specific coefficients towards a stable, uniform barycentric centroid:
+\begin{equation}
+    \mathcal{R}(\Lambda) = \sum_{k=1}^K \left( \lambda_k - \frac{1}{K+1} \right)^2
+\end{equation}
+The target value $\frac{1}{K+1}$ represents the uniform centroid of the convex simplex, which assigns equal weight to the pre-trained base model and each of the $K$ experts. This penalty acts as a simple, powerful geometric regularizer. It behaves like a spring pull that stabilizes the optimization landscape, preventing coefficients from drifting into extreme regions of the simplex unless supported by overwhelming teacher feedback.
+
+While we adopt a uniform prior for simplicity, we can formally extend this to incorporate a non-uniform, asymmetric prior. Because the pre-trained base model contains broader, general-purpose representation capabilities, it represents a logically stronger prior anchor than individual task-specific experts. To mathematically formulate this, we define an asymmetric target centroid prior $\Pi = \{\pi_{\text{base}}, \pi_1, \dots, \pi_K\}$, where $\pi_{\text{base}} > \frac{1}{K+1}$ is the prior weight allocated to the base model, and the remaining prior probability is distributed evenly among the experts: $\pi_k = \frac{1 - \pi_{\text{base}}}{K}$ for all $k \in [K]$. The asymmetric proximity penalty is then formulated as:
+\begin{equation}
+    \mathcal{R}_{\text{asym}}(\Lambda) = \left( \lambda_{\text{base}} - \pi_{\text{base}} \right)^2 + \sum_{k=1}^K \left( \lambda_k - \pi_k \right)^2
+\end{equation}
+where $\lambda_{\text{base}} = 1.0 - \sum_{k=1}^K \lambda_k$ represents the implicit scale weight of the pre-trained base model under the convex barycentric simplex constraint. For instance, by setting $\pi_{\text{base}} = 0.5$ (assigning 50\% prior weight to the base model) and $\pi_k = 0.0625$ for our $K=8$ experts, we anchor the adaptation process securely to the pre-trained base model, ensuring generalizability and preventing excessive task specialization under severe data scarcity.
+
+\subsection{Teacher-Guided Test-Time Adaptation}
+On the unlabeled test streams, we optimize the $K$ coefficients to minimize the joint KL-divergence between the merged model predictions and the expert teacher predictions, regularized by our Mean-Field Proximity Penalty:
+\begin{equation}
+\begin{aligned}
+    \min_{\Lambda} \mathcal{L}(\Lambda) &= \sum_{k=1}^K \mathbb{E}_{x \in \mathcal{X}_k^{te}} \Big[ \mathcal{D}_{KL}\Big( f(x; w_{MTL}(\Lambda)) \\
+    &\parallel f(x; w_k) \Big) \Big] + \beta \mathcal{R}(\Lambda)
+\end{aligned}
+\end{equation}
+where $\mathcal{X}_k^{te}$ represents the unlabeled test stream for task $k$, $f(x; w_k)$ is the prediction of the $k$-th fine-tuned expert teacher, and $\beta > 0$ is the regularization hyperparameter.
+
+For joint optimization configurations that concurrently adapt the visual classification heads during test-time optimization (e.g., {\bf BPAM-Full}), the joint objective function is extended to optimize both the weight-space merging coefficients $\Lambda$ and the parameters of all task-specific classification heads $H = \{h_k\}_{k=1}^K$:
+\begin{equation}
+\begin{aligned}
+    \min_{\Lambda, H} &\mathcal{L}(\Lambda, H) = \sum_{k=1}^K \mathbb{E}_{x \in \mathcal{X}_k^{te}} \Big[ \mathcal{D}_{KL}\Big( \\
+    &g\big(\phi(x; w_{MTL}(\Lambda)); h_k\big) \parallel g\big(\phi(x; w_k); h_k^{(orig)}\big) \Big) \Big] \\
+    &+ \beta \mathcal{R}(\Lambda)
+\end{aligned}
+\end{equation}
+where $\phi(x; w)$ represents the feature representation extracted by the image encoder with weights $w$, $g(z; h)$ is the classification head mapping function parameterized by parameters $h$, and $h_k^{(orig)}$ represents the original frozen head parameters of the $k$-th expert model. The classification heads $H$ are initialized with their original specialized parameters $\{h_k^{(orig)}\}$ and optimized concurrently with the merging coefficients using the same learning rate ($\eta = 10^{-3}$) and optimizer (Adam) without any specialized schedule. This formulation ensures that both the weight-space representations and downstream decision boundary classifiers co-adapt seamlessly, maintaining complete stability.
+
+\subsubsection{Optimization Procedure}
+The step-by-step optimization pipeline is structured to seamlessly accommodate both frozen-head configurations and joint head-weight co-adaptation settings. The precise algorithmic flow is outlined as follows:
+\begin{enumerate}
+    \item {\bf Initialization:} Initialize the $K$ weight coefficients to the uniform simplex centroid: $\lambda_k^{(0)} = \frac{1}{K+1}, \forall k \in \{1, \dots, K\}$. For joint head adaptation configurations (e.g., {\bf BPAM-Full}), also initialize the task-specific classification head parameters $H^{(0)} = \{h_k^{(0)}\}_{k=1}^K$ to their original, specialized pre-trained weights $\{h_k^{(orig)}\}_{k=1}^K$.
+    \item {\bf Forward Pass:} Construct the merged Visual Encoder weight matrix $w_{MTL}$ dynamically using the convex simplex formulation:
+    \begin{equation}
+        w_{MTL}^{(t)} = \left(1.0 - \sum_{k=1}^K \lambda_k^{(t)}\right) w_{base} + \sum_{k=1}^K \lambda_k^{(t)} w_k
+    \end{equation}
+    Pass target images $x$ from the task streams through the merged encoder to extract representations $\phi(x; w_{MTL}^{(t)})$. Then, compute the predictions of the merged model:
+    \begin{itemize}
+        \item {\bf Frozen-Head Settings (BPAM-Static \& BPAM-Restricted):} Compute predictions using the original, static expert heads: $f(x; w_{MTL}^{(t)}) = g\big(\phi(x; w_{MTL}^{(t)}); h_k^{(orig)}\big)$.
+        \item {\bf Active-Head Settings (BPAM-Full):} Compute predictions using the actively adapted expert heads: $f(x; w_{MTL}^{(t)}, H^{(t)}) = g\big(\phi(x; w_{MTL}^{(t)}); h_k^{(t)}\big)$.
+    \end{itemize}
+    Concurrently, pass images $x$ through the individual task-expert teachers to obtain the target predictions $f(x; w_k, h_k^{(orig)}) = g\big(\phi(x; w_k); h_k^{(orig)}\big)$.
+    \item {\bf Loss and Backpropagation:} Compute the objective function and perform joint updates:
+    \begin{itemize}
+        \item {\bf Frozen-Head Settings:} Compute the loss $\mathcal{L}(\Lambda)$ as defined in Equation 7. Compute the gradients with respect to the $K$ coefficients: $\nabla_\Lambda \mathcal{L}(\Lambda)$, and update the coefficients using Adam or SGD with learning rate $\eta$:
+        \begin{equation}
+            \Lambda^{(t+1)} \leftarrow \Lambda^{(t)} - \eta \nabla_\Lambda \mathcal{L}(\Lambda^{(t)})
+        \end{equation}
+        \item {\bf Active-Head Settings:} Compute the joint loss $\mathcal{L}(\Lambda, H)$ as defined in Equation 8. Compute the gradients with respect to both the $K$ coefficients and the classification head parameters: $\nabla_\Lambda \mathcal{L}(\Lambda^{(t)}, H^{(t)})$ and $\nabla_H \mathcal{L}(\Lambda^{(t)}, H^{(t)})$. Update both parameters concurrently:
+        \begin{equation}
+            \Lambda^{(t+1)} \leftarrow \Lambda^{(t)} - \eta \nabla_\Lambda \mathcal{L}(\Lambda^{(t)}, H^{(t)})
+        \end{equation}
+        \begin{equation}
+            H^{(t+1)} \leftarrow H^{(t)} - \eta \nabla_H \mathcal{L}(\Lambda^{(t)}, H^{(t)})
+        \end{equation}
+    \end{itemize}
+    \item {\bf Convex Simplex Projection:} Enforce the scale-preserving physical boundaries on the updated coefficients $\Lambda^{(t+1)}$ dynamically:
+    \begin{equation}
+        \lambda_k^{(t+1)} \leftarrow \max\left(0, \lambda_k^{(t+1)}\right), \quad \forall k \in \{1, \dots, K\}
+    \end{equation}
+    If their sum violates the simplex boundary ($\sum_{j=1}^K \lambda_j^{(t+1)} > 1.0$), project them back to the convex hull. Specifically, we apply a {\bf ray-scaling ($L_1$-normalization) projection}:
+    \begin{equation}
+        \lambda_k^{(t+1)} \leftarrow \frac{\lambda_k^{(t+1)}}{\sum_{j=1}^K \lambda_j^{(t+1)}} \quad \text{if} \quad \sum_{j=1}^K \lambda_j^{(t+1)} > 1.0
+    \end{equation}
+    We note that this ray-scaling projection is distinct from an exact orthogonal Euclidean projection onto the simplex (solved via sorting or pivoting algorithms \cite{duchi2008efficient}). Mathematically, an exact orthogonal projection minimizes the $L_2$ distance to the simplex:
+    \begin{equation}
+        \min_{w} \frac{1}{2} \|w - \Lambda^{(t+1)}\|_2^2 \quad \text{s.t.} \quad w \geq 0, \quad \sum_{j=1}^K w_j \leq 1.0
+    \end{equation}
+    While standard Projected Gradient Descent (PGD) typically relies on orthogonal projections to preserve convergence guarantees, orthogonal projection onto the $L_1$ simplex has a strong sparsification effect, which tends to push multiple coordinates to exactly zero. In multi-task model-merging, such hard sparsification is highly undesirable as it completely discards task-expert representations, breaking the collaborative representation-sharing basin. 
+    
+    In contrast, our ray-scaling projection preserves the exact directional ratios of the updated coefficients ($\lambda_k / \lambda_i = \lambda_k^{(t+1)} / \lambda_i^{(t+1)}$), thereby maintaining the collaborative representational contributions of all experts while scaling down the joint parameter energy to prevent activation collapse. Ray-scaling is thus selected for its extreme computational simplicity, convergence stability in this low-parameter regime, and its alignment with multi-task representation preservation.
+    \item {\bf Deployment:} Once test-time adaptation is complete, freeze the final parameters. Construct the static visual encoder weights using the converged coefficients $\Lambda^{(T)}$. For frozen-head settings, deploy the static merged encoder. For BPAM-Full, deploy the static merged encoder alongside the adapted classification heads $H^{(T)}$. In all cases, once adaptation is finished, downstream inference runs with {\bf zero additional parameters, zero computational overhead, and zero latency}.
+\end{enumerate}
+This elegant, self-contained optimization loop is mathematically rigorous, computationally efficient, and completely avoids the need for overparameterized adapter architectures.

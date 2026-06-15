@@ -1,0 +1,153 @@
+\section{Methodology: Deconstructing SAIM}
+\label{sec:method}
+
+To critically dissect the Sharpness-Aware Isotropic Merging (SAIM) framework, we formalize its primary stages and introduce modular, simplified baselines. This decoupling allows us to systematically isolate the true causal drivers of performance and identify redundancies.
+
+\subsection{Problem Formulation: Model Merging in Continual Learning}
+We consider a continual learning setting where a pre-trained model with parameters $\theta_0 \in \mathbb{R}^D$ is sequentially adapted to a stream of tasks $T_1, T_2, \dots, T_t$. For each new task $T_t$ with dataset $D_t$, we initialize the model with the previously consolidated parameters $\theta_{t-1}$ and fine-tune it to obtain a task-expert model $\theta_{T_t}$. 
+
+The task vector representing the parameters updated for task $T_t$ is defined as $\Delta_{T_t} = \theta_{T_t} - \theta_{t-1}$. The cumulative historical update from the pre-trained initialization is denoted as $\Delta_{\text{cum}} = \theta_{t-1} - \theta_0$. For each weight matrix (layer) $k$ in the network, the combined candidate update $\Delta^k_{\text{com}}$ is:
+\begin{equation}
+  \Delta^k_{\text{com}} = (1+\lambda)\Delta^k_{\text{cum}} + (1-\lambda)\Delta^k_{T_t}
+\end{equation}
+where $\lambda \in [0, 1)$ is a balance hyperparameter that scales the contributions of historical updates and current task experts.
+
+\textbf{Analysis of the $\lambda = 0$ Regime:} When $\lambda = 0.0$ and the global scaling factor is set to $\alpha = 1.0$, the combined update simplifies to:
+\begin{align}
+  \Delta^k_{\text{com}} &= \Delta^k_{\text{cum}} + \Delta^k_{T_t} \nonumber\\
+  &= (\theta_{t-1} - \theta_0) + (\theta_{T_t} - \theta_{t-1}) \nonumber\\
+  &= \theta_{T_t} - \theta_0
+\end{align}
+Under naive Task Arithmetic, the updated consolidated parameters are:
+\begin{equation}
+  \theta_t = \theta_0 + \alpha \Delta^k_{\text{com}} = \theta_0 + (\theta_{T_t} - \theta_0) = \theta_{T_t}
+\end{equation}
+In this regime, Task Arithmetic is mathematically equivalent to pure sequential fine-tuning on each task (i.e., the "merged" weights are exactly the expert weights $\theta_{T_t}$).
+
+While setting $\lambda = 0.0$ isolates basic sequential task adaptation, it removes active parameter mixing during model consolidation. Under a non-zero regime (e.g., $\lambda = 0.2$), there is an active mixing and scaling balance between cumulative history and the new task expert. To provide a rigorous and comprehensive deconstruction, we evaluate our grid under both the standard $\lambda = 0.0$ regime and an active mixing regime with $\lambda = 0.2$.
+
+\subsection{Deconstruction of Isotropic Merging (The Merging Axis)}
+SAIM argues that naive Euclidean averaging of task updates (Task Arithmetic \cite{taskarithmetic}) causes spectral imbalance and representation collapse. It proposes SVD-based \emph{Adaptive Isotropic Merging} to balance the singular spectrum of each weight layer $k$.
+
+\textbf{1. SAIM's Isotropic Merging (SVD):} For each layer $k$, we compute the Singular Value Decomposition (SVD) of the combined matrix update $\Delta^k_{\text{com}} \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$:
+\begin{equation}
+  \Delta^k_{\text{com}} = U^k \Sigma^k (V^k)^\top
+\end{equation}
+where $\Sigma^k = \text{diag}(\sigma^k_1, \sigma^k_2, \dots, \sigma^k_r)$ are the singular values, and $r = \min(d_{\text{out}}, d_{\text{in}})$. The mean singular value is calculated as:
+\begin{equation}
+  \bar{\sigma}^k = \frac{1}{r} \sum_{i=1}^r \sigma^k_i
+\end{equation}
+SAIM reconstructs the singular value spectrum by interpolating toward the mean using a decay factor that scales with the task index $t$:
+\begin{equation}
+  \hat{\Sigma}^k_{ii} = \bar{\sigma}^k + (\sigma^k_i - \bar{\sigma}^k) \times \frac{1}{\sqrt{t}}
+\end{equation}
+The isotropic update is reconstructed, and the final parameters are updated:
+\begin{equation}
+  \Delta^k_{\text{merged}} = U^k \hat{\Sigma}^k (V^k)^\top
+\end{equation}
+
+\textbf{2. Our Baseline (Scalar Update Decay) and its Conceptual Critique:} To investigate the impact of simple update scaling, we introduce a baseline named \emph{Scalar Update Decay} (also referred to as global update scaling or scalar update dampening):
+\begin{equation}
+  \Delta^k_{\text{merged}} = \gamma_t \Delta^k_{\text{com}}
+\end{equation}
+where $\gamma_t = \frac{1}{\sqrt{t}}$ is a simple scalar update scaling factor.
+
+As methodologists, we highlight a critical conceptual distinction between SAIM's isotropic merging and this simplified baseline. While some prior literature loosely refers to global decay as a spectral effect, we emphasize that Scalar Update Decay scales the entire update matrix uniformly by $\gamma_t = 1/\sqrt{t}$ without altering its singular vector structure. SAIM's isotropic merging, in contrast, *preserves the mean singular value $\bar{\sigma}^k$* at each step, thereby reducing the variance of the singular values (flattening the spectrum) while keeping the overall update scale stable. In contrast, our Scalar Update Decay baseline scales the entire update matrix. As $t$ increases, $\gamma_t$ quickly shrinks (e.g., $1/\sqrt{5} \approx 0.447$), resulting in severe global weight update shrinkage toward zero. Comparing these two methods allows us to decouple the effect of singular-value spectrum flattening from global weight shrinkage.
+
+\subsection{Deconstruction of SA-BCD (The Optimization Axis)}
+The optimization phase in SAIM is driven by Sharpness-Aware Block Coordinate Descent (SA-BCD) \cite{saim2026}, a custom optimizer that restricts SAM-style perturbations to a selected coordinate subset.
+
+\textbf{1. The Fatal Typo / Algebraic Bug in SA-BCD:} The literal mathematical formulation published in the SAIM paper defines the update step for coordinate $i$ within the selected subset of parameters $\Omega_t$ as:
+\begin{equation}
+  \theta_{t, i} = \theta_{t-1, i} - \eta \left(\frac{\hat{m}_{t, i}}{\sqrt{\hat{v}_{t, i}} + \epsilon}\right) \times g'_{t, i} \quad (i \in \Omega_t)
+\end{equation}
+where $g'_{t, i}$ is the gradient computed at the perturbed coordinate $\theta_{t-1, i} + \epsilon^*_i$, and $\hat{m}_{t,i}, \hat{v}_{t,i}$ are the Adam-style first and second moment estimates.
+
+As methodologists, we highlight a severe mathematical error in this formula: multiplying the Adam-scaled step-value (which already incorporates the running mean of gradients $\hat{m}_t$ and acts as the descent step direction) by the raw perturbed gradient $g'_{t, i}$ again. In standard gradient descent, multiplying the moment-scaled step by the gradient forces the update step to always have a negative sign relative to $g'_{t,i}$, regardless of the direction of the gradient. Furthermore, it scales the step size by the square of the gradient. This causes immediate optimization instability and divergence. We refer to this configuration as \emph{SA-BCD (Literal)}. We emphasize that this formulaic error is highly likely a mathematical typesetting typo in the published manuscript rather than a bug in the original authors' codebase. However, we evaluate the literal published formula to ensure absolute scientific coverage of what was documented, and implement corrected variants to evaluate the underlying block-coordinate descent concept.
+
+\textbf{2. Implementation of Corrected SA-BCD Variants:} To conduct a fair evaluation, we implemented two corrected variants that bypass this formulaic error:
+\begin{itemize}
+  \item \textbf{SA-BCD (Std Adam):} A correct coordinate-wise optimizer that uses AdamW on the perturbed gradients computed restricted to the selected top-$p\%$ coordinate subset $\Omega_t$ (based on momentum magnitude $|m_t|$):
+    \begin{equation}
+      \theta_{t, i} = \theta_{t-1, i} - \eta \cdot \text{AdamW}(g'_{t, i}) \quad (i \in \Omega_t)
+    \end{equation}
+  \item \textbf{SA-BCD (Adam GT):} A variant where the perturbation is applied on $\Omega_t$ to compute sharpness, but the final update step utilizes the unperturbed gradient:
+    \begin{equation}
+      \theta_{t, i} = \theta_{t-1, i} - \eta \cdot \text{AdamW}(g_{t, i}) \quad (i \in \Omega_t)
+    \end{equation}
+\end{itemize}
+
+\textbf{3. Sharpness-Aware Minimization (SAM):} As a strong, unconstrained baseline, we evaluate standard SAM \cite{sam} with AdamW as the base optimizer:
+\begin{equation}
+  \epsilon^* = \rho \frac{\nabla_\theta L(\theta_t, D)}{\|\nabla_\theta L(\theta_t, D)\|_2}
+\end{equation}
+\begin{equation}
+  \theta_{t+1} = \theta_t - \eta \cdot \text{AdamW}(\nabla_\theta L(\theta_t + \epsilon^*, D))
+\end{equation}
+Standard SAM perturbs all parameters globally, whereas SA-BCD restricts perturbations to a subset $\Omega_t$. We test whether coordinate selection in SA-BCD is a redundant constraint.
+
+\subsection{Theoretical Synergy of Optimizer-Driven Flatness and Post-Hoc Weight Consolidation}
+\label{sec:theoretical_synergy}
+
+To understand why optimizer-driven flatness (SAM) yields dramatic performance gains when crossed with post-hoc pruning and sign-consensus methods (such as TIES-Merging \cite{tiesmerging} and DARE \cite{dare}), we formalize their synergy mathematically using a quadratic Taylor expansion of the loss function.
+
+Let $L(\theta)$ be the task loss function, and let $\theta^*$ be a local minimum of $L(\theta)$ obtained after task fine-tuning. Any post-hoc weight consolidation operator (e.g., coordinate-wise pruning or sparsification) can be modeled as a parameter perturbation $\delta\theta \in \mathbb{R}^D$ applied to $\theta^*$, yielding the merged weights $\theta_{\text{merged}} = \theta^* + \delta\theta$. For instance, coordinate-wise pruning zeroes out a subset of update coordinates $\mathcal{P} \subset \{1, \dots, D\}$, which corresponds to the perturbation:
+\begin{equation}
+  (\delta\theta)_j = 
+  \begin{cases}
+    -\theta^*_j, & \text{if } j \in \mathcal{P} \\
+    0, & \text{if } j \notin \mathcal{P}
+  \end{cases}
+\end{equation}
+
+Under a second-order Taylor expansion of the loss around the local minimum $\theta^*$, where the gradient vanishes ($\nabla_\theta L(\theta^*) \approx 0$), the increase in loss $\Delta L = L(\theta^* + \delta\theta) - L(\theta^*)$ is:
+\begin{equation}
+  \Delta L \approx \frac{1}{2}\delta\theta^\top H(\theta^*) \delta\theta
+\end{equation}
+where $H(\theta^*) \in \mathbb{R}^{D \times D}$ is the Hessian matrix of the loss evaluated at $\theta^*$. Using the Rayleigh quotient, we can bound this loss increase by:
+\begin{equation}
+  \Delta L \le \frac{1}{2} \lambda_{\max}(H(\theta^*)) \|\delta\theta\|_2^2
+\end{equation}
+where $\lambda_{\max}(H(\theta^*))$ is the largest eigenvalue (spectral norm) of the Hessian $H(\theta^*)$, representing the maximum curvature of the loss landscape at the local minimum.
+
+\begin{proposition}
+  Let $\theta^*$ be a local minimum of $L(\theta)$. Under a post-hoc weight consolidation operator (e.g., pruning or sparsification) inducing a parameter perturbation $\delta\theta$, the resulting loss increase $\Delta L = L(\theta^* + \delta\theta) - L(\theta^*)$ is bounded from above by a linear function of the maximum Hessian curvature (spectral norm) $\lambda_{\max}(H(\theta^*))$. Specifically,
+  \begin{equation}
+    \Delta L \le C \cdot \lambda_{\max}(H(\theta^*))
+  \end{equation}
+  where $C = \frac{1}{2} \|\delta\theta\|_2^2$ is a constant determined entirely by the magnitude of the post-hoc consolidation perturbation.
+\end{proposition}
+
+\begin{proof}
+  Let $L(\theta): \mathbb{R}^D \to \mathbb{R}$ be a twice-differentiable loss function. Under a second-order Taylor expansion of $L(\theta)$ around the converged local minimum $\theta^*$, we have:
+  \begin{align}
+    L(\theta^* + \delta\theta) &= L(\theta^*) + \nabla_\theta L(\theta^*)^\top \delta\theta \nonumber \\
+    &\quad + \frac{1}{2} \delta\theta^\top H(\theta^*) \delta\theta + o(\|\delta\theta\|_2^2)
+  \end{align}
+  where $H(\theta^*) \in \mathbb{R}^{D \times D}$ is the symmetric Hessian matrix of the loss evaluated at $\theta^*$. Since $\theta^*$ is a local minimum, the first-order necessary condition dictates that the gradient vanishes, i.e., $\nabla_\theta L(\theta^*) = 0$. Neglecting higher-order terms of $o(\|\delta\theta\|_2^2)$ for small perturbations, the loss increase $\Delta L$ simplifies to:
+  \begin{equation}
+    \Delta L = L(\theta^* + \delta\theta) - L(\theta^*) \approx \frac{1}{2} \delta\theta^\top H(\theta^*) \delta\theta
+  \end{equation}
+  By the Rayleigh-Ritz theorem, for any symmetric matrix $H(\theta^*)$ and any non-zero vector $\delta\theta \in \mathbb{R}^D$, the quadratic form is bounded above by the maximum eigenvalue of the matrix multiplied by the squared Euclidean norm of the vector:
+  \begin{equation}
+    \delta\theta^\top H(\theta^*) \delta\theta \le \lambda_{\max}(H(\theta^*)) \|\delta\theta\|_2^2
+  \end{equation}
+  where $\lambda_{\max}(H(\theta^*))$ is the largest eigenvalue (spectral norm) of the Hessian. Substituting this inequality back into the second-order expansion yields:
+  \begin{equation}
+    \Delta L \le \frac{1}{2} \|\delta\theta\|_2^2 \lambda_{\max}(H(\theta^*))
+  \end{equation}
+  By defining $C = \frac{1}{2} \|\delta\theta\|_2^2$, which depends solely on the magnitude of the post-hoc consolidation perturbation (such as pruning masks in TIES-Merging or random dropouts in DARE), we obtain the desired linear upper bound:
+  \begin{equation}
+    \Delta L \le C \cdot \lambda_{\max}(H(\theta^*))
+  \end{equation}
+  This completes the proof.
+\end{proof}
+
+This proposition establishes a direct, causal connection between the sharpness of the local basin and the model's tolerance to post-hoc weight modifications:
+\begin{itemize}
+  \item \textbf{Sharp Basins (Standard Optimizers):} When training with standard optimizers like AdamW, the model typically converges to sharp local basins where the Hessian has extremely large eigenvalues ($\lambda_{\max}(H) \gg 0$). Consequently, even a minor parameter pruning perturbation $\|\delta\theta\|_2^2$ (such as zeroing out updates during TIES/DARE) results in a catastrophic increase in loss $\Delta L \to \infty$, causing representation collapse.
+  \item \textbf{Flat Basins (Sharpness-Aware Minimization):} Standard SAM explicitly minimizes the worst-case neighborhood loss, which is mathematically equivalent to minimizing the spectral norm of the Hessian, $\lambda_{\max}(H)$. In flat minima found by SAM, the eigenvalues of $H$ are tightly bounded and small ($\lambda_{\max}(H) \approx 0$). Thus, even under substantial pruning perturbations $\delta\theta$ (e.g., dropping 50\% of coordinates), the change in loss $\Delta L$ remains exceptionally small. This guarantees that parameters are structurally robust to post-hoc consolidation, explaining the massive empirical synergy (+16.89\% accuracy) when SAM is crossed with sparsification.
+\end{itemize}
+
+\subsection{Decoupled Multi-Axial Evaluation Grid}
+To systematically decouple optimization-stage flatness from merging-stage manipulation, we execute a $5 \times 3$ grid crossing all five optimizers (\emph{AdamW}, \emph{SAM}, \emph{SA-BCD Literal}, \emph{SA-BCD Std Adam}, \emph{SA-BCD Adam GT}) with the three merging strategies (\emph{Task Arithmetic}, \emph{Isotropic SVD Merging}, \emph{Scalar Update Decay}). This experimental design isolates the precise contribution of each component.

@@ -1,0 +1,26 @@
+# Intermediate Review Report 2: Novelty Check and Positioning
+
+## 1. Key Novel Aspects
+The primary novelty of this paper lies in its **evaluative, diagnostic, and methodological contributions** to the field of model merging and test-time adaptation. Rather than presenting yet another hyperparameter-rich adaptation method, this paper acts as a rigorous scientific check on existing literature.
+
+Specific novel aspects of this work include:
+1.  **Formulation and Resolution of the "Overfitting-Optimizer Paradox":** The paper is the first to identify and systematically analyze how different optimizers manifest transductive overfitting during test-time adaptation. It shows that under zero-order search, overfitting appears as high-frequency optimization noise easily regularized via spatial averaging, whereas under first-order gradient descent, the optimizer finds a highly precise, delicate configuration of layer coefficients that collapses under shuffling or averaging but fails to improve generalizable test-set performance.
+2.  **Formulation of the "SVHN Rescue vs. CIFAR-10 Collapse Trade-off":** The paper exposes how average multi-task accuracy can mask catastrophic single-task performance collapse. It demonstrates that spatial averaging acts as a regularizer that breaks joint entropy bias and rescues simpler/sacrificial tasks (like SVHN) at the direct cost of destroying delicate layer-specific hierarchies needed for complex tasks (like CIFAR-10).
+3.  **Discovery and Analysis of "CKA-Accuracy Decoupling":** The paper is the first to systematically apply linear Centered Kernel Alignment (CKA) to model merging and expose a profound decoupling between high-level activation correlation ($>0.95$ CKA) and fine-grained classification accuracy, proving that CKA is an unreliable proxy for weight-space decision boundary integrity.
+4.  **Mathematical and Empirical Validation of "Proximity Coefficient Regularization":** To address the discovered transductive overfitting, the authors mathematically formulate and empirically validate a regularization objective that penalizes parameter drift from a stable, uniform baseline, showing it achieves a peak of 86.57% test accuracy and stabilizes first-order gradient descent.
+5.  **Calibration Sample Size Threshold Mapping:** In Appendix C, the paper is the first to empirically map the transductive overfitting threshold, showing that test-time adaptation requires a minimum calibration sample size (e.g., $N_{\text{cal}} \ge 128$) to generalize effectively on unseen test samples.
+6.  **Comprehensive Diagnostic Suite:** The paper introduces three simple, elegant control treatments—shuffling, averaging, and noise perturbations—evaluated across three independent random seeds, establishing a standardized framework to verify whether learned layer coefficients capture physical representational hierarchies.
+
+## 2. Delta from Prior Work
+The paper directly critiques and differentiates itself from:
+*   **AdaMerging (Yang et al., 2024):** AdaMerging proposed layer-wise test-time adaptive model merging. The delta here is that this paper evaluates AdaMerging under its proposed control treatments across multiple seeds and proves that the learned layer-specificity is largely redundant for simple tasks, and behaves as an overfit artifact.
+*   **SyMerge (Jung et al., 2025):** SyMerge jointly adapts coefficients and classifiers. This paper's delta is identifying and warning against the risk of transductive overfitting and joint entropy task-bias when adapting parameters directly on target evaluation streams, and proposing a robust proximity-based regularization method.
+*   **Task Arithmetic (Ilharco et al., 2023):** Traditional task arithmetic uses global scales. This paper's delta is showing that a properly regularized, simple task-wise scalar (Spatial Mean) achieves comparable or superior average performance compared to complex layer-wise schemes, and preserves expert representations consistently better under zero-order search, while exposing the genuine physical limits where layer-specificity is required (complex tasks like CIFAR-10).
+
+Unlike prior work that evaluates merging purely on validation accuracies, this paper performs a multidimensional study involving parameter sensitivity (noise sweeps), activation similarity (CKA), parameter structure (layer permutations), regularization weight sweeps, and calibration sample size sweeps.
+
+## 3. Characterization of Novelty
+The novelty of this paper is **extraordinary and highly valuable for the machine learning community**.
+In a field where papers often compete to introduce increasingly complex and fine-grained schemes, evaluative and diagnostic papers of this caliber serve as crucial "brakes" or course-corrections. They prevent the community from wasting effort on overparameterized, over-hyped trends that do not generalize. 
+
+The paper is exceptionally original in its approach, combining standard ML metrics with interpretability tools (CKA) and comprehensive empirical sweeps to provide a deep, physical explanation for why simpler, averaged models can outperform highly optimized ones, and how to properly regularize them. This level of critical analysis is highly original and necessary.

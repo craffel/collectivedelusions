@@ -1,0 +1,100 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we present the mathematical and architectural formulation of our proposed \textbf{Q-PolyMerge} framework. We detail our polynomial subspace parameterization, our symmetric uniform post-training quantization operator, our test-time adaptation objective, and our two optimization pathways.
+
+\subsection{Preliminaries \& Task Vectors}
+Let $\Theta_{\text{base}} \in \mathbb{R}^M$ denote the parameters of a pre-trained base backbone model (e.g., a Vision Transformer). Let $\{\Theta_k\}_{k=1}^K$ represent a set of $K$ independent task-specific expert checkpoints, each fine-tuned from the identical base checkpoint $\Theta_{\text{base}}$ on a distinct downstream dataset. We partition the backbone parameters into $L$ sequential layer-specific parameter blocks (such as attention weight matrices, feed-forward layers, or projection matrices). For our Vision Transformer (ViT-Tiny) setup, the backbone is partitioned into $L=14$ blocks, where Layer 0 represents the patch embedding layer, Layers 1--12 correspond to the 12 sequential Transformer blocks, and Layer 13 represents the final layer normalization block. 
+
+For each layer block $l \in \{0, 1, \dots, L-1\}$, the expert task vector $\mathbf{\Delta}_{k, l} \in \mathbb{R}^{M_l}$ is defined as the parameter difference between the expert weights and the base weights:
+\begin{equation}
+\mathbf{\Delta}_{k, l} = \Theta_{k, l} - \Theta_{\text{base}, l}
+\end{equation}
+The classic task arithmetic framework \cite{ilharco2022editing} merges these task vectors into a single unified multi-task model using static, uniform scaling coefficients. Under test-time adaptation, we seek layer-wise and expert-wise coefficients $\lambda_{k, l} \in \mathbb{R}$ to form a continuous merged model before quantization:
+\begin{equation}
+\label{eq:continuous_merge}
+\Theta_{\text{merged}, l} = \Theta_{\text{base}, l} + \sum_{k=1}^K \lambda_{k, l} \mathbf{\Delta}_{k, l}
+\end{equation}
+
+\subsection{Continuous Polynomial Subspace Parameterization}
+Under test-time adaptation, optimizing individual coefficients $\lambda_{k, l}$ independently for each layer $l$ and task $k$ requires learning $L \times K$ parameters. On small, unlabeled on-device calibration batches, this high dimensionality allows the optimizer to overfit to statistical noise in the calibration stream. This \emph{Overfitting-Optimizer Paradox} leads to highly jagged layer-wise trajectories that generalize poorly to held-out test data.
+
+To resolve this, Q-PolyMerge constrains the merging coefficients to lie within a continuous, low-degree polynomial subspace of normalized layer depth. We define the layer coefficient $\lambda_{k, l}(\boldsymbol{\alpha})$ as a polynomial of degree $d$ evaluated at the normalized depth $\bar{l} = \frac{l}{L-1} \in [0, 1]$:
+\begin{equation}
+\label{eq:polynomial_mapping}
+\lambda_{k, l}(\boldsymbol{\alpha}) = \sum_{j=0}^d \alpha_{k, j} \cdot \left( \frac{l}{L-1} \right)^j
+\end{equation}
+where $\boldsymbol{\alpha} = \{ \alpha_{k, j} \} \in \mathbb{R}^{K \times (d+1)}$ represents the small set of learnable continuous polynomial parameters. Normalizing the layer indices to the compact domain $[0, 1]$ is a crucial operational detail: it guarantees numerical stability by preventing polynomial terms from diverging in deep architectures, and it ensures scale invariance across networks of varying depths.
+
+By substituting Equation \ref{eq:polynomial_mapping} into Equation \ref{eq:continuous_merge}, the continuous merged weights at layer $l$ are governed by:
+\begin{equation}
+\Theta_{\text{merged}, l}(\boldsymbol{\alpha}) = \Theta_{\text{base}, l} + \sum_{k=1}^K \left[ \sum_{j=0}^d \alpha_{k, j} \left( \frac{l}{L-1} \right)^j \right] \mathbf{\Delta}_{k, l}
+\end{equation}
+This projects the learnable dimensions from $L \times K$ down to just $(d+1) \times K$. For a standard network with $L=14$ layers and $K=4$ tasks using a quadratic polynomial ($d=2$), Q-PolyMerge reduces the optimization space from 56 parameters to just 12, a \textbf{78.6\% search space reduction}. Bounding the coefficients to a smooth polynomial acts as a mathematical low-pass filter, filtering out high-frequency optimization noise and preventing overfitting.
+
+While the standard monomial basis $\{1, \bar{l}, \bar{l}^2, \dots\}$ is numerically stable and highly performant for low-degree polynomial constraints ($d \le 3$), scaling to extremely deep networks (such as 32-to-80 layer foundation models) can cause monomial bases to become ill-conditioned. In such deep regimes, alternative orthogonal polynomial bases—such as Chebyshev polynomials of the first kind $T_j(\cdot)$—can be seamlessly integrated to prevent Runge's boundary oscillations. We detail these orthogonal scaling pathways and formulations in Appendix~\ref{sec:appendix_chebyshev_scaling}.
+
+\subsection{Symmetric Uniform Post-Training Quantization}
+We compress the merged model to low-bit formats using a symmetric uniform post-training quantization operator $q(\cdot)$.
+For standard 8-bit quantization (INT8), we employ per-tensor uniform quantization. For aggressive 4-bit quantization (INT4), to protect coordinate alignment and mode connectivity from extreme outlier values, we mandate per-channel uniform weight quantization.
+
+The per-channel quantization operator is formulated as:
+\begin{equation}
+q(W_{c, \cdot}) = \text{clamp}\left( \text{round}\left( \frac{W_{c, \cdot}}{S_c} \right), -2^{b-1}, 2^{b-1}-1 \right) \cdot S_c
+\end{equation}
+where $W_{c, \cdot}$ represents the weights of output channel $c$, $b \in \{4, 8\}$ is the bit-width, and $S_c$ is the per-channel scale factor calculated from the absolute maximum weight value in that channel:
+\begin{equation}
+S_c = \frac{\max_i(|W_{c, i}|)}{2^{b-1} - 1}
+\end{equation}
+The quantized merged weights of the model are thus represented as:
+\begin{equation}
+\Theta^q_{\text{merged}, l}(\boldsymbol{\alpha}) = q\left( \Theta_{\text{merged}, l}(\boldsymbol{\alpha}) \right)
+\end{equation}
+
+\subsection{Test-Time Optimization Objective}
+During test-time adaptation, the network receives a streaming calibration batch of unlabeled target images. Adhering to the principles of test-time entropy minimization, we optimize the continuous polynomial parameters $\boldsymbol{\alpha}$ by minimizing the average Shannon entropy of the model's predictions:
+\begin{equation}
+\mathcal{L}_{\text{TTA}}(\boldsymbol{\alpha}) = \sum_{k=1}^K \mathbb{E}_{x \sim \mathcal{D}_k^{\text{unlabeled}}} \left[ H\left( f_{\Theta^q_{\text{merged}}(\boldsymbol{\alpha})}(x) \right) \right]
+\end{equation}
+where $f_{\Theta^q_{\text{merged}}(\boldsymbol{\alpha})}(x)$ is the logit distribution predicted by the fully quantized network, and $H(\mathbf{p}) = -\sum_{c=1}^C p_c \log (p_c + \epsilon)$ represents the Shannon entropy (with a stability constant $\epsilon = 10^{-8}$). Minimizing entropy forces the quantized model's representations to become highly confident, aligning task distributions and mitigating the representational misalignment caused by quantization noise.
+
+To prevent the continuous polynomial parameters $\boldsymbol{\alpha}$ from learning arbitrarily large scaling trajectories that could scale merged weights far outside normal boundaries and trigger severe clipping under the physical quantization operator, we can incorporate a trajectory clamping function or L2 regularization. Specifically, we can restrict the learned layer coefficients $\lambda_{k, l}(\boldsymbol{\alpha})$ to a stable, physically meaningful interpolation interval $[-\gamma, 1+\gamma]$ (where typically $\gamma = 0.5$):
+\begin{equation}
+\tilde{\lambda}_{k, l}(\boldsymbol{\alpha}) = \max\left(-\gamma, \min\left(1+\gamma, \lambda_{k, l}(\boldsymbol{\alpha})\right)\right)
+\end{equation}
+Alternatively, an L2 weight decay term $\frac{\beta}{2} \|\boldsymbol{\alpha}\|_F^2$ can be added directly to the test-time loss $\mathcal{L}_{\text{TTA}}$ to penalize extreme coefficient scales. In our physical PyTorch implementation, we implement both constraints: we clamp the layer coefficients $\lambda_{k, l}$ to the stable interval $[-0.5, 1.5]$ (using $\gamma = 0.5$) and incorporate L2 weight decay on $\boldsymbol{\alpha}$ (with $\beta = 10^{-4}$). Bounding the coefficient trajectories in this manner serves as an essential stability safeguard, protecting the dynamic range of weight values prior to uniform PTQ rounding and further stabilizing adaptation.
+
+\subsection{First-Order Optimization via Straight-Through Estimator}
+Because the $\text{round}$ function in the quantization operator has a derivative of zero almost everywhere, the standard backpropagation of gradients is blocked. We bypass this using the Straight-Through Estimator (STE) \cite{bengio2013estimating}, which approximates the derivative of the rounding operator as the identity mapping during the backward pass:
+\begin{equation}
+\frac{\partial q(W)}{\partial W} \approx \mathbf{I}
+\end{equation}
+Applying the multi-variable chain rule, the gradient of the test-time loss with respect to our learnable polynomial parameter $\alpha_{k, j}$ is computed as:
+\begin{equation}
+\frac{\partial \mathcal{L}_{\text{TTA}}}{\partial \alpha_{k, j}} = \sum_{l=0}^{L-1} \frac{\partial \mathcal{L}_{\text{TTA}}}{\partial \Theta^q_{\text{merged}, l}} \cdot \frac{\partial \Theta^q_{\text{merged}, l}}{\partial \lambda_{k, l}} \cdot \frac{\partial \lambda_{k, l}}{\partial \alpha_{k, j}}
+\end{equation}
+Under the STE approximation, the gradient flows directly through the quantization operator to scale the task vectors:
+\begin{equation}
+\frac{\partial \mathcal{L}_{\text{TTA}}}{\partial \alpha_{k, j}} \approx \sum_{l=0}^{L-1} \left\langle \frac{\partial \mathcal{L}_{\text{TTA}}}{\partial \Theta^q_{\text{merged}, l}}, \mathbf{\Delta}_{k, l} \right\rangle \cdot \left( \frac{l}{L-1} \right)^j
+\end{equation}
+The continuous parameters $\boldsymbol{\alpha}$ are iteratively updated using the first-order Adam optimizer on the device.
+
+\subsection{Zero-Order Optimization via 1+1 Evolution Strategy}
+In real-world microcontroller deployments, backpropagation is highly impractical because caching activations and storing gradient graphs consumes massive amounts of volatile memory (SRAM), which is severely limited on the edge. 
+
+To overcome this constraint, we implement a derivative-free, zero-order optimization pathway based on the 1+1 Evolution Strategy (1+1 ES). This treats the quantized model as a black-box oracle. At each iteration, we perturb the current parameters:
+\begin{equation}
+\boldsymbol{\alpha}_{\text{candidate}} = \boldsymbol{\alpha}_{\text{active}} + \sigma \cdot \mathbf{z}
+\end{equation}
+where $\mathbf{z} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$ and $\sigma$ represents an adaptive step size. We evaluate the candidate model's entropy on the calibration stream. If $\mathcal{L}_{\text{TTA}}(\boldsymbol{\alpha}_{\text{candidate}}) < \mathcal{L}_{\text{TTA}}(\boldsymbol{\alpha}_{\text{active}})$, we accept the candidate: $\boldsymbol{\alpha}_{\text{active}} \leftarrow \boldsymbol{\alpha}_{\text{candidate}}$, and increase $\sigma$ to accelerate search. Otherwise, we reject it and shrink $\sigma$.
+
+Under unconstrained search (Q-Merge 1+1 ES), optimizing in high-dimensional space ($L \times K$ parameters) is extremely inefficient due to the curse of dimensionality, leading to search failure. However, by projecting the search space down to our continuous polynomial parameters (just $(d+1) \times K$ dimensions), the search becomes highly efficient, enabling zero-order optimization to match or exceed gradient methods. Since 1+1 ES only requires standard inference forward passes, it incurs \textbf{zero activation caching, zero gradient overhead, and zero backward-pass memory footprints}, making adaptive on-device low-bit merging physically viable for the first time.
+
+\subsection{Integer-Weight Edge Pipeline}
+To deliver on strict storage and memory-bandwidth constraints where weight transfer dominates energy consumption, we post-hoc quantize the task-specific linear classification heads to 8-bit precision (INT8) after completing the test-time optimization of $\boldsymbol{\alpha}$. This yields a \textbf{fully integer-quantized weight pipeline} (W8 or W4 weight representation across both backbone and classification heads), completely removing the need to store any floating-point weight parameters on disk or flash. 
+
+While intermediate activations, layer normalizations, and attention softmax calculations are maintained in FP16/FP32 formats during inference to preserve representational precision (forming a hybrid-precision pipeline), storing 100\% of the parameters as low-bit integers dramatically cuts DRAM-to-SRAM communication bottlenecks, which are the primary drivers of on-device latency and energy dissipation. 
+
+We acknowledge that in extremely low-power and low-cost microcontroller environments lacking dedicated hardware Floating-Point Units (FPUs) or vector engines supporting FP16, executing activations in floating-point format requires software emulation, which incurs substantial latency and energy penalties. A truly edge-optimal execution pipeline would require transitioning to a \textbf{fully-integerized arithmetic pipeline} (e.g., W8A8 or W4A8 execution), where intermediate activations are also quantized post-hoc, and floating-point operations (such as layer normalization and attention softmax) are replaced with integer shift-and-add arithmetic (using libraries like CMSIS-NN or IREE). 
+
+While implementing fully-integerized activation operators is beyond our current scope, our proposed Q-PolyMerge framework is fundamentally orthogonal to the precision of the activation execution: the continuous polynomial constraint and test-time optimization formulation apply identically under W8A8 or W4A8 integer math, making Q-PolyMerge a highly valuable and adaptable prior for next-generation, integer-only hardware execution.

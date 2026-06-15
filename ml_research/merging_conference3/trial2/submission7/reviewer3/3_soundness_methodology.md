@@ -1,0 +1,13 @@
+# Soundness and Methodology Evaluation
+
+## Clarity of Description
+The description of the methodology is mathematically clear, and the step-by-step derivations in Section 3.3 and Appendix A are algebraic identities that are technically correct. However, the presentation is heavily obscured by unnecessary physical jargon. The paper fails to explicitly acknowledge that its equations are functionally identical to standard deep learning formulations (e.g., temperature-scaled Softmax and standard KL divergence). This lack of transparency makes the methodology appear far more complex and novel than it actually is.
+
+## Appropriateness of Methods
+While the algebraic derivations are sound, several methodological aspects are highly questionable:
+1. **The Physical Metaphor vs. Reality:** The paper claims to establish "a bold new pathway toward fluid, self-crystallizing, and physically grounded artificial generalists." In reality, there is no physical system, no heat bath, and no thermodynamic equilibrium. The "annealing schedule" does not affect the physical state of the weights in a thermodynamic sense; it simply changes the scalar multiplier in the loss function during gradient descent. Over-claiming this metaphor as a "physical grounding" is conceptually misleading.
+2. **Role of Task-wise Thermal Coupling ($\tau_k$):** The authors admit in Section 3.5 that the final classification accuracy is mathematically invariant to the value of $\tau_k$ during evaluation (since dividing logits by a positive constant does not change the $\arg\max$). Therefore, $\tau_k$ is only a training-phase scaling factor. The authors clamp $\tau_k \in [0.2, 5.0]$ to prevent gradient issues. This clamping is highly empirical and arbitrary, suggesting that the "thermal coupling" is highly sensitive and requires careful, manual tuning to avoid numerical instability (NaN gradients).
+3. **Granularity of Merging:** The merging formulation in Equation 1 is standard linear interpolation. Despite the "thermal" framing of the outputs, the parameters themselves are still merged in a cold, static, Euclidean manner. Thus, the actual weight merging is still subject to all the limitations of Euclidean linear interpolation; only the test-time objective used to tune the coefficients is modified.
+
+## Reproducibility
+The methodology appears moderately reproducible. The paper provides a detailed table of network architecture and lists hyperparameters (such as learning rate, steps, and temperature schedules) in the appendix. However, no source code or repository link is provided, which makes verifying the empirical results and checking for potential implementation bugs difficult.

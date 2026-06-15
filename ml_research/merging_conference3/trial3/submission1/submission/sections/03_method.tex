@@ -1,0 +1,123 @@
+\section{Methodology}
+\label{submission:sec:method}
+
+In this section, we formalize the mathematics of multi-task model merging, post-training quantization (PTQ) operators, first-order Straight-Through Estimator (STE) optimization, and our derivative-free 1+1 Evolution Strategy (1+1 ES) comparator. We then introduce the mathematical framing of our multi-axial robustness audit.
+
+\subsection{Multi-Task Model Merging Formulation}
+Let $\theta_{\text{pre}} \in \mathbb{R}^D$ represent the weights of a pre-trained backbone model. Suppose we have $K$ task-specific expert networks, where the weights of the $k$-th expert, denoted by $\theta_k \in \mathbb{R}^D$, have been fine-tuned starting from the shared backbone $\theta_{\text{pre}}$. The parameter differences, known as \emph{task vectors}, are defined as $\tau_k = \theta_k - \theta_{\text{pre}}$ \cite{ilharco2022editing}.
+
+For a transformer architecture consisting of $L$ layers or discrete weight blocks (e.g., self-attention projections, feed-forward layers, and embeddings), we parameterize the merging process using a layer-wise coefficient matrix $\Lambda \in [0, 1]^{K \times L}$. The unquantized merged weights at layer $l \in \{1, \dots, L\}$ are defined as a continuous linear combination of the pre-trained weights and the task vectors:
+\begin{equation}
+    \theta^l_{\text{merged}}(\Lambda) = \theta^l_{\text{pre}} + \sum_{k=1}^K \lambda^l_k (\theta^l_k - \theta^l_{\text{pre}})
+\end{equation}
+where $\lambda^l_k$ is the blending coefficient for expert $k$ at layer $l$. This formulation generalizes standard Task Arithmetic (which uses a uniform scalar $\lambda^l_k = \bar{\lambda}$) and AdaMerging (which learns layer-specific coefficients) \cite{yang2023adamerging}.
+
+\subsection{Post-Training Quantization Operators}
+Post-Training Quantization (PTQ) converts full-precision continuous weights (usually 32-bit or 16-bit floats) into discrete representations using a scaling factor $s$ and zero-point offset $z$ \cite{nagel2021whitepaper}. To present these operations compactly, we let $\lfloor \cdot \rceil$ denote the rounding-to-nearest-integer operator, and let $[x]_L^U = \max(L, \min(x, U))$ represent the element-wise clamping operator. We formalize three key categories of PTQ operators used in our cross-schema evaluation:
+
+\textbf{Uniform Asymmetric Quantization:} For a weight tensor $W$ representing the dynamic merged weights $W = \theta^l_{\text{merged}}(\Lambda)$ at layer $l$, and bit-width $b$, asymmetric quantization maps the active weight range $[\min(W), \max(W)]$ to a $b$-bit integer interval $[-2^{b-1}, 2^{b-1}-1]$. Crucially, we clarify that the quantization scale $s$ and zero-point $z$ are \textbf{dynamically re-calculated at every single optimization forward pass} as the merging coefficients $\Lambda$ shift. While this ensures that the quantization grid remains adaptive to the active weight range, it introduces a highly non-linear, circular feedback loop (coefficient updates shift weight ranges $\to$ scale parameters shift $\to$ rounding thresholds move), which generates massive gradient noise under Straight-Through approximations:
+\begin{align}
+    s_{\text{asym}} &= \frac{\max(W) - \min(W)}{2^b - 1} \\
+    z_{\text{asym}} &= \left\lfloor \frac{-\min(W)}{s_{\text{asym}}} \right\rceil - 2^{b-1} \\
+    W_{\text{quant}} &= \left[ \left\lfloor \frac{W}{s_{\text{asym}}} \right\rceil + z_{\text{asym}} \right]_{-2^{b-1}}^{2^{b-1}-1}
+\end{align}
+The dequantized continuous weight representation is reconstructed via:
+\begin{equation}
+    Q_{\text{asym}}(W, b) = s_{\text{asym}} \cdot (W_{\text{quant}} - z_{\text{asym}})
+\end{equation}
+
+\textbf{Uniform Symmetric Quantization:} Under symmetric quantization, the range is forced to be symmetric around zero, setting $z_{\text{sym}} = 0$:
+\begin{align}
+    s_{\text{sym}} &= \frac{\max(|W|)}{2^{b-1} - 1} \\
+    Q_{\text{sym}}(W, b) &= s_{\text{sym}} \cdot \left[ \left\lfloor \frac{W}{s_{\text{sym}}} \right\rceil \right]_{-2^{b-1}+1}^{2^{b-1}-1}
+\end{align}
+
+\textbf{Granularity (Tensor-wise vs. Channel-wise):} Under a \emph{tensor-wise} schema, a single scale $s$ and zero-point $z$ are computed for the entire weight tensor $W$. Under a \emph{channel-wise} schema, scales and zero-points are calculated independently for each output channel $c$ of the weight matrix (i.e., $W[c, \dots]$), significantly increasing representation expressiveness at the cost of additional hardware tracking metadata:
+\begin{equation}
+    Q_{\text{channel}}(W, b)[c, \dots] = Q\left(W[c, \dots], b\right)
+\end{equation}
+
+\textbf{Double Quantization (DQ):} In extreme low-bit regimes, double quantization compresses the scale factors $s$ themselves from FP32 to an 8-bit representation, further minimizing memory footprint:
+\begin{equation}
+    Q_{\text{DQ}}(W, b) = Q\left(s, 8\right) \cdot (W_{\text{quant}} - z)
+\end{equation}
+
+\textbf{Gradient Tracking of Quantization Parameters (Active vs. Detached):} A key theoretical question in quantization-aware optimization is whether gradients propagate back through the scale and zero-point parameters. In our implementation, we clarify that the scale factor $s$ is computed as a continuous function of the weight range (specifically $\max(W)$ and $\min(W)$) and is fully active (not detached) in PyTorch's computational graph. Thus, autograd propagates gradients through $s$ back to the continuous weights $W$ and merging coefficients $\Lambda$. Conversely, the zero-point $z$ is rounded using the non-differentiable $\lfloor \cdot \rceil$ operator without any straight-through estimation, meaning its gradient path is mathematically zero almost everywhere. This creates a highly asymmetric, one-sided gradient flow: the optimizer accounts for how updates adjust the quantization grid's step-size scale but is blind to shifts in the grid offset. While detaching both scale and zero-point parameters (as in standard PyTorch \texttt{FakeQuantize}) stabilizes training by keeping the grid static during backpropagation, it detaches the grid from the weights, causing the optimizer to completely ignore how coefficient shifts alter scale ranges. This trade-off between grid stability and grid adaptability is a major source of Straight-Through gradient noise.
+
+\textbf{Hardware Deployment Scenarios and Chip Architectures:} In modern edge-computing deployments, different hardware ASICs and software runtimes impose strict constraints on which quantization schemas can be natively accelerated. For instance, low-power edge TPU chips (e.g., Google Edge TPU) and microcontrollers (e.g., ARM Cortex-M utilizing CMSIS-NN) often strictly mandate uniform symmetric integer arithmetic with tensor-wise scaling to simplify computational logic and avoid per-channel accumulator hardware overhead. Conversely, high-performance edge accelerators (such as Qualcomm Hexagon DSPs, Apple Neural Engine, or NVIDIA TensorRT under INT8/INT4 precision) natively support asymmetric channel-wise quantization, enabling much higher accuracy retention at the cost of more complex scale-tracking circuitry. Double Quantization (DQ) is a core component of modern software-centric compression standards (such as QLoRA on desktop/server GPUs), minimizing memory footprints in VRAM but introducing additional dequantization latency overhead. This architectural heterogeneity highlights the massive practical deployment risk of the Cross-Schema Generalization Gap: coefficients optimized for one accelerator may collapse entirely when run on a different edge chip.
+
+\subsection{First-Order Optimization via Straight-Through Estimators (STE)}
+The optimization of the merging coefficient matrix $\Lambda$ is framed as fully test-time and unsupervised, utilizing prediction entropy minimization \cite{wang2020tent, qmerge2025} over a tiny calibration stream $D_{\text{cal}} = \{X_{i, k}\}_{i=1}^N$ of size $N$ per task. 
+
+Specifically, let $p_{k, i}(c) = P(y=c \mid X_{i, k}; \theta_{\text{quant}}(\Lambda))$ represent the predicted probability for class $c$ on the $i$-th sample of task $k$, where the network weights are merged under coefficients $\Lambda$ and quantized under the optimization schema: $\theta_{\text{quant}}(\Lambda) = Q_{\text{opt}}(\theta_{\text{merged}}(\Lambda), b)$. The base unsupervised objective is formulated as prediction entropy minimization:
+\begin{equation}
+    \mathcal{L}_{\text{entropy}}(\Lambda) = -\frac{1}{N \cdot K} \sum_{k=1}^K \sum_{i=1}^N \sum_{c=1}^C p_{k, i}(c) \log p_{k, i}(c)
+\end{equation}
+
+To stabilize the optimization trajectory and mitigate boundary overfitting under low-bit schemas, we evaluate Elastic Spatial Regularization (ESR) as an auxiliary loss term. Specifically, we formalize spatial smoothing as a layer-wise Total Variation (TV) regularizer over adjacent layers for each expert $k$:
+\begin{equation}
+    \mathcal{R}_{\text{TV}}(\Lambda) = \sum_{k=1}^K \sum_{l=1}^{L-1} (\lambda_k^{l+1} - \lambda_k^l)^2
+\end{equation}
+The total regularized optimization objective is then formulated as:
+\begin{equation}
+    \mathcal{L}_{\text{total}}(\Lambda) = \mathcal{L}_{\text{entropy}}(\Lambda) + \alpha \mathcal{R}_{\text{TV}}(\Lambda)
+\end{equation}
+where $\alpha \ge 0$ is the regularization scaling coefficient (set to $\alpha = 0.5$ in our experiments).
+
+Because the rounding operator $\text{round}(x)$ has a derivative of zero almost everywhere, backpropagating the gradient of $\mathcal{L}_{\text{total}}$ with respect to the continuous parameters $\Lambda$ is impossible under standard auto-differentiation frameworks. To bypass this, Q-Merge uses the Straight-Through Estimator (STE) \cite{bengio2013ste}:
+\begin{equation}
+    \frac{\partial \text{round}(x)}{\partial x} \approx 1
+\end{equation}
+This allows first-order gradient descent to propagate loss signals through the rounding operator to the continuous coefficients:
+\begin{equation}
+    \Lambda^{(t+1)} = \Lambda^{(t)} - \eta \cdot \text{Adam}\left( \nabla_{\Lambda} \mathcal{L}_{\text{total}}(\Lambda^{(t)}) \right)
+\end{equation}
+where $\text{Adam}(g^{(t)})$ is a shorthand for the bias-corrected update vector:
+\begin{equation}
+    \text{Adam}(g^{(t)}) = \frac{\hat{m}^{(t)}}{\sqrt{\hat{v}^{(t)}} + \epsilon_{\text{stab}}}
+\end{equation}
+which is computed from the first and second raw moment estimates, $m^{(t)}$ and $v^{(t)}$, and their bias-corrected equivalents, $\hat{m}^{(t)}$ and $\hat{v}^{(t)}$:
+\begin{align}
+    m^{(t)} &= \beta_1 m^{(t-1)} + (1 - \beta_1) g^{(t)} \\
+    v^{(t)} &= \beta_2 v^{(t-1)} + (1 - \beta_2) (g^{(t)})^2 \\
+    \hat{m}^{(t)} &= \frac{m^{(t)}}{1 - \beta_1^t} \\
+    \hat{v}^{(t)} &= \frac{v^{(t)}}{1 - \beta_2^t}
+\end{align}
+with hyperparameters $\beta_1, \beta_2 \in [0, 1)$ tracking historical gradients $g^{(\tau)} = \nabla_{\Lambda} \mathcal{L}_{\text{total}}(\Lambda^{(\tau)})$ for $\tau \le t$, and $\epsilon_{\text{stab}}$ being a small numerical stability constant.
+
+\subsection{Derivative-Free Optimization: 1+1 Evolution Strategy}
+As a critical methodological comparator, we introduce a derivative-free black-box optimizer: a \emph{1+1 Evolution Strategy (1+1 ES)} \cite{rechenberg1978es}. Unlike STE, which relies on a highly biased, artificial first-order approximation, 1+1 ES treats the quantized loss landscape as a true black-box, performing stochastic search over the continuous space of merging coefficients.
+
+At each generation $t$, a candidate coefficient matrix $\Lambda'$ is proposed by adding Gaussian noise scaled by a step size $\sigma^{(t)}$ to the current parent $\Lambda^{(t)}$:
+\begin{equation}
+    \Lambda' = \text{clamp}\left(\Lambda^{(t)} + \sigma^{(t)} \cdot Z, [0, 1]^{K \times L}\right), \quad Z \sim \mathcal{N}(0, I)
+\end{equation}
+The candidate is evaluated under the quantized objective. We apply Rechenberg's $1/5$-th success rule to adapt the mutation step size $\sigma^{(t)}$ dynamically:
+\begin{equation}
+    \Lambda^{(t+1)} = \begin{cases}
+        \Lambda' & \text{if } \mathcal{L}_{\text{entropy}}(\Lambda') \le \mathcal{L}_{\text{entropy}}(\Lambda^{(t)}) \\
+        \Lambda^{(t)} & \text{otherwise}
+    \end{cases}
+\end{equation}
+\begin{equation}
+    \sigma^{(t+1)} = \begin{cases}
+        \sigma^{(t)} \cdot \exp(0.2) & \text{if candidate is accepted} \\
+        \sigma^{(t)} \cdot \exp(-0.05) & \text{otherwise}
+    \end{cases}
+\end{equation}
+This approach requires no gradient computations or STE approximations, ensuring that search trajectories are guided entirely by true, evaluated loss values.
+
+\subsection{Multi-Axial Deconstruction Metrics}
+To quantify the vulnerability of quantization-aware model merging, we define two crucial evaluation metrics:
+
+\textbf{Cross-Schema Generalization Gap:} Let $\text{Acc}_Q(\Lambda)$ represent the multi-task accuracy of the model merged under coefficients $\Lambda$ and quantized under schema $Q$. Let $\Lambda^*$ be the optimal merging coefficients learned under the source optimization schema $Q_{\text{opt}}$. The cross-schema generalization gap when deploying these coefficients to a hardware-relevant target evaluation schema $Q_{\text{eval}}$ is defined as:
+\begin{equation}
+    \Delta \text{Acc}(Q_{\text{opt}} \to Q_{\text{eval}}) = \text{Acc}_{Q_{\text{eval}}}(\Lambda^*) - \text{Acc}_{Q_{\text{opt}}}(\Lambda^*)
+\end{equation}
+A large negative gap indicates severe \emph{Quantization-Operator Overfitting}, proving that the optimization has merely adapted to the simulated rounding boundaries of $Q_{\text{opt}}$ rather than aligning weights in a quantization-robust configuration.
+
+\textbf{Calibration Stream Perturbations:} We parameterize calibration stream corruptions by adding Gaussian input noise:
+\begin{equation}
+    \tilde{X} = X + \epsilon, \quad \epsilon \sim \mathcal{N}(0, \sigma^2_{\text{noise}} I)
+\end{equation}
+and class skewness using a Gini-skewed sampling function where a dominant class receives $80\%$ of the streaming samples, simulating extreme test-time class distribution shifts.

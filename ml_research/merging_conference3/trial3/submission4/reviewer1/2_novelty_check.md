@@ -1,0 +1,12 @@
+# 2. Novelty Check
+
+## Assessment of Key Novel Aspects and Delta
+The paper operates at the intersection of model merging, network pruning, and test-time adaptation. 
+* **Prior Work Limitations:** Existing model merging techniques (such as Task Arithmetic and AdaMerging) assume fully dense merged models, which are too large for edge deployment. Existing pruning methods compress a single model rather than address multi-task spatial and representational conflicts during merging.
+* **The ZipMerge Proposal:** Mathematically, the attempt to co-optimize merging coefficients $\Lambda$ and dynamic pruning masks $M(\Lambda)$ at test-time via Straight-Through Estimators (STE) or zero-order Evolution Strategies (ES) is a novel formulation. It represents a "delta" in how compression and merging are handled jointly rather than sequentially.
+* **The True Scientific Novelty:** Ironically, the primary scientific novelty and value of this paper do not reside in the proposed ZipMerge algorithm itself (which fails to solve the representational collapse problem under extreme domain shift). Instead, the novelty lies in the **rigorous, transparent, and comprehensive mapping of the failure modes of such test-time co-optimization schemes**. 
+
+## Characterization of Novelty
+* **Algorithmic Novelty (Incremental to Moderate):** The combining of STEs, Evolution Strategies, magnitude pruning, and entropy minimization is a creative combination of existing techniques. It is methodologically sound but incremental from an optimization perspective.
+* **Empirical and Insight Novelty (Significant):** The deep post-mortem analysis provides highly significant, original insights for the machine learning community. By demonstrating that a complex, adaptive test-time optimization framework is consistently outperformed by a simple, unoptimized decoupled baseline (**Prune-then-Merge**), the paper highlights a fundamental lesson: **complexity does not guarantee performance, and simple decoupled operations can be structurally superior due to implicit regularizations.**
+* **PEFT/LoRA and Procrustes Alignment Insights (Significant):** The paper’s empirical validation of LoRA merging (+29% gain) and the introduction of **Orthogonal Procrustes SVD Alignment** (+16.45% absolute improvement over unaligned LoRA) represent a highly novel, lightweight, and data-free alignment mechanism that directly addresses coordinate basis mismatch in parameter space.

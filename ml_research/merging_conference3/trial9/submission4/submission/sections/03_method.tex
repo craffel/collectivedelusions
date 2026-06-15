@@ -1,0 +1,118 @@
+\section{Methodology}
+\label{sec:method}
+
+We present \textbf{Momentum-Merge}, a minimalist ensembling framework to serve multiple task expert adapters on a heterogeneous stream without labels. We first formalize the dynamic serving problem, detail our routing, and provide a formal mathematical deconstruction of previous continuous biochemical SOTA, proving it simplifies exactly to a standard constant Exponential Moving Average (EMA).
+
+\subsection{Problem Formulation and Serving Architecture}
+Consider a pre-trained backbone neural network of $L$ layers. The first $L_{\text{frozen}}$ layers are frozen and shared across all tasks. The remaining layers $l \in [L_{\text{frozen}}+1, L]$ are adapted via $K$ task-specific PEFT experts (LoRA \cite{hu2021lora} modules targeting Query $W_Q$ and Value $W_V$ weight matrices with rank $r$).
+
+At serving time, the network receives a continuous stream of unlabeled samples $X_1, X_2, \dots$ sample-by-sample ($B=1$). For each sample, let $h^{(l-1)} \in \mathbb{R}^{D}$ denote the hidden representation entering adapted layer $l$. The blended activation output $h^{(l)}$ is computed in parallel as:
+\begin{equation}
+    h^{(l)} = h_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_k^{(l)} h_{\text{expert}, k}^{(l)}
+    \label{eq:activation_blending}
+\end{equation}
+where $h_{\text{base}}^{(l)} = h^{(l-1)} W_{\text{base}}^{(l)}$ is the base forward pass, and $h_{\text{expert}, k}^{(l)} = h^{(l-1)} A_k^{(l)} B_k^{(l)}$ is the forward pass of expert $k$ with scale $\frac{s_{\text{LoRA}}}{r}$. The routing coefficients $\alpha_k^{(l)} \in [0, 1]$ are ensembling weights computed at layer $l$, subject to $\sum_{k=1}^K \alpha_k^{(l)} = 1$. This ensures $O(1)$ edge serving latency.
+
+\subsection{Unit-Norm Anchored Similarity Routing}
+To route samples without task labels, we define a training-free nearest-centroid similarity routing network anchored at the output of the shared feature extractor (Layer $L_{\text{frozen}}$).
+During a brief offline calibration phase, we compute task-specific centroids: $\mu_k = \frac{1}{|\mathcal{C}_k|} \sum_{X \in \mathcal{C}_k} h_X^{(L_{\text{frozen}})}$, where $\mathcal{C}_k$ is a tiny calibration subset of size $|\mathcal{C}_k| = 64$ samples (we investigate the model's sensitivity to this calibration subset size $|\mathcal{C}_k|$ in Appendix~\ref{app:calibration_sensitivity}) and $h_X^{(L_{\text{frozen}})}$ is the representation of calibration sample $X$ at the output of Layer $L_{\text{frozen}}$.
+
+At test time, the routing coefficients are updated layer-by-layer. To compute similarity, we measure the directional alignment of the current intermediate activations $h^{(l-1)}$ to early-layer centroids $\mu_k$. We rely purely on angular cosine similarity, termed Unit-Norm Calibration (UNC):
+\begin{equation}
+    S\left(h^{(l-1)}, \mu_k\right) = \frac{h^{(l-1)} \cdot \mu_k}{\left\|h^{(l-1)}\right\|_2 \left\|\mu_k\right\|_2}
+    \label{eq:cosine_similarity}
+\end{equation}
+We normalize these similarities into raw ensembling weights $w_k^{(l)}$ using a gated Softmax with temperature $\tau > 0$:
+\begin{equation}
+    w_k^{(l)} = \frac{\exp\left(S\left(h^{(l-1)}, \mu_k\right) / \tau\right)}{\sum_{j=1}^K \exp\left(S\left(h^{(l-1)}, \mu_j\right) / \tau\right)}
+    \label{eq:softmax_routing}
+\end{equation}
+
+\subsection{Layer-wise Representational Shift and Sandbox Assumptions}
+In deep Transformer backbones, representations undergo severe transformations across sequential layers. Consequently, comparing a deep activation $h^{(l-1)}$ (e.g., at layer 12) directly to an early shared centroid $\mu_k$ (e.g., at layer 3) can be semantically invalid. 
+
+While our evaluation is situated within the coordinate-aligned Analytical Coordinate Sandbox (ICS) \cite{chemmerge} where global centroid matching is empirically valid, scaling to actual models (e.g., LLaMA or ViT) requires calibrating centroids \emph{layer-by-layer} across network depth:
+\begin{equation}
+    \mu_k^{(l)} = \frac{1}{|\mathcal{C}_k|} \sum_{X \in \mathcal{C}_k} h_{X}^{(l-1)}
+    \label{eq:layerwise_centroids}
+\end{equation}
+This layer-specific anchor $\mu_k^{(l)}$ naturally accounts for representational transformations, enabling robust similarity routing $S\left(h^{(l-1)}, \mu_k^{(l)}\right)$ across any deep architecture.
+
+\subsection{Momentum-Merge Dynamics}
+In stateless routing architectures (e.g., SABLE \cite{sable}), raw routing weights are applied directly as ensembling coefficients, i.e., $\alpha_k^{(l)} = w_k^{(l)}$. Under representation noise, stateless systems suffer from extreme layer-to-layer oscillations, leading to catastrophic representation drift. 
+
+To smooth out these trajectories, \textbf{Momentum-Merge} applies a standard constant Exponential Moving Average (EMA) to the ensembling weights across the network's depth. Inside each adapted layer $l \in [L_{\text{frozen}}+1, L]$, the final ensembling coefficients $\alpha_k^{(l)}$ are recursively updated as:
+\begin{equation}
+    \alpha_k^{(l)} = (1 - \beta) w_k^{(l)} + \beta \alpha_k^{(l-1)}
+    \label{eq:momentum_merge}
+\end{equation}
+where $\beta \in [0, 1]$ is the constant momentum coefficient.
+
+\subsubsection{Boundary Conditions and Initialization Damping}
+We initialize the recurrence with a uniform boundary condition:
+\begin{equation}
+    \alpha_k^{(L_{\text{frozen}})} = \frac{1}{K}
+    \label{eq:boundary_condition}
+\end{equation}
+While setting a uniform initial state is simple, it can introduce artificial damping in the first few adapted layers, forcing the model to blend all experts uniformly. 
+
+An elegant, parameter-free alternative to avoid this early-layer damping is initializing the boundary condition directly with the raw similarity-routing weight of the first adapted layer:
+\begin{equation}
+    \alpha_k^{(L_{\text{frozen}})} = w_k^{(L_{\text{frozen}}+1)}
+    \label{eq:raw_boundary_condition}
+\end{equation}
+In this paper, we adhere to the uniform boundary condition (Eq.~\ref{eq:boundary_condition}) to maintain direct structural comparability with the ChemMerge baseline, but we highlight Eq.~\ref{eq:raw_boundary_condition} as a promising direction for further refinement.
+
+\subsection{Deconstruction of Biochemical SOTA}
+We now prove that the complex continuous-time biochemical kinetics of the state-of-the-art ChemMerge \cite{chemmerge} baseline are mathematically dual to our simple Momentum-Merge formulation.
+
+ChemMerge tracks ensembling coefficients as chemical concentrations $C_k(t)$ of expert species inside a continuous reactor, evolving across virtual time (network depth) $t$ according to a first-order kinetic Ordinary Differential Equation (ODE):
+\begin{equation}
+    \frac{d C_k(t)}{dt} = R_k(C(t), h(t)) - k_{\text{decay}} C_k(t)
+    \label{eq:chemmerge_ode}
+\end{equation}
+where $R_k$ is the reaction rate of expert species $k$ catalyzed by representation $h(t)$, and $k_{\text{decay}}$ is the decay rate. The reaction rate is modeled via Arrhenius temperature-dependent kinetics:
+\begin{equation}
+    R_k = A_0 \exp\left(-\frac{E_{a, k}}{k_B T}\right) w_k(t)
+    \label{eq:arrhenius}
+\end{equation}
+where $w_k(t)$ is the activation-similarity score, and $E_{a, k}$ is the task-specific activation energy.
+
+\begin{theorem}[Biochemical Deconstruction]
+Assuming a uniform activation energy $E_{a, k} = E_a$ across tasks and a constant temperature environment, the continuous-time non-equilibrium chemical ODE of ChemMerge discretized via explicit Euler integration is mathematically equivalent to the constant Exponential Moving Average of Momentum-Merge.
+\label{thm:deconstruction}
+\end{theorem}
+
+\begin{proof}
+Under the assumption of uniform activation energy and constant temperature, the reaction rate $R_k$ simplifies to a linear scaling of the similarity-routing weights: $R_k = \kappa w_k(t)$ where $\kappa = A_0 \exp\left(-E_a / k_B T\right)$ is a constant reaction velocity. Substituting this into the continuous concentration ODE yields: $\frac{d C_k(t)}{dt} = \kappa w_k(t) - k_{\text{decay}} C_k(t)$.
+To map this continuous system across the discrete layers of the network, we discretize the ODE with a constant virtual step size $\Delta t > 0$. Let $C_k^{(l)}$ denote the concentration at discrete layer $l$, and let $w_k^{(l)}$ represent the similarity routing weight evaluated at layer $l$. Applying explicit Euler discretization: $\frac{C_k^{(l)} - C_k^{(l-1)}}{\Delta t} = \kappa w_k^{(l)} - k_{\text{decay}} C_k^{(l-1)}$.
+Solving for $C_k^{(l)}$:
+\begin{equation}
+    C_k^{(l)} = (\kappa \Delta t) w_k^{(l)} + (1 - k_{\text{decay}} \Delta t) C_k^{(l-1)}
+\end{equation}
+For the concentration vector $C^{(l)}$ to remain on the probability simplex (preserving $\sum_k C_k^{(l)} = 1$ given $\sum_k w_k^{(l)} = 1$ and $\sum_k C_k^{(l-1)} = 1$), the coefficients must satisfy conservation of mass. This physical constraint forces: $\kappa \Delta t = k_{\text{decay}} \Delta t = \gamma$, where $\gamma \in [0, 1]$ is a positive scaling factor. Substituting $\gamma$ back into the discretized equation yields the simplex-conserving form: $C_k^{(l)} = \gamma w_k^{(l)} + (1 - \gamma) C_k^{(l-1)}$.
+By defining the constant momentum parameter $\beta = 1 - \gamma \in [0, 1]$ and mapping the concentrations $C_k^{(l)}$ to the ensembling weights $\alpha_k^{(l)}$, we recover: $\alpha_k^{(l)} = (1 - \beta) w_k^{(l)} + \beta \alpha_k^{(l-1)}$, which is exactly the Momentum-Merge update equation (Eq.~\ref{eq:momentum_merge}). This completes the proof.
+\end{proof}
+
+\subsubsection{Theoretical Boundary of Equivalence: Non-Uniform Activation Energies}
+We explicitly acknowledge a theoretical boundary to this deconstruction. The mathematical equivalence demonstrated in Theorem~\ref{thm:deconstruction} relies on the assumption of a uniform activation energy $E_{a, k} = E_a$. In the complete formulation of ChemMerge, the activation energies can be task-specific ($E_{a, k}$) and dynamically modulated on-the-fly to enable non-linear task-adaptive gating (where different task experts are subject to different activation thresholds). 
+
+Under a non-uniform activation energy regime, the reaction velocity $\kappa_k = A_0 \exp\left(-E_{a, k} / k_B T\right)$ is task-specific, meaning that the Euler discretization yields:
+\begin{equation}
+    C_k^{(l)} = (\kappa_k \Delta t) w_k^{(l)} + (1 - k_{\text{decay}} \Delta t) C_k^{(l-1)}
+\end{equation}
+Because $\kappa_k$ varies across experts, a constant scaling factor $\gamma$ cannot be factored out uniformly while simultaneously satisfying the conservation of mass constraint $\sum_k C_k^{(l)} = 1$ on the probability simplex. Consequently, under non-uniform activation energies, ChemMerge's kinetics act as a state-dependent, task-asymmetric EMA with dynamically varying, expert-specific inertia. 
+
+Theoretically, such a task-asymmetric, state-dependent inertia formulation could excel under highly specialized serving streams with heterogeneous noise characteristics or varying expert-switching costs. For instance, if task $k_1$ is subject to high representational noise, it would benefit from a higher activation barrier (higher $E_{a, k_1}$), resulting in a lower reaction velocity $\kappa_{k_1}$ and higher routing inertia to suppress false-positive activations. Conversely, a clean task $k_2$ could operate with low activation energy to allow rapid routing plasticity. Similarly, if switching from expert $k_1$ to expert $k_2$ incurs a high computational latency or memory paging cost, setting task-specific activation barriers could act as a gating mechanism to prevent high-frequency transitions into high-cost tasks unless similarity signals are exceptionally strong.
+
+While this dynamically modulated inertia theoretically allows for non-linear, adaptive gating in these asymmetric edge cases, our empirical results on the uncalibrated Analytical Coordinate Sandbox (ICS) demonstrate that this added complexity is largely redundant under standard multi-task streams. Under sequential serving, our basic Momentum-Merge (which utilizes a constant, task-agnostic momentum parameter $\beta = 0.60$) matches or exceeds the performance of ChemMerge's non-linear gating. Furthermore, our advanced variant—which anchors similarities layer-by-layer—outperforms the fully-optimized ChemMerge baseline in accuracy while reducing routing jitter by an astonishing 38.1$\times$. This demonstrates that in practical dynamic ensembling, constant-inertia temporal smoothing is highly sufficient, and the empirical benefits of non-linear biochemical gating do not justify the massive system overhead of virtual-time ODE integrations.
+
+Theorem~\ref{thm:deconstruction} provides a rigorous deconstruction of continuous stateful routing, while exposing a major physical inconsistency in ChemMerge's metaphorical apparatus. Specifically, forcing $\kappa = k_{\text{decay}}$ is a severe physical constraint: in physical chemistry, there is absolutely no thermodynamic reason why the rate of expert species creation must be identical to its rate of degradation. The fact that ChemMerge must artificially force this equality to maintain mass conservation on the probability simplex reveals that the biochemical metaphor is highly strained and mathematically convoluted. By eliminating Arrhenius rates, activation barriers, and numerical ODE solvers, Momentum-Merge provides a mathematically pure, parsimonious, and direct implementation of stateful smoothing.
+
+\subsection{Routing Trajectory Stability Metric}
+To evaluate the stability of ensembling weight trajectories across layers, let $N_{\text{adapt}} = L - L_{\text{frozen}} - 1$ be the number of adapted transitions. We formally define the mean-squared layer-to-layer ensembling weight routing jitter as:
+\begin{equation}
+    \text{Jitter} = N_{\text{adapt}}^{-1} \sum_{l=L_{\text{frozen}}+2}^{L} \sum_{k=1}^K \left(\alpha_k^{(l)} - \alpha_k^{(l-1)}\right)^2
+    \label{eq:jitter_metric}
+\end{equation}
+Low jitter indicates highly stable routing trajectories, preventing cascading representation drift across depth.

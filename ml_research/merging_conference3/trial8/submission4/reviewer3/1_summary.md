@@ -1,0 +1,32 @@
+# Comprehensive Summary: PAC-ZCA
+
+## 1. Main Topic
+The paper addresses the challenge of **dynamic model-merging routing on the edge** in modular deep learning environments. Specifically, it focuses on serving multiple Parameter-Efficient Fine-Tuning (PEFT) adapters (such as Low-Rank Adaptation, or LoRA) concurrently without incurring a linear latency penalty (which scales as $O(K)$, where $K$ is the number of active tasks). The goal is to perform Single-Pass Activation-Space Dynamic Blending (SPS) inside a single forward pass, which maintains a constant $O(1)$ latency, while dynamically routing incoming heterogeneous inputs to the correct task-specific expert adapters.
+
+## 2. Main Approach: PAC-ZCA
+The authors propose **PAC-ZCA**, a learning-theoretic framework for dynamic model-merging routing. The core components of PAC-ZCA include:
+- **Routing Paradox Resolution:** Placing routing decisions at an early, shared, adapter-free representation layer $l_{\text{route}}$, extracting pooled intermediate representations exactly once.
+- **Subspace Energy Projection (SEP):** A task-agnostic, completely unsupervised early-layer projection step. It maps high-dimensional hidden representations ($D$) to task-agnostic energy coordinates ($K$) by computing the $L_2$ norm of projections onto task-specific subspaces. The paper generalizes SEP to non-orthogonal, real distributed manifolds using Singular Value Decomposition / Principal Component Analysis (SVD/PCA), and further proposes regularized extensions:
+  - *Ledoit-Wolf Shrinkage PCA (Shrinkage-SEP)*
+  - *Ridge-Regularized Subspace Projection (Ridge-SEP)*
+  - *Supervised Linear Discriminant Analysis Projection (LDA-SEP)*
+  - *Unit-Norm PCA Subspace Projection (UN-PCA-SEP)*, which normalizes features to the unit $L_2$ sphere prior to projection to prevent train-test scale mismatch and heteroscedastic noise spillover.
+- **Strictly Temperature-Only Gibbs Routing Policy:** Softmax routing parameterized strictly by task-specific log-temperatures $\mathbf{w} \in \mathbb{R}^K$ over the SEP coordinates.
+- **Parameter-Space PAC-Bayesian Generalization Bound:** Formulation of a Gaussian prior and posterior over the log-temperature parameters. Center the prior at a physically grounded scale $\mathbf{w}_0 = \ln(0.05) \cdot \mathbf{1}$, and define isotropic variance $\sigma_0^2$. The Gaussian KL-divergence serves as a data-independent parameter-space complexity penalty.
+- **Decoupled Calibration Splits:** Partitioning a tiny calibration set of size $N_c = 16$ per task into two disjoint subsets of size 8: a Subspace Extraction Split ($\mathcal{C}^{\text{sub}}$) to compute projection matrices/centroids, and a Temperature Optimization Split ($\mathcal{C}^{\text{opt}}$) to train parameters. This disjoint split preserves the independent and identically distributed (i.i.d.) assumption under McAllester's theorem.
+- **Duality between Parameter Complexity and Entropy:** Theorem 3.2 proves that bounding the log-temperature parameter complexity restricts logit variation, acting as an output routing entropy regularizer that prevents deterministic ensembling collapse.
+- **Activation Blending Theory-Practice Gap Resolution:** Quantifying the gap between expected randomized Gibbs outputs and continuous activation-blended outputs in terms of sub-network curvature and manifold divergence.
+
+## 3. Key Findings
+- **Resolution of Heterogeneity Collapse:** Static weight-space merging methods (e.g. TIES-Merging, DARE, and PFSR) collapse under mixed-task batches because they cannot run sample-specific weights in a vectorized pass. PAC-ZCA is immune, maintaining robust serving accuracy on both homogeneous and heterogeneous batches.
+- **Theoretical Bounds vs. Raw Performance:** Under sound decoupled splits, PAC-ZCA (Block) achieves **64.16% $\pm$ 2.23%** joint accuracy in a 14-layer Coordinate Sandbox (orthogonal manifolds), outperforming raw-coordinate SABLE (+23.70%) and matching standard unregularized Temp-Only ERM while reducing ensembling variance (standard deviation drops from 2.28% to 2.23%).
+- **SVD Overfitting and UN-PCA-SEP Resolution:** On distributed PCA-SEP features, standard SVD/PCA overfits to sample noise in the low-data regime ($N_c \ll D$), causing severe train-test scale mismatch and a routing accuracy of 0.00% on high-noise SVHN queries. UN-PCA-SEP resolves this by restricting coordinate values to $[0, 1]$, achieving **44.36% $\pm$ 1.30%** (orthogonal) and **45.86% $\pm$ 0.76%** (overlapping) joint accuracy, and recovering SVHN predictions.
+- **Real-World Validation:** On real image datasets (MNIST, Fashion-MNIST, CIFAR-10) with pre-trained ResNet-18 features, Isotropic PAC-ZCA achieves **70.87% $\pm$ 2.20%** joint accuracy, strictly outperforming standard SABLE (65.67%) and standard unregularized Temp-Only ERM (69.47% $\pm$ 2.21%) while maintaining high serving stability.
+- **Sample Complexity and Prior Sensitivity:** Accuracies scale with calibration size $N_c$, and the "disjoint split penalty" vanishes asymptotically as $N_c$ scales. Sensitivity sweeps show that prior variance $\sigma_0^2$ balances empirical risk and parameter complexity well.
+
+## 4. Explicitly Claimed Contributions (with Evidence)
+1. **First Mathematically Rigorous PAC-Bayesian Learning Framework for Dynamic Model-Merging:** Formulates generalization bounds linking calibration sample complexity to out-of-sample routing error (Eq. 11, Section 3.4).
+2. **Parameter-Space Gaussian KL Complexity Penalty:** Defines the bound over log-temperatures and employs disjoint calibration splits to resolve data-dependency flaws (Section 3.4).
+3. **Subspace Energy Projection (SEP) and Regularized Extensions:** Formulates task-agnostic dimensionality reduction, generalizes it to non-orthogonal distributed manifolds (Section 3.2.1), and introduces regularized versions (LW-Shrinkage, Ridge, LDA, UN-PCA) to prevent train-test scale mismatch and noise spillover.
+4. **Lipschitz-Entropy Duality and Gap Proofs:** Proves Theorem 3.2, showing that parameter regularization acts as an output entropy regularizer (Section 3.4.1), and derives bounds on the continuous activation blending discrepancy (Section 3.5.1).
+5. **Thorough Empirical Evaluation:** Validates the framework in a 14-layer Coordinate Sandbox with extreme noise (Section 4) and on real vision datasets (MNIST, Fashion-MNIST, CIFAR-10) using ResNet-18 features (Section 4.5), outperforming representative baselines (SABLE, PFSR, Linear Router, Temp-Only ERM).

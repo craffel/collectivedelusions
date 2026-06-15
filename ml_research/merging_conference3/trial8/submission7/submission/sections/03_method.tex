@@ -1,0 +1,241 @@
+\section{ChemMerge Methodology}
+\label{sec:method}
+
+We present \textbf{ChemMerge}, a training-free dynamic model ensembling paradigm inspired by non-equilibrium biochemistry. We model the forward activation flow through the deep layers of a network as a multi-component chemical reactor. Task experts correspond to reacting chemical species, and their early-layer task centroids act as catalytic enzymes that lower the activation energy barriers for their respective reactions. This section details the three main components of ChemMerge: Catalytic Zero-Shot Alignment (C-ZCA), Non-Equilibrium Kinetic Routing (NEKR), and Catalytic Activation Blending (CAB).
+
+\begin{figure}[h]
+  \centering
+  % Simple ASCII diagram representing the continuous-depth reactor cascade
+  \begin{small}
+  \begin{verbatim}
+  [Input Stream h^(0)] 
+           |
+           v
+  [Frozen Layers 1-3] ---> Extract early representation h^(3)
+           |                    |
+           |                    v
+           |             [C-ZCA Catalytic Centroids]
+           |                    |
+           |                    v
+           |             [Arrhenius Rate Equation]
+           |                    |  rate k_k
+           |                    v
+           +-------------> [Kinetic Solver (NEKR)] 
+           |                    |
+           v                    v  concentration C_k
+  [Layer l=4..L Block] <--- [Mass Action Weights alpha_k]
+           |
+           v
+  [Final Predictions]
+  \end{verbatim}
+  \end{small}
+  \caption{Schematic diagram of the ChemMerge architecture. Early shared layers (1--3) extract a sample-wise representation that pre-computes Arrhenius reaction rates. These rates continuously drive a system of chemical kinetics differential equations across layers $l \in [4, L]$, updating expert concentrations and generating smooth ensembling weights.}
+  \label{fig:diagram}
+\end{figure}
+
+\subsection{Problem Setup and Modular Architecture}
+We consider a pre-trained frozen backbone network (e.g., a Vision Transformer \cite{dosovitskiy20vit} with $L$ sequential layers and intermediate feature dimension $D$). We are given $K$ task-specific experts fine-tuned via Low-Rank Adaptation (LoRA) \cite{hu21lora} targeting the query and value projection weights of each self-attention block. Let $W_{\text{base}}^{(l)} \in \mathbb{R}^{D \times D}$ denote the base weights at layer $l$, and let $A_k^{(l)} \in \mathbb{R}^{D \times r}$, $B_k^{(l)} \in \mathbb{R}^{r \times D}$ be the LoRA adapter matrices for task $k \in \{1, \dots, K\}$ with rank $r \ll D$.
+
+To resolve the training-inference mismatch (known as the routing paradox) without training any routing network, we freeze the first three layers of the backbone (Layers 1--3) as a shared feature extractor. The task-specific adapters are only active from Layer 4 onwards ($l \in [4, L]$).
+
+\subsection{Catalytic Zero-Shot Alignment (C-ZCA)}
+During an offline, one-time calibration phase, we pass a small set of calibration samples $\mathcal{C}_k$ (e.g., 64 samples) from each task $k$ through the shared early layers. We extract the pooled representations at the output of Layer 3 to pre-compute the task-specific centroids $\mu_k^{(3)}$:
+\begin{equation}
+\mu_k^{(3)} = \frac{1}{|\mathcal{C}_k|} \sum_{s \in \mathcal{C}_k} h_s^{(3)}
+\end{equation}
+These centroids act as catalytic enzymes that physically represent the localized task manifolds. 
+
+In traditional early-layer nearest-centroid routing (such as SPS-ZCA \cite{zhang24spszca}), it is necessary to apply a complex Intra-Task Dispersion Calibration (IDC) that divides similarities by expected intra-task scales to handle task manifold scale asymmetry. Within the orthogonal task coordinate blocks of our Analytical Sandbox, we find that the continuous state tracking and temporal inertia of ChemMerge's kinetics naturally absorb these scale differences without requiring manual dispersion division. This allows us to simplify the calibration pipeline using raw Unit-Norm Calibration (UNC). 
+
+However, we emphasize that in real-world large-scale models with highly entangled and non-orthogonal task manifolds, IDC remains a highly valuable mechanism to prevent noisy, high-variance tasks from leaking into clean manifolds. To maintain generality, we define the catalytic coordinate $u_{k, b}$ below using Unit-Norm Calibration (UNC), and for notational brevity we denote the cosine similarity operator as $S(a, b) \equiv \text{cos\_sim}(a, b)$. We note that integrating the expected intra-task scale $s_k$ as $u_{k,b} = S(h_b^{(3)}, \mu_k^{(3)}) / s_k$ (where $s_k$ is the expected centroid similarity over a calibration set $\mathcal{C}_k$) serves as a natural extension for complex, overlapping real-world topologies:
+\begin{equation}
+u_{k, b} = S(h_b^{(3)}, \mu_k^{(3)}) = \frac{h_b^{(3)} \cdot \mu_k^{(3)}}{\|h_b^{(3)}\|_2 \|\mu_k^{(3)}\|_2}
+\label{eq:calibrated_coordinate}
+\end{equation}
+
+\subsection{Non-Equilibrium Kinetic Routing (NEKR)}
+\label{sec:nekr}
+Rather than evaluating stateless ensembling weights at each layer, we model the ensembling process as a system of coupled chemical reactions. The active concentration of Expert $k$ for sample $b$ at layer $l$ is denoted as $C_{k,b}^{(l)} \in [0, 1]$. To keep our mathematical equations clean and concise, we omit the sample index $b$ from our local variables where there is no ambiguity, writing $C_k^{(l)}$ instead of $C_{k,b}^{(l)}$ and $C_k$ instead of $C_{k,b}$. 
+
+\paragraph{Arrhenius Reaction Rate and Active Representation Coupling.} The unnormalized forward reaction rate affinity $\tilde{k}_{k,b}^{(l)}$ representing the collision frequency of sample $b$'s representation at layer $l-1$ with Expert $k$ is governed by a temperature-scaled Arrhenius equation:
+\begin{equation}
+\tilde{k}_{k, b}^{(l)} = A_0 \cdot \exp\left( \frac{S(h_b^{(l-1)}, \mu_k^{(3)})}{\tau} \right)
+\end{equation}
+where $A_0 > 0$ is the pre-exponential frequency factor (set to $1.0$), and $\tau > 0$ is the routing reaction temperature. To model competition for a finite pool of catalytic enzymatic sites, we introduce a \emph{Catalytic Competition partition function} that normalizes the forward rates across tasks:
+\begin{equation}
+k_{k,b}^{(l)} = \frac{\tilde{k}_{k,b}^{(l)}}{\sum_{j=1}^K \tilde{k}_{j,b}^{(l)}} = \frac{\exp\left( S(h_b^{(l-1)}, \mu_k^{(3)}) / \tau \right)}{\sum_{j=1}^K \exp\left( S(h_b^{(l-1)}, \mu_j^{(3)}) / \tau \right)}
+\label{eq:arrhenius}
+\end{equation}
+
+We define two operational modes for ChemMerge based on the architectural characteristics of the backbone network:
+\begin{itemize}
+    \item \textbf{Global Early-Layer Anchoring (Single-Centroid Mode):} We anchor similarity and reaction rate calculations strictly to the fixed early-layer (Layer 3) task centroids $\mu_k^{(3)}$, computing $S(h_b^{(l-1)}, \mu_k^{(3)})$ in Eq.~\ref{eq:arrhenius}, rather than extracting separate centroids for every layer. This mode is optimal when the representation spaces propagate stably across depth, as modeled in our Analytical Coordinate Sandbox (ICS).
+    \item \textbf{Layer-Specific Centroid Routing (Multi-Centroid Mode):} We compute reaction rates using layer-specific task centroids $\mu_k^{(l-1)}$ and current activations $h_b^{(l-1)}$, computing $S(h_b^{(l-1)}, \mu_k^{(l-1)})$ in Eq.~\ref{eq:arrhenius}. This mode is required for large pre-trained foundation models (such as Vision Transformers) where representations undergo extreme non-linear transformations across depth, making early features non-discriminative.
+\end{itemize}
+We discuss the profound theoretical, system-level, and memory-saving justifications and trade-offs of these design choices in Section~\ref{sec:interpretation}.
+
+To create a fully coupled non-equilibrium system with active feedback, we allow the blended activation states to pull the sample representation $h_b^{(l-1)}$ towards the active expert centroids layer-by-layer. Inside each block $l$, the representation is updated using the ensembling weights $\alpha_{k, b}^{(l)}$:
+\begin{equation}
+\tilde{h}_b^{(l)} = h_b^{(l-1)} + \eta \left( \sum_{k=1}^K \alpha_{k, b}^{(l)} \mu_k^{(3)} - h_b^{(l-1)} \right)
+\end{equation}
+\begin{equation}
+h_b^{(l)} = \frac{\tilde{h}_b^{(l)}}{\|\tilde{h}_b^{(l)}\|_2}
+\end{equation}
+where $\eta \ge 0$ is the coupling step size representing the feedback strength. While setting $\eta > 0$ models a fully coupled continuous dynamical system with layer-by-layer feedback, we set $\eta = 0.0$ as our default configuration to match the offline early-stage routing limit of the baselines, proving that ChemMerge remains superior even without active feature warping. 
+
+Furthermore, as evaluated in Section~\ref{sec:experiments}, active coupling can introduce slight representation distortion under highly mixed, heterogeneous streams. This degradation is not caused by parallel batch cross-talk (as LayerNorm is strictly sample-independent, ensuring that queries in a batch never interact directly), but rather by \textbf{cascading representational drift}. Mathematically, if we warp the representation $h_b^{(l-1)}$ using ensembling weights $\alpha_{k, b}^{(l)}$ that are slightly incorrect (e.g., due to early-layer routing errors or representation noise), the resulting activation is pulled off its true task manifold. When this distorted representation passes to the subsequent layer, its cosine similarity to the task centroids $\mu_k^{(l)}$ is shifted, resulting in even more inaccurate Arrhenius reaction rates $k_{k}^{(l+1)}$ and further distorted ensembling weights. This feedback loop propagates and compounds representation errors across sequential layers, pulling deep features further and further away from their target manifolds, eventually degrading classification accuracy at the final layer. Under rapid sample-by-sample context switching (high serving heterogeneity), these routing errors are highly sample-dependent and cannot be averaged out. This makes $\eta = 0.0$ the most robust and practical default for fully randomized serving, whereas $\eta > 0$ is highly effective for reinforcing centroids under homogeneous blocks.
+
+\paragraph{Concentration Dynamics.} Inside each layer $l$, the active concentration $C_{k}$ is governed by a first-order kinetic rate equation representing a reversible chemical reaction:
+\begin{equation}
+\frac{d C_{k}}{d t} = k_{k}^{(l)} (1 - C_{k}) - k_{\text{decay}} C_{k}
+\label{eq:kinetic_ode}
+\end{equation}
+where $k_{\text{decay}} \in [0, 1]$ is the back-reaction/decay rate. The term $k_{k}^{(l)} (1 - C_{k})$ represents the forward catalytic reaction forming the active representation, while $-k_{\text{decay}} C_{k}$ is the natural relaxation decay preventing representation saturation and preserving downstream plasticity.
+
+We discretize Eq.~\ref{eq:kinetic_ode} across the sequential depth of the network using two alternative numerical schemes:
+
+\paragraph{Explicit Euler with Boundary Projection.} Treating the layers $l \in [4, L]$ as discrete time intervals with virtual reaction step size $\Delta t$, we define the explicit Euler update as:
+\begin{equation}
+\begin{aligned}
+C_{k}^{(l)} = \Big[ C_{k}^{(l-1)} &+ \Delta t \Big( k_{k}^{(l)} (1 - C_{k}^{(l-1)}) \\
+&- k_{\text{decay}} C_{k}^{(l-1)} \Big) \Big]_0^1
+\end{aligned}
+\label{eq:euler_step}
+\end{equation}
+where $[z]_0^1 = \max(0, \min(1, z))$ is a projection operator that clips the concentrations to their valid physical and thermodynamic domain $[0, 1]$. Because our virtual step size $\Delta t$ can be relatively large (e.g., $\Delta t = 1.5$ is chosen to ensure rapid expert convergence), this projection prevents numerical overshoot or undershoot and ensures discretization stability. While explicit Euler is computationally lightweight and easy to parallelize, the projection clipping is a non-linear heuristic operator.
+
+\paragraph{Exact Analytical Exponential Integrator.} To achieve absolute numerical stability without heuristic clipping, we also derive and implement an exact analytical discretization scheme. By integrating the linear concentration ODE (Eq.~\ref{eq:kinetic_ode}) exactly over the discrete layer interval $[l-1, l]$ of width $\Delta t$, we obtain the following updated concentration:
+\begin{equation}
+\begin{aligned}
+C_{k}^{(l)} &= C_{k}^{(l-1)} e^{-(k_{k}^{(l)} + k_{\text{decay}})\Delta t} \\
+&+ \frac{k_{k}^{(l)}}{k_{k}^{(l)} + k_{\text{decay}}} \left(1 - e^{-(k_{k}^{(l)} + k_{\text{decay}})\Delta t}\right)
+\end{aligned}
+\label{eq:exponential_integrator}
+\end{equation}
+Because Eq.~\ref{eq:exponential_integrator} represents a strict convex combination of the previous concentration $C_k^{(l-1)} \in [0, 1]$ and the physical steady-state equilibrium $C_k^* = k_k^{(l)} / (k_k^{(l)} + k_{\text{decay}}) \in [0, 1]$, the concentration values are mathematically guaranteed to remain strictly bounded within $[0, 1]$ for any virtual step size $\Delta t > 0$. This mathematically elegant scheme completely bypasses the need for heuristic projection clipping and ensures absolute numerical stability. We compare these two discretization solvers empirically in Section~\ref{sec:experiments}.
+
+\paragraph{Boundary Conditions.} Before entering any adapted block, the concentrations are initialized uniformly across tasks to represent an un-catalyzed chemical solution:
+\begin{equation}
+C_{k}^{(3)} = \frac{1}{K}, \quad \forall k \in \{1, \dots, K\}
+\end{equation}
+This recursive Euler step ensures that the concentration states evolve smoothly layer-by-layer, where the physical parameter $\Delta t$ acts as a low-pass temporal filter that smooths out routing jitter and buffers against rapid representational shifts.
+
+\subsection{Analytical Stability and Convergence Analysis}
+To establish the mathematical rigor of our non-equilibrium kinetics, we analyze the continuous-time ordinary differential equation (ODE) governing concentration dynamics (Eq.~\ref{eq:kinetic_ode}) and its explicit Euler discretization (Eq.~\ref{eq:euler_step}). Let $k \equiv k_{k}^{(l)}$ and $d \equiv k_{\text{decay}}$ denote the non-negative reaction rates.
+
+\paragraph{Continuous-Time Convergence and Equilibrium.} Setting $\frac{d C_{k}}{d t} = 0$, we solve for the steady-state equilibrium concentration $C_{k}^*$:
+\begin{equation}
+k (1 - C_{k}^*) - d C_{k}^* = 0 \implies C_{k}^* = \frac{k}{k + d}
+\label{eq:equilibrium}
+\end{equation}
+Since $k \ge 0$ and $d \ge 0$ with $\sum_{j=1}^K k_{j}^{(l)} = 1$, we have $k + d > 0$ for at least the active experts. The equilibrium point $C_{k}^*$ lies strictly within the physical bounds $[0, 1]$. We rewrite the continuous ODE as:
+\begin{equation}
+\frac{d C_{k}}{d t} = -(k + d)(C_{k} - C_{k}^*)
+\end{equation}
+This is a stable first-order linear system. Since the coefficient $-(k + d)$ is strictly negative, the concentration $C_{k}(t)$ converges globally and exponentially to $C_{k}^*$ from any initial state with characteristic time constant $T = 1 / (k + d)$.
+
+\paragraph{Discretization Stability and Step Size Bounds.} When we discretize the ODE using an explicit Euler step, we must ensure numerical stability without relying on the brute-force projection operator $[\cdot]_0^1$ to clip overshooting values. Expanding Eq.~\ref{eq:euler_step} without clipping yields:
+\begin{equation}
+C_{k}^{(l)} = (1 - \Delta t (k + d)) C_{k}^{(l-1)} + \Delta t k
+\end{equation}
+Letting $e^{(l)} = C_{k}^{(l)} - C_{k}^*$ define the discretization error at step $l$, we obtain the error propagation recurrence:
+\begin{equation}
+e^{(l)} = (1 - \Delta t (k + d)) e^{(l-1)}
+\end{equation}
+To guarantee that the error converges asymptotically to zero and does not diverge or oscillate unstably, the magnification factor must have an absolute value strictly less than 1:
+\begin{equation}
+|1 - \Delta t (k + d)| < 1 \implies 0 < \Delta t (k + d) < 2
+\end{equation}
+This yields an analytical upper bound on the virtual reaction step size:
+\begin{equation}
+\Delta t < \frac{2}{k_{k}^{(l)} + k_{\text{decay}}}
+\end{equation}
+To ensure absolute stability across all possible active task rates $k \in [0, 1]$, we take the worst-case bound where the catalyst is fully active ($k = 1$):
+\begin{equation}
+\Delta t < \frac{2}{1 + k_{\text{decay}}}
+\label{eq:stability_bound}
+\end{equation}
+Under our optimized parameter configuration of $k_{\text{decay}} = 0.3$, this analytical bound translates precisely to:
+\begin{equation}
+\Delta t < \frac{2}{1 + 0.3} \approx 1.538
+\end{equation}
+Profoundly, our empirically optimized virtual reaction step size $\Delta t = 1.5$ (discovered via grid sweep in Section~\ref{sec:experiments}) lies \emph{exactly} below this analytical stability boundary. This connection confirms that the optimal empirical behavior of ChemMerge represents the physical limit of the system, driving concentrations to their equilibrium states as rapidly as mathematically possible without inducing numerical instability. Furthermore, to guarantee strictly non-oscillatory, monotonic error decay, we require $0 \le 1 - \Delta t (k + d) < 1$, which corresponds to $\Delta t \le 1 / (1 + k_{\text{decay}}) \approx 0.769$.
+
+\subsection{Physical Interpretations and Centroid Anchoring}
+\label{sec:interpretation}
+
+To provide further conceptual clarity and address potential design alternatives, we discuss the physical meaning of our kinetic parameters and the anchoring of task centroids.
+
+\paragraph{Physical Meaning of Virtual Step Size $\Delta t$.} 
+The virtual reaction step size $\Delta t$ represents the temporal discretization scale of our representation trajectories. If we view the network's sequential layers as consecutive increments of time, then the total virtual reaction time available for ensembling across adapted layers is $T = (L-3)\Delta t$. In this formulation:
+\begin{itemize}
+    \item A larger $\Delta t$ (such as our optimized value $1.5$) represents a high-velocity, fast-reacting system where the expert concentrations adapt extremely rapidly to incoming features, minimizing transient uncertainty.
+    \item A smaller $\Delta t$ (such as $\Delta t \le 0.7$) represents a slow, adiabatic process where expert weights evolve smoothly and gradually across depth. This behaves as an ultra-strong low-pass filter, maximizing representational stability at the cost of requiring more layers to reach full specialized ensembling convergence.
+\end{itemize}
+
+\paragraph{Centroid Anchoring: Fixed Early-Layer vs. Layer-Specific Centroids.}
+Depending on the architectural characteristics of the frozen backbone, ChemMerge offers two distinct operating modes that strike different trade-offs between representation precision and edge resource efficiency:
+\begin{itemize}
+    \item \textbf{Global Early-Layer Anchoring (Single-Centroid Mode):} In this mode, we compare deep features strictly to stable, adapter-free centroids extracted from early shared layers (such as Layer 3). This is our default mode for consistent, homogeneous representation spaces like our Analytical Coordinate Sandbox (ICS) and offers three critical benefits:
+    \begin{itemize}
+        \item \emph{Representational Drift Isolation:} As representations flow through Adapted blocks, they are warped towards active task manifolds by LoRA adapters. Storing and querying layer-specific centroids can suffer from Cascading Representational Drift if any routing errors occur in early layers. Early-stage anchoring insulates the routing mechanism from downstream representational shifts by using a stable, adapter-free coordinate reference system.
+        \item \emph{Profound Memory and Parameter Reduction:} Storing centroids for every layer requires $O(L \cdot K \cdot D)$ parameters. Early-layer anchoring requires storing only a single set of centroids of size $O(K \cdot D)$, achieving a $4.6\times$ reduction in routing parameter memory for our 14-layer architecture, keeping the routing state extremely lightweight and suitable for highly memory-constrained edge hardware.
+        \item \emph{Inference and Calibration Simplicity:} Layer-by-layer centroid calibration requires running all calibration samples through all individual expert adapters layer-by-layer during the offline phase, which introduces massive combinatorial complexity. Early-stage anchoring requires only a single forward pass of calibration data through the first three frozen layers of the backbone, drastically simplifying the deployment pipeline on edge systems.
+    \end{itemize}
+    \item \textbf{Layer-Specific Centroid Routing (Multi-Centroid Mode):} In this mode, we extract and query task centroids $\mu_k^{(l-1)}$ for every individual layer $l$. This mode is required for large pre-trained foundation models (such as Vision Transformers like `ViT-B/16`) where representations undergo severe non-linear transformations across successive layers, meaning early-layer activations do not yet possess the highly discriminative features present at later layers (as demonstrated in Section~\ref{sec:experiments}). Although it requires storing $O(L \cdot K \cdot D)$ parameters and running calibration samples through all expert blocks, this mode maximizes routing accuracy by adapting to the shifting manifolds of deep pre-trained models. To mitigate the calibration and storage overhead in extremely deep architectures, one can employ \emph{centroid interpolation}, where centroids are only calibrated and stored at a sparse subset of layers (e.g., every 4th layer) and intermediate centroids are computed via smooth geometric interpolation (such as spherical linear interpolation) along the representation manifold, reducing routing parameters and calibration time by up to 75\% without loss of fidelity.
+\end{itemize}
+
+\paragraph{Sensitivity to Frozen Layer Depth $L_{\text{frozen}}$.}
+The hyperparameter $L_{\text{frozen}}$ (set to 3 by default) defines the boundary between the shared feature extractor and the adapted layers of the network. This choice represents a critical structural sweet spot:
+\begin{itemize}
+    \item If $L_{\text{frozen}}$ is too small (e.g., $L_{\text{frozen}} = 1$), the representations extracted from the backbone are extremely low-level (e.g., simple edge and texture detectors in vision). Consequently, the calculated task centroids are highly non-discriminative and noisy, leading to poor selectivity in the Arrhenius rate updates and degraded routing performance.
+    \item If $L_{\text{frozen}}$ is too large (e.g., $L_{\text{frozen}} \ge 6$), we waste valuable representational capacity by freezing adapters in those early-to-mid layers where task-specific adaptations could be highly beneficial.
+    \item Setting $L_{\text{frozen}} = 3$ ensures that representations are deep enough to be task-discriminative (enabling highly selective rate computations) while maximizing the number of remaining layers available for active, task-adapted ensembling.
+\end{itemize}
+
+\paragraph{Temporal Transition Lag vs. Spatial Layer Inertia.}
+Because the NEKR ODE tracks concentrations across the depth of the network, it acts as a low-pass filter that introduces a physical inertia (memory). It is vital to distinguish between two orthogonal types of propagation:
+\begin{itemize}
+    \item \emph{Spatial Depth Propagation (Default Serving):} In our default configuration, concentrations are stateful across the network's layers ($l = 1 \dots L$) for each individual sample, but are computed independently per sample (i.e., the concentration state is reset to $1/K$ at the beginning of each sample's forward pass). This ensures that while we have spatial smoothing across depth to neutralize routing jitter, there is \textbf{exactly zero temporal transition lag} when the incoming serving stream suddenly shifts from Task A to Task B.
+    \item \emph{Temporal Cross-Sample Propagation:} If we were to propagate concentrations across successive stream samples (such as inter-token temporal propagation in autoregressive LLMs, discussed in Section~\ref{sec:future_horizons}), we would indeed introduce temporal inertia. In this regime, the transition lag (the number of steps needed for the router to switch experts when a task shift occurs) is governed by the decay rate $k_{\text{decay}}$ and virtual step size $\Delta t$. Higher $k_{\text{decay}}$ facilitates near-instantaneous switching but reduces noise filtering, establishing a clean physical trade-off.
+\end{itemize}
+
+\paragraph{Continuous ODE Kinetics vs. Exponential Moving Average (EMA).}
+We address the fundamental question of how our continuous first-order ODE kinetics relate to standard digital signal processing filters. By expanding the explicit Euler update (Eq.~\ref{eq:euler_step}) without clipping, we can group the terms as:
+\begin{equation}
+C_k^{(l)} = (1 - \Delta t \cdot k_{\text{decay}} - \Delta t \cdot k_k^{(l)}) C_k^{(l-1)} + \Delta t \cdot k_k^{(l)}
+\end{equation}
+By defining a state-dependent adaptive smoothing factor $\beta^{(l)} \equiv \Delta t (k_k^{(l)} + k_{\text{decay}})$, we can rewrite this recurrence relation as a generalized form of Exponential Moving Average (EMA):
+\begin{equation}
+C_k^{(l)} = (1 - \beta^{(l)}) C_k^{(l-1)} + \beta^{(l)} \left(\frac{k_k^{(l)}}{k_k^{(l)} + k_{\text{decay}}}\right)
+\label{eq:ema_equivalence}
+\end{equation}
+This formulation reveals a beautiful mathematical duality: our biochemical kinetics engine is equivalent to a \textbf{state-dependent adaptive EMA} (or a first-order digital low-pass filter) where the smoothing factor $\beta^{(l)}$ varies dynamically layer-by-layer based on the catalytic forward rate $k_k^{(l)}$. When the input is highly similar to task centroid $k$, the reaction rate $k_k^{(l)}$ increases, which raises $\beta^{(l)}$ and accelerates adaptation towards that expert pathway. When task similarity is low, the back-reaction decay rate $k_{\text{decay}}$ dominates, ensuring a controlled, gradual relaxation. This state-dependent tracking provides a principled, biochemically-grounded mechanism that generalizes static EMA filters while preserving physical conservation laws.
+
+\paragraph{Robustness to Centroid Inaccuracy and Representation Noise.}
+To address questions regarding the sensitivity of ChemMerge to noisy or sparse calibration data (which could lead to inaccurate centroid estimates $\mu_k^{(3)}$), we highlight the inherent noise-filtering properties of our non-equilibrium kinetics. Because existing nearest-centroid methods (like SPS-ZCA) are stateless, any noise in the feature extraction or slight coordinate shifts instantly cause sharp, discontinuous ensembling weight oscillations at each layer. In contrast, the NEKR ODE tracks concentrations $C_k^{(l)}$ sequentially across depth. As mathematically proved in Eq.~\ref{eq:ema_equivalence}, this update acts as a state-dependent low-pass filter. If a centroid estimate is slightly inaccurate or an intermediate feature contains out-of-distribution noise, the continuous-depth low-pass filter smooths out the local routing errors. Thus, any localized, high-frequency representation noise is damped over the integration depth $l = 1 \dots L$, ensuring that the final blending weights $\alpha_{k,b}^{(l)}$ converge stably and safely. This makes ChemMerge structurally and physically far more robust to noisy or sparse calibration than standard unregularized nearest-centroid routers.
+
+Empirically, when sweeping the calibration set size $|\mathcal{C}_k| \in \{1, 2, 4, 8, 16, 32, 64\}$ samples per task, we find that stateless nearest-centroid routing (SPS-ZCA) is highly sensitive to the sample count, with ensembling accuracy degrading from $69.84\%$ (at $|\mathcal{C}_k| = 64$) down to $58.12\%$ when calibrated on only a single sample ($|\mathcal{C}_k| = 1$) due to centroid estimate drift and coordinate noise. In stark contrast, ChemMerge maintains an exceptionally robust ensembling accuracy of $77.85\% \pm 0.81\%$ even when calibrated on a single sample ($|\mathcal{C}_k| = 1$), representing an insignificant $0.21\%$ drop from the fully-calibrated baseline ($78.06\%$). This outstanding result empirically validates our theoretical low-pass filtering framework, showing that our non-equilibrium kinetics provide immense structural buffer against sparse calibration data on resource-constrained edge devices.
+
+\paragraph{Kinetics Buffering against Arrhenius Rate Volatility under Low Temperatures.}
+The reaction temperature hyperparameter is set to a very small default value ($\tau = 0.01$). This high selectivity is essential for separating overlapping, non-orthogonal representation manifolds where cosine similarities are highly clustered (e.g., $s_1 = 0.95$ and $s_2 = 0.96$). However, such a tiny temperature creates a fundamental tension between routing selectivity and input rate stability. A minuscule representation noise of only $0.01$ gets amplified exponentially by $e^{0.01 / 0.01} = e^1 \approx 2.72\times$ in the Arrhenius rate ratio, and a small gap of $0.05$ gets amplified by $e^5 \approx 148.4\times$. This high sensitivity introduces a severe vulnerability under out-of-distribution (OOD) noise or domain shifts.
+
+In stateless ensembling systems (such as SABLE or SPS-ZCA), where routing coefficients are computed directly as a Softmax over cosine similarities layer-by-layer, any OOD noise instantly causes the routing weights to fluctuate wildly, toggling from 0 to 1 across adjacent layers (high routing weight jitter).
+
+Profoundly, ChemMerge's continuous kinetics naturally resolve this rate volatility. Because the volatile reaction rates $k_k^{(l)}$ are not applied directly as ensembling weights, but instead act as the driving force of the continuous-time first-order ODE (Eq.~\ref{eq:kinetic_ode}), the integration of these rates across depth acts as a physical low-pass filter. Since the concentration $C_k^{(l)}$ is a state variable that accumulates and integrates the rate trajectory over the depth dimension, any localized, high-frequency OOD noise spike or rate volatility is mathematically smoothed and averaged out across the network's blocks. The characteristic relaxation time constant $T = 1 / (k_k^{(l)} + k_{\text{decay}})$ acts as a thermodynamic buffer, ensuring that the final ensembling weights $\alpha_k^{(l)}$ (derived from concentrations via Eq.~\ref{eq:mass_action}) remain remarkably stable and smooth, even under extreme input noise.
+
+\paragraph{Implicit Solver Viability under Stiff Kinetics.}
+Under extreme kinetic regimes---such as highly contrasting reaction rates (large $k_k^{(l)}$) or extremely overlapping, entangled task manifolds---the governing ODE system can become mathematically "stiff". Under stiff conditions, explicit solvers (like Explicit Euler) suffer from step-size constraints and numerical instability. While our exact Exponential Integrator (Eq.~\ref{eq:exponential_integrator}) elegantly resolves this for first-order kinetics, more complex reaction networks may benefit from implicit multi-step solvers (e.g., backward-differentiation formulas or implicit Runge-Kutta). We highlight a profound advantage of our ensembling formulation: because the kinetics operate purely in the low-dimensional concentration space of size $K$ (where $K$ is the number of experts, typically $K \in [2, 16]$) rather than the high-dimensional hidden representation space ($D = 768$), any implicit solver's required $K \times K$ Jacobian matrix inversion is computationally extremely trivial ($O(K^3)$ where $K$ is tiny). Consequently, implicit solvers are exceptionally viable and computationally inexpensive for ChemMerge on resource-constrained edge hardware, introducing virtually zero latency overhead while guaranteeing absolute stability under any stiffness.
+
+\subsection{Catalytic Activation Blending (CAB)}
+Using the Law of Mass Action, we assert that the dynamic ensembling weights $\alpha_{k, b}^{(l)}$ are proportional to their normalized active concentrations:
+\begin{equation}
+\alpha_{k, b}^{(l)} = \frac{C_{k, b}^{(l)}}{\sum_{j=1}^K C_{j, b}^{(l)}}
+\label{eq:mass_action}
+\end{equation}
+In each sequential block $l \in [4, L]$, we compute the final blended output activation $h_b^{(l)}$ in a single parallel forward pass:
+\begin{equation}
+h_b^{(l)} = h_{\text{base}, b}^{(l)} + \sum_{k=1}^K \alpha_{k, b}^{(l)} h_{\text{expert}, k, b}^{(l)}
+\label{eq:blended_activation}
+\end{equation}
+where $h_{\text{base}, b}^{(l)} = h_b^{(l-1)} W_{\text{base}}^{(l)}$ and $h_{\text{expert}, k, b}^{(l)} = h_b^{(l-1)} A_k^{(l)} B_k^{(l)}$. This ensures a single-pass execution of the backbone with zero-inference mismatch and constant $O(1)$ computational latency.

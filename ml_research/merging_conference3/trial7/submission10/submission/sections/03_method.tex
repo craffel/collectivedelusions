@@ -1,0 +1,116 @@
+\section{Proposed Method: SPS-ZCA}
+\label{sec:method}
+
+We introduce \textbf{SPS-ZCA} (Single-Pass Sample-Wise Routing with Zero-Shot Centroid Alignment), a training-free and computationally efficient dynamic model-merging framework designed for edge hardware. The overall architecture consists of three interconnected steps: zero-shot task-centroid pre-computation, representation-space centroid alignment routing, and single-pass activation-space blending. Additionally, we propose key calibration and out-of-distribution (OOD) rejection enhancements to ensure high reliability under real-world deployability constraints.
+
+\subsection{Problem Formulation and Notation}
+Let $f_\theta$ be a pre-trained, frozen shared base model backbone (e.g., a Vision Transformer~\cite{dosovitskiy2020image}).
+Suppose we have $K$ independent task experts $\{E_1, \dots, E_K\}$ fine-tuned via Low-Rank Adaptation (LoRA)~\cite{hu2021lora} on task-specific datasets from the same pre-trained base backbone. 
+For each transformer block layer $l \in \{1, \dots, L\}$, the base model weight is $W_{\text{base}}^{(l)} \in \mathbb{R}^{D_{\text{in}} \times D_{\text{out}}}$, and the task-specific LoRA adapters are represented by low-rank matrices $A_k^{(l)} \in \mathbb{R}^{D_{\text{in}} \times r}$ (the down-projection matrix) and $B_k^{(l)} \in \mathbb{R}^{r \times D_{\text{out}}}$ (the up-projection matrix), where $r \ll \min(D_{\text{in}}, D_{\text{out}})$ is the rank.
+
+At inference time, the edge device receives a heterogeneous batch of samples $X = \{x_1, \dots, x_B\}$ of size $B$, where each sample $x_b$ can belong to any of the $K$ tasks or be an out-of-distribution query. The goal is to dynamically route and serve each sample $x_b$ through its appropriate expert pathway in a single forward pass, preventing both heterogeneity collapse and multi-pass latency penalties.
+
+\subsection{Zero-Shot Centroid Pre-computation}
+Prior dynamic routing methods (e.g., PFSR~\cite{pfsr2025}) project features against classification heads to compute routing coefficients. However, classification heads are highly specific to task-specific labels, making them extremely noisy and sensitive to vocabulary differences.
+More critically, routing with late-stage penultimate representations (e.g., extracted at the very end of the backbone network) introduces a fundamental temporal circular dependency: to execute the task adapters layer-by-layer starting from Layer 1, the system requires the routing coefficients $\alpha_{k, b}$, but these coefficients can only be computed once the entire backbone has already been executed. This would require running the base backbone twice, completely invalidating the single-pass speedup claims.
+
+To resolve this temporal circular dependency, SPS-ZCA operates in the shared \textbf{early-stage representation space} of the frozen base model (specifically, at Layer 3, which we empirically validate in Section~\ref{subsec:real_pytorch_profiling} as achieving near-optimal feature separability while keeping execution costs extremely low). In this early representation space, features are highly generalizable, task-separable, and available near the beginning of the forward pass.
+
+During a one-time offline calibration phase, we pre-compute a robust early-stage task centroid $\mu^{(3)}_k \in \mathbb{R}^D$ for each expert task $k \in \{1, \dots, K\}$. This is done using a tiny, low-resource calibration split $\mathcal{C}_k$ consisting of only $|\mathcal{C}_k| = 64$ samples:
+\begin{equation}
+    \mu^{(3)}_k = \frac{1}{|\mathcal{C}_k|} \sum_{s \in \mathcal{C}_k} h^{(3)}_s
+\end{equation}
+where $h^{(3)}_s = \text{Pool}(f_{\theta, \text{block3}}(x_s)) \in \mathbb{R}^D$ is the pooled representation of calibration sample $x_s$, extracted at the output of the shared early backbone (Layer 3). This process requires zero parameter training and zero gradient computations.
+
+\subsection{Zero-Shot Centroid Alignment (ZCA) Routing}
+During on-device serving, when a sample $x_b$ is received, we execute the shared, adapter-free early-stage blocks (Layers 1--3) of the shared base backbone to extract its early-stage representation $h^{(3)}_b \in \mathbb{R}^D$.
+The similarity coordinate vector $u_b = [u_{1, b}, \dots, u_{K, b}]^T \in \mathbb{R}^K$ is computed by taking the cosine similarity between $h^{(3)}_b$ and the pre-computed Layer 3 task centroids $\mu^{(3)}_k$:
+\begin{equation}
+    u_{k, b} = \text{cos\_sim}(h^{(3)}_b, \mu^{(3)}_k) = \frac{h^{(3)}_b \cdot \mu^{(3)}_k}{\|h^{(3)}_b\|_2 \|\mu^{(3)}_k\|_2}
+\end{equation}
+By relying on the stable, early representation space (Layer 3) rather than task-specific classification heads or late-stage penultimate features, ZCA avoids the temporal routing paradox while remaining immune to head scale imbalances and label-space asymmetries.
+
+\paragraph{Boundary Conditions and Highly Overlapping Task Domains.} We explicitly note that nearest-centroid early-layer routing assumes tasks have distinct, separable semantic representations (evidenced by a high Fisher Separability Criterion, e.g., $\text{FSC} = 47.50$ on our main task suite). If task experts are fine-tuned on highly fine-grained or overlapping domains (such as medical MRI subtypes or fine-grained artistic styles), early features will exhibit severe spatial overlap. Under this boundary condition, ZCA coordinates will become highly clustered and uniform, causing routing confusion. This leads to on-the-fly ``activation bleeding'' where expert activations are blended uniformly, degrading dynamic performance toward static Uniform Merging. We outline concrete mitigations for this fine-grained overlap---such as Hierarchical Centroid Clustering and low-resource Supervised Head Fine-Tuning---in Section~\ref{subsec:generalizability}, but highlight this representation separability as a fundamental boundary condition for training-free dynamic merging.
+
+\textbf{Resolving the Early-Layer Routing Paradox and Preventing Mismatch:}
+If routing coefficients are computed at an intermediate layer (e.g., Layer 3) rather than Layer 0 to leverage higher feature separability (Section~\ref{subsec:real_pytorch_profiling}), a secondary temporal paradox arises: how are the LoRA adapters for the early layers (Layers 1--3) executed prior to computing the routing coefficients?
+To resolve this, we leverage the physical reality of Vision Transformer feature abstraction: the first few layers of a ViT model extract highly shared, general low-level visual features (edges, textures) that require zero task-specialization.
+Therefore, we design our multi-task expert registry to insert LoRA adapters \emph{only} in the mid-to-late layers of the backbone (Layers 4 to $L$) during \emph{both} the fine-tuning phase and the inference serving phase. During fine-tuning, the first 3 blocks (Layers 1--3) are kept frozen and shared across all tasks, and task-specific LoRA adapters are never trained or inserted in these early layers. Consequently, during inference serving, these first 3 blocks are executed completely task-agnostically with no adapters present. At the output of Layer 3, ZCA extracts the representation, computes the routing coefficients $\alpha_{k, b}$, and executes the remaining layers (Layers 4 to $L$) using SPS. This elegant, hardware-software co-designed execution layout completely resolves the early-layer routing paradox while guaranteeing \textbf{100\% mathematical consistency with zero train-inference mismatch} or accuracy degradation.
+
+The dynamic, sample-wise routing coefficients $\alpha_{k, b}$ are derived via a temperature-scaled Softmax over the coordinates:
+\begin{equation}
+    \alpha_{k, b} = \frac{\exp(u_{k, b} / \tau)}{\sum_{j=1}^K \exp(u_{j, b} / \tau)}
+\end{equation}
+where $\tau > 0$ is a scaling temperature. In our primary implementation, we find that a sharp, static temperature (e.g., $\tau = 0.001$) enforces highly confident and crisp routing, preventing cross-task activation dilution. 
+
+However, to handle borderline or genuinely ambiguous (yet in-distribution) samples where the top coordinate similarities are extremely close (e.g., $|u_{1,b} - u_{2,b}| < \epsilon$), a static sharp temperature forces a hard, potentially incorrect routing choice. To mitigate this borderline ambiguity, we discuss an \textbf{Adaptive Entropy-Dependent Temperature Scaling} mechanism. Specifically, we dynamically scale the temperature as a function of the Shannon entropy $H(u'_b)$ of the normalized coordinate similarities $u'_{k,b} = \text{Softmax}(u_b)$:
+\begin{equation}
+    \tau_b = \tau_0 \cdot \exp\left( \lambda \cdot H(u'_b) \right)
+\end{equation}
+where $\tau_0 = 0.001$ is the base temperature, and $\lambda \ge 0$ is a sensitivity parameter. Under high-confidence, unambiguous representations (low entropy), $\tau_b \approx \tau_0$, preserving crisp, top-1 routing. For highly ambiguous borderline inputs (high entropy), $\tau_b$ automatically increases, relaxing the Softmax into a soft, collaborative activation blend across the top experts. This adaptive smoothing prevents high-confidence misrouting and gracefully delegates compute across specialized adapters under borderline semantic states.
+
+\subsection{Single-Pass Activation-Space Dynamic Blending (SPS)}
+The core systems-ML innovation of SPS is the execution of dynamic expert routing inside a single, parallel forward pass. Instead of splitting the batch into homogeneous micro-batches and sequentially dispatching them (which requires running the heavy base model backbone multiple times), SPS blends the activations of the expert adapters layer-wise.
+
+For each Transformer layer $l \in \{1, \dots, L\}$ and sample $b$, let $h_b^{(l-1)}$ be the input activation (a row vector of shape $1 \times D_{\text{in}}$). The output activation $h_b^{(l)}$ (of shape $1 \times D_{\text{out}}$) is computed sample-wise as:
+\begin{equation}
+    h_b^{(l)} = h_b^{(l-1)} W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_{k, b} \left( h_b^{(l-1)} A_k^{(l)} B_k^{(l)} \right)
+\end{equation}
+This formulation yields multiple critical pragmatic advantages:
+\begin{itemize}
+    \item \textbf{Single-Pass Efficiency:} The base layer representation $h_b^{(l-1)} W_{\text{base}}^{(l)}$ (which comprises $>95\%$ of the layer's computational FLOPs) is computed exactly once for the entire batch.
+    \item \textbf{Constant $O(1)$ Latency:} Because we execute the shared backbone once, the overall execution latency is constant with respect to the batch heterogeneity and the number of active tasks $K$.
+    \item \textbf{Zero-Overhead Parallelism:} Modern highly threaded hardware (e.g., multicore edge CPUs and GPUs) can execute the parallel LoRA adapter pathways concurrently, maximizing execution efficiency.
+\end{itemize}
+
+\subsection{Robustness and Calibration Enhancements}
+
+\subsubsection{Unit-Norm Calibration (UNC)}
+In real-world deployment, different expert adapters are fine-tuned on distinct datasets, which can cause their corresponding penultimate representations to drift in scale. If the representation norm of Expert $A$ is significantly larger than that of Expert $B$, an uncalibrated linear router using raw dot products will statistically over-route queries to Expert $A$, leading to routing collapse.
+
+To neutralize this representation scale imbalance, we propose \textbf{Unit-Norm Calibration (UNC)}. During the routing coordinate extraction, we force both the input representations and the pre-computed task centroids onto a unit sphere. This mathematically guarantees that the routing coordinates are perfectly scale-invariant:
+\begin{equation}
+    z'_b = \frac{z_b}{\|z_b\|_2}, \quad \mu'_k = \frac{\mu_k}{\|\mu_k\|_2}
+\end{equation}
+And the calibrated coordinates are computed as $u_{k, b} = z'_b \cdot \mu'_k$.
+
+Mathematically, we highlight that the dot product of two unit-norm projected vectors is exactly equivalent to the cosine similarity between the original, unnormalized vectors:
+\begin{equation}
+    u_{k, b} = \text{cos\_sim}(z_b, \mu_k) = \frac{z_b \cdot \mu_k}{\|z_b\|_2 \|\mu_k\|_2} = z'_b \cdot \mu'_k
+\end{equation}
+Thus, ZCA in Equation~2 incorporates Unit-Norm Calibration by using cosine similarity instead of a raw unnormalized dot product. In our ablation studies (Figure~\ref{fig:ablations_1}), the uncalibrated ``Without UNC'' baseline is modeled using the raw dot product $u_{k, b} = z_b \cdot \mu_k$, which directly exposes the router to scale drift and representation scale imbalances. Clarifying this terminology establishes that Unit-Norm Calibration is mathematically implemented via the cosine similarity operation itself, and that omitting UNC is equivalent to falling back to an unnormalized dot product.
+
+\subsubsection{Intra-Task Dispersion Calibration (IDC)}
+In nearest-centroid routing over early representation manifolds, different task domains exhibit highly asymmetric spatial dispersion (variance). For instance, a simple, highly homogeneous task (such as MNIST digit classification) has a very compact representation manifold, meaning its samples lie extremely close to its centroid (resulting in high baseline cosine similarities). In contrast, a highly diverse, complex domain (such as SVHN real-world street digit recognition) exhibits massive intra-task manifold variance, meaning its samples are highly dispersed and have a much lower average similarity to their centroid.
+
+If uncalibrated cosine similarities are used directly, the highly compact task will statistically dominate the routing coefficients, leading to systematic over-routing to simpler tasks and complete routing collapse on more complex tasks.
+To neutralize this manifold dispersion bias, we propose \textbf{Intra-Task Dispersion Calibration (IDC)}.
+During the one-time offline calibration phase, we compute the expected in-distribution cosine similarity scale $s_k$ of the calibration samples to their respective centroid for each task $k$:
+\begin{equation}
+    s_k = \frac{1}{|\mathcal{C}_k|} \sum_{s \in \mathcal{C}_k} \text{cos\_sim}(h^{(3)}_s, \mu^{(3)}_k)
+\end{equation}
+During online serving, we calibrate the raw coordinate similarity $u_{k, b}$ by dividing it by the task's expected dispersion scale $s_k$:
+\begin{equation}
+    u'_{k, b} = \frac{u_{k, b}}{s_k}
+\end{equation}
+This projects all coordinates onto a standardized significance scale where each task's expected in-distribution similarity is centered at $1.0$. This mathematically guarantees that the routing decision is scale-invariant and immune to asymmetric task manifold dispersion, preserving balanced and unbiased routing across highly heterogeneous task suites.
+
+\subsubsection{Out-of-Distribution (OOD) Rejection via Coordinate GMM}
+An essential requirement for robust edge deployment is shielding the dynamic experts from out-of-distribution (OOD) queries (such as corrupted inputs or completely unrelated tasks) which could lead to erratic activations and wasted compute.
+Rather than employing expensive, parametric OOD classifiers, we leverage our low-dimensional routing coordinate space $\mathcal{U} \subset \mathbb{R}^K$.
+
+For each task expert $k$, we fit a diagonal \textbf{Gaussian Mixture Model (GMM)} with $M$ components (we set $M=2$) over the calibration coordinate vectors $u_s \in \mathbb{R}^K$ extracted from $\mathcal{C}_k$. 
+During inference, for an incoming sample $b$, we compute its coordinate vector $u_b$. The sample is routed only if its coordinate log-likelihood under the GMM of its predicted task exceeds a safety threshold $\eta$:
+\begin{equation}
+    \log P(u_b \mid \text{GMM}_k) \ge \eta
+\end{equation}
+If the log-likelihood is below $\eta$, the sample is rejected as OOD, completely bypassing the expert adapter blending paths and saving edge computational resources. 
+
+To complete the end-to-end serving logic, the system implements a modality-specific fallback prediction flow:
+\begin{itemize}
+    \item \textbf{Classification Modality (Vision):} When a query is flagged as OOD, the system immediately bypasses all task-specific expert heads. Instead of forcing a prediction through specialized classifier layers (which would lead to highly erratic, high-confidence misclassifications, such as classifying a digit image as a sneaker), the system raises an out-of-distribution flag and outputs a designated ``OOD / Unknown'' class label. This preserves safe inference in production edge deployments.
+    \item \textbf{Autoregressive Generation Modality (Text):} When a text sequence is rejected as OOD (e.g., general-domain chat or unrelated languages), the system sets all task-specific expert adapter coefficients to zero ($\alpha_{k,b} = 0$). The input is then executed strictly by the frozen, pre-trained base backbone model (such as base GPT-2 or LLaMA) using its pre-trained language modeling head. The system thus falls back to generating text using the base model's generic English distribution, producing standard fluent text rather than forcing legal, medical, or coding jargon.
+\end{itemize}
+This dual fallback mechanism guarantees robust, safe, and context-appropriate behavior under severe out-of-distribution noise, maintaining the parameter-free, training-free purity of the system.
+
+\paragraph{IDC Noise Amplification and the GMM Shield.} We note a potential interaction between Intra-Task Dispersion Calibration (IDC) and extreme OOD noise. Because IDC scales raw coordinates $u_{k, b}$ inversely with expected similarity scales (e.g., SVHN's $s_k \approx 0.31$ yields a $3.23\times$ scaling factor, whereas MNIST's $s_k \approx 0.65$ yields $1.54\times$), a highly noisy or corrupted input that yields uniformly low raw similarities could have its coordinate for the most dispersed task disproportionately amplified. In our architectural design, our diagonal GMM Coordinate Density Estimator acts as an upfront "GMM Shield" that completely neutralizes this amplification risk. By evaluating coordinate log-likelihoods and rejecting extreme OOD queries \textit{prior} to IDC division, we prevent the propagation of noisy, low-similarity activations through the calibrated routing pipeline, guaranteeing that only validated in-distribution queries undergo dispersion scaling.

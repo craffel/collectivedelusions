@@ -1,0 +1,19 @@
+# 2. Novelty Check
+
+## Key Novel Aspects
+1. **Application of SGLD and Simulated Annealing to Test-Time Model Merging**: While Stochastic Gradient Langevin Dynamics (SGLD) and Simulated Annealing are classic techniques in deep learning optimization and posterior sampling, their application to the specific, newly emerged task of **test-time model merging** is a novel combination. 
+2. **Dimensionality-Scaled Langevin Noise (DSLN)**: The introduction of a dimensional scaling factor ($\sigma_j = \sqrt{2 \eta_j T_t / d_j}$) to resolve the dimensional mismatch between low-dimensional merging coefficients ($\approx 10^1$) and high-dimensional classification heads ($\approx 10^5$) is a useful and necessary engineering heuristic. This represents a distinct formulation designed specifically for joint, heterogeneous multi-scale parameter optimization.
+3. **Thermodynamic Analysis of Model Merging**: Framing the model merging landscape in terms of statistical mechanics (Boltzmann distributions, partition functions, and specific heat capacity $C_v$ peaks) and numerically computing these thermodynamic quantities on a synthetic landscape is a highly creative and original contribution to the conceptual understanding of model merging.
+
+## Delta from Prior Work
+The closest prior work is **SyMerge** (Jung et al., 2025) and **AdaMerging** (Yang et al., 2024):
+* **AdaMerging** and **SyMerge** both perform test-time adaptive model merging by jointly optimizing merging coefficients and classifier weights. However, both of these methods rely on **deterministic optimizers** (like Adam or SGD). Under severe task interference, they are susceptible to getting trapped in sharp, sub-optimal local minima.
+* **ThermoMerge** addresses this deterministic trap. The "delta" consists of replacing the deterministic updates in SyMerge with **curvature-aware preconditioned SGLD**, governed by an **exponential Simulated Annealing cooling schedule**, and stabilized by **DSLN**.
+* Compared to standard **SGLD**, the delta is the introduction of **DSLN** and the layer-wise functional parameter-group scaling (e.g., grouping weight-bias pairs of the same layer) to prevent the "high-dimensional noise catastrophe" that otherwise destroys pre-trained classifier features.
+* Compared to active flat-minima optimizers like **Sharpness-Aware Minimization (SAM)** or **Stochastic Weight Averaging (SWA)**, ThermoMerge provides an isotropic, stochastic alternative that avoids the double forward/backward pass latency of SAM and the trajectory-averaging bias of SWA under extreme test-time data scarcity.
+
+## Characterization of Novelty
+The novelty of this work is characterized as **incremental to moderate**:
+* **Conceptual Novelty (Moderate)**: The metaphorical and analogical framing of joint test-time model adaptation as physical crystallization is highly creative and original, adding a rich, physical vocabulary to describe the phenomena of model merging.
+* **Algorithmic Novelty (Incremental)**: The underlying tools---SGLD, Simulated Annealing, preconditioned Langevin updates, and division of noise variance by dimension---are well-established in the literature. For example, dividing coordinate-wise noise variance by dimension to keep the total expected norm constant is a straightforward consequence of high-dimensional Gaussian properties. The primary contribution here is the adaptation, integration, and engineering of these established components into a unified framework designed for test-time model merging.
+* **Practical Novelty (Incremental)**: The method uses standard backpropagation and has negligible computational/memory overhead, but the actual empirical performance gains on deep neural networks (e.g., MLPs and LoRA) are extremely subtle and mostly within the standard deviation margin of error of the deterministic baseline (SyMerge), which somewhat limits its practical novelty.

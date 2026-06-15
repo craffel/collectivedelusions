@@ -1,0 +1,26 @@
+# 5. Impact and Presentation Check
+
+## 1. Major Strengths
+1. **Exceptional Clarity and Structure:** The paper is beautifully structured, with an easy-to-follow narrative flow. The transitions between the introduction, related work, methodology, and results sections are seamless.
+2. **Exhaustive Discussion of Limitations:** Unlike many papers that obscure their weaknesses, the authors are exceptionally honest and comprehensive in discussing the limitations of their work. They dedicate substantial sections to discussing the zero-sum trade-offs of the minimax objective, the limitations of backbone scale, the optimizer mismatch for SOTA baselines, and the capacity starvation of EPM under high sparsity. This level of transparency is highly commendable.
+3. **Rigorous and Extensive Sensitivity Analyses:** The paper features detailed sensitivity sweeps of the coherence retention factor $\gamma$ (Table 4) and validation calibration size $N_{\text{val}}$ (Table 6), along with a systematic optimization budget study (Table 5, Figure 2). These sweeps add significant empirical weight to the study.
+4. **Statistical Rigor:** The reporting of standard deviations across 5 random calibration seeds for the randomized search methods provides strong statistical confidence in the stability of TLC-Tune's 4-dimensional optimization compared to the high variance of continuous layer-wise methods.
+5. **Clear Practical Guidance:** The inclusion of an explicit PyTorch algorithm (Algorithm 1) for implementing Soft-EPA on decoder-only autoregressive LLMs provides direct, actionable guidance for practitioners seeking to adapt this method to large generative models.
+
+## 2. Major Weaknesses & Areas for Improvement
+1. **Lack of Large-Scale Validation:** The most critical weakness is that the empirical evaluation is restricted to a toy model (ViT-Tiny, 5.7M parameters) on four simple classification benchmarks (MNIST, FashionMNIST, CIFAR-10, SVHN). To demonstrate true practical significance, the authors must validate EPM on large-scale LLMs (e.g., Llama-3 or Mistral) or CLIP models, showing that overparameterization indeed mitigates the representation destruction observed on the compact backbone.
+2. **Methodological Injustice to Baselines (Optimizer Mismatch):** Running SOTA layer-group-wise tuning methods (AdaMerging and ZipMerge) under (1+1)-ES represents a severe optimizer mismatch. The authors must compare EPM against these baselines optimized using their native first-order gradient descent to establish a scientifically fair comparison and prove whether first-order methods truly suffer from the "Overfitting-Optimizer Paradox" on small calibration batches.
+3. **Absence of Scale Preservation in Sparsity:** Under high sparsity ($p=0.8$), EPM lacks a proper activation scale-preservation mechanism, leading to severe performance decay (26.41% vs. DARE's 40.90%). The authors should integrate an expectation-value scaling operator (similar to DARE) into EPM's routing logic to stabilize activation scales under extreme pruning.
+4. **Artificially Balanced Minimax Performance:** TLC-Tune's minimax objective is a zero-sum trade-off that severely degrades complex expert models (CIFAR-10 collapses by over 31% absolute accuracy) just to lift trivial grayscale expert models. In a real-world scenario, this is highly impractical. The authors should evaluate weighted multi-task objectives or constraint-based optimization to provide more realistic operational trade-offs.
+
+## 3. Overall Presentation Quality
+The presentation quality is **excellent**. 
+- The text is grammatically flawless, mathematically rigorous, and contains beautifully detailed figures and tables. 
+- The discussion of the "Overfitting-Optimizer Paradox" is conceptually interesting, and the "scale override" frequency analysis across the 5.52M parameters provides a highly detailed window into the inner workings of their normalization scheme.
+- The tone is highly professional and scholarly, and the mathematical formatting is clean and easy to read.
+
+## 4. Potential Impact & Significance
+The potential impact of this paper in its current state is **low to moderate**.
+- **Theoretical Significance:** The paper introduces a conceptually interesting framing of model merging as a coordinate-exclusive routing problem and provides a useful discussion on the trade-offs of low-dimensional versus high-dimensional test-time adaptation.
+- **Practical Significance:** Because the empirical validation is limited to a toy backbone (ViT-Tiny) and toy datasets, yielding merged model accuracies that are practically unusable (around 46%), the immediate practical utility is very weak. Practitioners are highly unlikely to adopt EPM for production systems based on this toy-scale demonstration, especially when standard joint multi-task fine-tuning or parameter-efficient fine-tuning (LoRA adapters) achieve over 90% accuracy with manageable serving overheads.
+- **Path to High Significance:** If the authors can successfully scale EPM to large decoder-only LLMs or CLIP models, showing that it can merge math and code experts without destroying their native capabilities and running at native speed with zero serving latency overhead, the impact of this work would become **exceptionally high**.

@@ -1,0 +1,122 @@
+\section{Prior-Driven Classical Routing Framework}
+\label{sec:method}
+
+In this section, we present the mathematical formulation of our Prior-Driven Classical Routing Framework. The central pillar of our framework is the **Zero-Initialized Softmax prior** combined with $L_2$ weight decay, which serves as a powerful implicit regularizer. To theoretically understand and guide this stabilization under heterogeneous batch streams, we introduce a group-level limit constraint, \textbf{Task-Variance Regularization ($\mathcal{L}_{VR}$)}, designed to suppress intra-task routing variance and prevent Heterogeneity Collapse. Crucially, as we show in our empirical audit, our zero-initialized Softmax architectural prior naturally and inherently satisfies this group-level variance limit, making explicit penalty tuning empirically redundant in practice, yet providing high diagnostic value. 
+
+First, we define the mechanics of dynamic model merging in the parameter space. Next, we detail our low-dimensional unit-state feature projection and layer-wise routing projections. Finally, we introduce our multi-objective calibration loss, formalize the group-level \textbf{Task-Variance Regularization ($\mathcal{L}_{VR}$)} constraint, and deconstruct the role of zero-initialized Softmax routing as the foundational implicit prior-layer regularizer.
+
+\subsection{Dynamic Model Merging in Parameter Space}
+Let $W_{\text{base}}^{(l)}$ represent the pre-trained base parameters (weights and biases) at layer $l \in \{1, \dots, L\}$. Suppose we have $K$ independent task-specific visual expert models, where the parameters of expert $k \in \{1, \dots, K\}$ at layer $l$ are denoted by $W_k^{(l)}$. Following the task-vector paradigm \cite{ilharco2022editing}, we define the task vector $V_k^{(l)}$ as the parameter difference between the specialized expert and the base model:
+\begin{equation}
+    V_k^{(l)} = W_k^{(l)} - W_{\text{base}}^{(l)}
+\end{equation}
+
+For an incoming batch of inputs $x$ of size $B$, the dynamically merged parameter set $W_{\text{merged}}^{(l)}(x)$ at layer $l$ is assembled by adding a weighted combination of task vectors to the base parameters:
+\begin{equation}
+    W_{\text{merged}}^{(l)}(x) = W_{\text{base}}^{(l)} + \sum_{k=1}^K \bar{\alpha}_k(l) V_k^{(l)}
+\end{equation}
+where $\bar{\alpha}_k(l) \in \mathbb{R}$ represents the batch-averaged merging coefficient for task $k$ at layer $l$:
+\begin{equation}
+    \bar{\alpha}_k(l) = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}(l)
+\end{equation}
+Here, $\alpha_{k, b}(l)$ represents the sample-wise merging coefficient computed specifically for input sample $b \in \{1, \dots, B\}$.
+
+\subsection{Low-Dimensional Unit-State Feature Projection}
+Let $z(x)_b \in \mathbb{R}^D$ be the globally pooled latent representation extracted from the backbone network's early layers for sample $b$. In deep network sandboxes or large-scale vision models (e.g., CLIP ViT-B/16), the feature dimension $D$ is typically high (e.g., $D=192$ or $D=768$). Direct mapping from this high-dimensional space to routing coefficients on scarce calibration data (e.g., $|D_{\text{cal}}| = 64$) inevitably leads to severe overfitting.
+
+To prevent this, we project $z(x)_b$ into a highly compact $d$-dimensional subspace ($d = K \ll D$) using a static, frozen projection matrix $P \in \mathbb{R}^{D \times d}$. The projection matrix is initialized as a stable, normalized random projection matrix satisfying the Johnson-Lindenstrauss lemma, which provides a data-free and computationally efficient mapping to the $d$-dimensional subspace. To ensure stability against scale variations, we normalize the projected representation onto a unit sphere, obtaining the unit state $\psi(x)_b$:
+\begin{equation}
+    \psi(x)_b = \frac{z(x)_b P}{\|z(x)_b P\|_2 + \epsilon} \in \mathbb{R}^d
+\end{equation}
+where $\epsilon = 10^{-8}$ is a small numerical stabilizer.
+
+\subsection{Layer-wise Classical Routing}
+For each layer $l \in \{1, \dots, L\}$, we compute the sample-wise merging coefficient $\alpha_{k, b}(l)$ for each task expert $k$ by applying a Softmax activation over the linear projection outputs across the task experts:
+\begin{equation}
+\begin{aligned}
+    \alpha_{k, b}(l) &= \text{Softmax}\left( \langle \psi(x)_b, W_{l, \cdot} \rangle + B_{l, \cdot} \right)_k \\
+    &= \frac{\exp\left( \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k} \right)}{\sum_{k'=1}^K \exp\left( \langle \psi(x)_b, W_{l, k'} \rangle + B_{l, k'} \right)}
+\end{aligned}
+\end{equation}
+where $W_{l, \cdot} \in \mathbb{R}^{K \times d}$ and $B_{l, \cdot} \in \mathbb{R}^K$ represent the trainable routing weights and biases for layer $l$ (with $W_{l, k} \in \mathbb{R}^d$ and $B_{l, k} \in \mathbb{R}$ corresponding to task expert $k$). The Softmax normalizes the coefficients across all $K$ tasks to sum to $1$ for each sample.
+
+Unlike quantum-inspired methods (e.g., QWS-Merge \cite{qwsmerge2025}) that pass these projection values through non-monotonic wave-interference activations:
+\begin{equation}
+    \alpha^{\text{QWS}}_{k, b}(l) = \cos\left( \langle \psi(x)_b, W_{l, k} \rangle + B_{l, k} \right)^2
+\end{equation}
+our classical projections are linear, avoiding the rugged, non-convex optimization landscapes that trap gradient descent in small-sample calibration splits.
+
+\subsection{Task-Variance Regularization ($\mathcal{L}_{VR}$)}
+\label{subsec:vr_loss}
+
+During deployment, inference streams are frequently heterogeneous, meaning they contain batches mixed with samples from different tasks. Standard dynamic routers batch-average sample-wise coefficients to construct a single merged model per batch:
+\begin{equation}
+    \bar{\alpha}_k(l) = \frac{1}{B} \sum_{b=1}^B \alpha_{k, b}(l)
+\end{equation}
+When the batch is mixed, this batch-averaging collapses task-specific routing weights toward a uniform, intermediate compromise (e.g., $\bar{\alpha}_k(l) \approx 0.25$ for all $k$). This is \emph{heterogeneity collapse}: the specialized parameters needed for task $A$ are diluted by the requirements of task $B$ within the same batch, severely degrading multi-task accuracy.
+
+To address this and model the optimal group-level behavior of dynamic ensembling, we introduce a mathematical limit constraint, \textbf{Task-Variance Regularization ($\mathcal{L}_{VR}$)}. Although we will show in Section~\ref{sec:experiments} that this explicit loss penalty is empirically redundant once our central zero-initialized Softmax architectural prior is established, formalizing $\mathcal{L}_{VR}$ provides a mathematically precise limit target that characterizes the optimal low-variance group behavior required for robust multi-task ensembling. During the calibration phase, we analyze the router on simulated heterogeneous batches of varying mixtures. Let $S_k \subseteq \{1, \dots, B\}$ represent the indices of samples in a calibration batch that belong to task expert $k$. When $S_k \neq \emptyset$, we compute the intra-task sample variance of predicted routing coefficients at layer $l$:
+\begin{equation}
+    \sigma^2_{\text{task}}(k, l) = \frac{1}{|S_k|} \sum_{b \in S_k} \left( \alpha_{k, b}(l) - \mu_k(l) \right)^2
+\end{equation}
+where $\mu_k(l)$ is the mean predicted coefficient for task $k$ across its respective sample group $S_k$:
+\begin{equation}
+    \mu_k(l) = \frac{1}{|S_k|} \sum_{b \in S_k} \alpha_{k, b}(l)
+\end{equation}
+In practice, a calibration batch might not contain any samples for a given task, rendering $S_k = \emptyset$. Thus, the task-variance penalty $\mathcal{L}_{VR}$ is averaged only over non-empty (active) task groups, which we denote as $\mathcal{K}_{\text{active}} = \{k \in \{1,\dots,K\} \mid S_k \neq \emptyset\}$:
+\begin{equation}
+    \mathcal{L}_{VR} = \lambda_{\text{var}} \frac{1}{L \cdot |\mathcal{K}_{\text{active}}|} \sum_{l=1}^L \sum_{k \in \mathcal{K}_{\text{active}}} \sigma^2_{\text{task}}(k, l)
+\end{equation}
+where $\lambda_{\text{var}} \ge 0$ is a hyperparameter scaling the penalty. Minimizing $\mathcal{L}_{VR}$ forces the router to produce highly consistent, low-variance routing predictions within each task group, suppressing sample-specific noise and outlier skews that lead to heterogeneity collapse. (Note that we explicitly employ the uncorrected population variance formula with factor $1/|S_k|$ rather than Bessel's corrected sample variance with factor $1/(|S_k|-1)$. In the edge case where a calibration batch contains exactly one sample for a task group, i.e., $|S_k| = 1$, Bessel's correction would lead to an undefined division-by-zero error, whereas our formulation naturally evaluates to exactly zero for that group, ensuring stable numerical gradients without artificially distorting the regularization objective.)
+
+\subsection{Sequential Smoothness Regularization ($\mathcal{L}_{\text{smooth}}$)}
+\label{subsec:smooth_loss}
+
+While our coordinate sandbox employs a layer-averaging simplification to fit its single-layer expert classifiers, deep sequential architectures (such as foundation models) deploy independent, un-averaged routing coefficients per layer. In these deep sequential networks, allowing layer-wise routing weights to fluctuate wildly and independently across adjacent layers poses a severe representation risk. Because representation spaces are processed sequentially, rapid and incoherent layer-to-layer routing variations introduce a compounding "routing jitter." This jitter results in sequentially compounding representation misalignment that corrupts intermediate activations as they flow through the depth of the network, leading to severe functional degradation.
+
+To theoretically resolve this multi-layer deployment bottleneck, we propose a novel \textbf{Sequential Smoothness Regularizer ($\mathcal{L}_{\text{smooth}}$)}. This constraint penalizes rapid, high-frequency routing weight fluctuations across consecutive layers, encouraging sequential consistency and parameter alignment throughout the depth of the network:
+\begin{equation}
+\begin{split}
+    \mathcal{L}_{\text{smooth}} = \gamma_{\text{smooth}} & \frac{1}{B \cdot (L-1)} \sum_{b=1}^B \sum_{l=2}^L \sum_{k=1}^K \\
+    & \left( \alpha_{k, b}(l) - \alpha_{k, b}(l-1) \right)^2
+\end{split}
+\end{equation}
+where $\gamma_{\text{smooth}} \ge 0$ represents a smoothness hyperparameter that controls the regularization strength. Minimizing $\mathcal{L}_{\text{smooth}}$ forces consecutive layers to share similar task ensembling choices, ensuring smooth hidden representation transitions and suppressing sequential routing jitter. Nonetheless, as discussed in Section~\ref{subsec:limitations}, our zero-initialized Softmax prior naturally serves as an inherent, implicit smoothness regularizer, holding layer-by-layer routing weights close to their uniform, maximum-entropy state and preventing routing jitter from emerging, even in the absence of explicit, hyperparameter-sensitive smoothness losses.
+
+\subsection{Multi-Objective Calibration and Vectorized Assembly}
+The complete trainable parameters of the router (weights $W \in \mathbb{R}^{L \times K \times d}$ and biases $B \in \mathbb{R}^{L \times K}$ in our framework, including both the well-regularized standard Softmax baseline and its variance-regularized VR-Router variant) are optimized end-to-end on simulated calibration batches. Crucially, we perform \textbf{true sample-specific parameter assembly during training itself}, completely avoiding any batch-averaging compromise or training-time collapse. For a calibration batch $x$ of size $B$, the merged weights are assembled sample-by-sample:
+\begin{equation}
+    W_{\text{merged}}^{(l)}(b) = W_{\text{base}}^{(l)} + \sum_{k=1}^K \alpha_{k, b}(l) V_k^{(l)}
+\end{equation}
+The cross-entropy loss $\mathcal{L}_{CE}$ is computed directly on these sample-specific merged weights using highly optimized vectorized operations:
+\begin{equation}
+    \mathcal{L}_{CE} = -\frac{1}{B} \sum_{b=1}^B \log P(y_b \mid x_b; W_{\text{merged}}(b))
+\end{equation}
+The complete multi-objective loss is defined as:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = \mathcal{L}_{CE} + \mathcal{L}_{\text{reg}} + \mathcal{L}_{VR} + \mathcal{L}_{\text{smooth}}
+\end{equation}
+where $\mathcal{L}_{\text{reg}}$ represents $L_2$ routing weight decay:
+\begin{equation}
+    \mathcal{L}_{\text{reg}} = \lambda_{wd} \sum_{l=1}^L \sum_{k=1}^K \left( \|W_{l, k}\|_2^2 + B_{l, k}^2 \right)
+\end{equation}
+
+\subsection{Implicit Regularization via Zero-Initialized Softmax}
+A critical finding of our empirical audit is the profound role of \emph{zero-initialization} in the routing layers. By initializing the weights $W$ and biases $B$ to exact zeros, the router initially outputs equal, uniform coefficients for all task experts ($\alpha_{k, b}(l) = 1/K$ for all $k$). This zero-initialization acts as a maximum-entropy uniform prior that naturally minimizes intra-task variance and restricts the model to a highly-regularized, convex compromise.
+
+Because the calibration split is extremely small ($|D_{\text{cal}}| = 64$) and training is short (100 epochs), the router weights remain constrained close to their initial zero state under $L_2$ decay. This zero-initialized Softmax architecture acts as a powerful \textbf{implicit task-variance regularizer}. It prevents the routing weights from overfitting to high-frequency sample noise, ensuring that predicted sample-wise routing coefficients remain remarkably stable and consistent. This implicit regularization explains the flat sensitivity curves and why our zero-initialized routing models completely avoid the severe \emph{Vectorization Collapse} observed in random-initialized models (which drop to 42.34\% under $B=1$ vectorized deployment).
+
+\subsection{Resolving the Conceptual Premise of Dynamic Routing}
+We explicitly address the conceptual role of Task-Variance Regularization ($\mathcal{L}_{VR}$). One might argue that minimizing intra-task variance ($\sigma^2_{\text{task}} \to 0$) forces the router to act as a static task classifier, rendering the dynamic routing machinery redundant. 
+
+However, we contend that $\mathcal{L}_{VR}$ acts as a soft-clustering constraint that filters out high-frequency input noise while preserving coarse task boundaries. Under data scarcity, unregularized dynamic routers suffer from severe overfitting, misinterpreting sample noise as task indicators. Minimizing intra-task variance prevents this overfitting, forcing the router to align its predictions with robust task subspaces. At the same time, the zero-initialized Softmax architecture allows the router to dynamically scale task coefficients smoothly across tasks on boundary samples, achieving a robust compromise that a rigid, discrete task classifier cannot realize.
+
+During deployment, we bypass batch-averaging entirely. We employ PyTorch's vectorized mapping API (`torch.vmap`) or highly optimized einsum operations to perform sample-specific, batch-independent forward passes. This allows each input sample in a mixed batch to be processed by its own dynamically assembled parameters, realizing true batch-independent multi-task routing without any batch-averaging bottlenecks.
+
+\subsection{Systems-Level Complexity, Hardware Bottlenecks, and Scaling to Billion-Parameter Models}
+\label{subsec:systems_complexity}
+While sample-specific vectorized assembly mathematically resolves Heterogeneity Collapse and Vectorization Collapse by decoupling routing from the batch size, it introduces substantial hardware-level memory and computational challenges. At the physical layer, constructing $B$ distinct, sample-specific weight matrices of size $D_{\text{in}} \times D_{\text{out}}$ scales the active model parameter footprint by a factor of $B$. For deep architectures with hundreds of millions or billions of parameters, storing $B$ separate replicas of the network's weights in GPU memory is extremely memory-intensive, often leading to severe out-of-memory (OOM) errors during both training and inference.
+
+Furthermore, this sample-wise vectorized assembly transforms standard, highly-optimized General Matrix Multiplications (GEMMs) into batch-wise operations (such as \texttt{torch.einsum('b...d,b...o->b...o')}). These operations suffer from a massive drop in arithmetic intensity (the ratio of floating-point operations to memory access). Because the processor must fetch $B$ distinct weight matrices from High Bandwidth Memory (HBM) instead of reusing a single static weight matrix across the entire batch, the execution becomes heavily memory-bandwidth bound rather than compute bound. On modern hardware accelerators, this memory bandwidth bottleneck leads to severe processing stalls and a significant increase in wall-clock latency compared to static Uniform Merging (which has zero runtime overhead).
+
+To mitigate these systems-level limitations when transitioning from our controlled sandbox to multi-billion parameter foundation models (such as LLaMA-70B or CLIP-ViT-L/14), we propose that \emph{low-rank parameter assembly} becomes a mandatory structural requirement rather than an optional optimization. By applying dynamic routing coefficients exclusively to low-rank parameter-efficient adapters (such as LoRA \cite{hu2021lora}), where adapter weights are decomposed into low-rank matrices $A \in \mathbb{R}^{D_{\text{in}} \times r}$ and $B \in \mathbb{R}^{r \times D_{\text{out}}}$ with rank $r \ll \min(D_{\text{in}}, D_{\text{out}})$, the vectorized assembly is restricted to less than $1\%$ of the total network parameters. In this low-rank regime, the active memory footprint is virtually unaffected, and the memory bandwidth overhead of fetching sample-specific adapter weights is small enough to be easily hidden behind the compute-heavy base model forward pass, realizing a highly scalable, systems-efficient deployment pipeline.

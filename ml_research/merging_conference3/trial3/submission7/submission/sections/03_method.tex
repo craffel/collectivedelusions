@@ -1,0 +1,108 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we formalize the \textbf{GranMerge} framework. 
+We detail the task vector formulation, define the five structural granularities under investigation, describe the unsupervised test-time adaptation objective, present the optimizer dynamics (first-order vs.\ zero-order), and introduce our spatial and depth regularizers as candidate tools to control transductive overfitting.
+
+\subsection{Task Vector Formulation and Adaptive Blending}
+
+Let $W_{\text{base}} \in \mathbb{R}^D$ represent the weights of a pre-trained foundation model. 
+Suppose we are given $K$ independent downstream expert models sharing the same pre-trained initialization, where each expert $k \in \{1, \dots, K\}$ has been fine-tuned on a task-specific dataset $\mathcal{D}_k$. 
+Following task arithmetic~\cite{ilharco2022task}, we extract the task vector $\theta_k \in \mathbb{R}^D$ for each expert by subtracting the base model weights from the fine-tuned weights:
+\begin{equation}
+\theta_k = W_k - W_{\text{base}}
+\end{equation}
+The task vector $\theta_k$ isolates the directional weight updates that encode task-specific knowledge. 
+
+Let $T$ represent the set of all parameter tensors in the model (e.g., weights and biases across all layers). 
+For a specific tensor $t \in T$, we denote its base weights as $W_{\text{base}}^{(t)}$ and its task-specific vector as $\theta_k^{(t)}$. 
+To combine all $K$ tasks into a single multi-task network, we construct the merged tensor $W^{(t)}$ using a linear combination:
+\begin{equation}
+\label{eq:merge}
+W^{(t)} = W_{\text{base}}^{(t)} + \sum_{k=1}^K \lambda_{k, t} \theta_k^{(t)}
+\end{equation}
+where $\lambda_{k, t} \in \mathbb{R}$ is the merging coefficient for task $k$ assigned to tensor $t$. 
+The complete set of all optimized coefficients is denoted as $\Lambda = \{\lambda_{k, t}\}_{k=1, t \in T}^K$.
+
+\subsection{The Five Levels of Structural Granularity}
+
+The core contribution of GranMerge is the systematic dissection of the structural resolution of the coefficients $\lambda_{k, t}$. 
+We implement five nested levels of parameter resolution to partition $T$:
+
+\begin{itemize}
+    \item \textbf{Level 1: Global Merging (Task Arithmetic).} A single scalar is optimized per task across the entire model. For all tensors $t \in T$:
+    \begin{equation}
+    \lambda_{k, t} = \lambda_k
+    \end{equation}
+    This coarsest level optimizes exactly $K$ total parameters (4 parameters for $K=4$ tasks).
+    
+    \item \textbf{Level 2: Layer-wise Merging (AdaMerging).} We assign a single coefficient per layer per task: $\lambda_{k, l}$. This represents the standard setting in adaptive merging literature~\cite{yang2024adamerging}, yielding $L \times K$ total parameters (48 parameters for $L=12$, $K=4$).
+    
+    \item \textbf{Level 3: Block-wise Merging.} We group the model's tensors into attention blocks vs.\ MLP blocks. Let $L$ be the number of Transformer layers. For each layer $l \in \{1, \dots, L\}$, we define two coefficients per task: $\lambda_{k, l, \text{Attention}}$ and $\lambda_{k, l, \text{MLP}}$. This yields $2 \times L \times K$ total parameters (96 parameters for $L=12$, $K=4$).
+    
+    \item \textbf{Level 4: Component-wise Merging.} We split the attention and MLP layers into four finer sub-components per layer: $\{qkv, attn\_out, mlp\_fc1, mlp\_fc2\}$. This yields $4 \times L \times K$ total parameters (192 parameters for $L=12$, $K=4$).
+    
+    \item \textbf{Level 5: Tensor-wise Merging.} We assign a unique coefficient to the major projection modules in each block. Specifically, we define six coefficients per layer per task, corresponding to the projection components: \texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{out\_proj}, \texttt{fc1}, and \texttt{fc2} (where each coefficient acts as a single scalar multiplier scaling both the weight matrix and the bias vector of its respective module, rather than assigning separate independent scalars). This yields $6 \times L \times K$ total parameters (288 parameters for $L=12$, $K=4$).
+\end{itemize}
+
+\subsection{Unsupervised Surrogate Objective}
+
+At test time, the model is deployed on an unlabeled calibration stream. 
+Since true labels are unavailable, we optimize the coefficients $\Lambda$ by minimizing the multi-task prediction entropy of the model's outputs. 
+Given a small calibration batch $X_{\text{cal}} = \{X_{\text{cal}, 1}, \dots, X_{\text{cal}, K}\}$ of size $N$ for each task, the adaptation loss is:
+\begin{equation}
+\mathcal{L}(\Lambda) = \frac{1}{K} \sum_{k=1}^K \mathcal{H}\left(P(Y \mid X_{\text{cal}, k}; W(\Lambda))\right) + \beta \mathcal{R}(\Lambda)
+\end{equation}
+where $P(Y \mid X_{\text{cal}, k}; W(\Lambda))$ is the softmax output distribution over class categories, and $\mathcal{H}(P) = -\sum_{c} P_c \log P_c$ is the Shannon entropy. 
+$\mathcal{R}(\Lambda)$ is the regularization penalty, scaled by hyperparameter $\beta \geq 0$.
+
+\subsection{Optimizer Dynamics: First-order vs.\ Zero-order}
+
+To explore how optimization trajectories influence transductive overfitting, we optimize the surrogate loss using two fundamentally different optimizer families:
+
+\textbf{Adam Gradient Descent (First-order):} 
+We compute the analytical gradients of the unsupervised loss with respect to the continuous coefficients, $\nabla_{\Lambda} \mathcal{L}$, via backpropagation. 
+The coefficients are updated using the Adam optimizer~\cite{kingma2014adam} for $S=60$ steps with a learning rate of $\eta = 0.02$:
+\begin{equation}
+\Lambda^{(s+1)} = \Lambda^{(s)} - \text{Adam}(\nabla_{\Lambda} \mathcal{L}(\Lambda^{(s)}), \eta)
+\end{equation}
+
+\textbf{1+1 Evolution Strategies (Zero-order):} 
+We employ a derivative-free 1+1 Evolution Strategy (1+1 ES)~\cite{rechenberg1973evolutionsstrategie}. 
+At each step $s \in \{1, \dots, 100\}$, we generate a candidate mutation $\Lambda_{\text{mut}}$ by adding zero-mean Gaussian noise scaled by mutation strength $\sigma$:
+\begin{equation}
+\Lambda_{\text{mut}} = \Lambda^{(s)} + \epsilon, \quad \epsilon \sim \mathcal{N}(0, \sigma^2 \mathbf{I})
+\end{equation}
+We evaluate the forward pass loss of the mutated weights $W(\Lambda_{\text{mut}})$. 
+The mutation is accepted if it reduces the loss; otherwise, we retain the current parameters:
+\begin{equation}
+\Lambda^{(s+1)} = \begin{cases} 
+\Lambda_{\text{mut}} & \text{if } \mathcal{L}(\Lambda_{\text{mut}}) < \mathcal{L}(\Lambda^{(s)}) \\
+\Lambda^{(s)} & \text{otherwise}
+\end{cases}
+\end{equation}
+The mutation strength is initialized to $\sigma=0.05$ and dynamically adapted based on historical success rates (the 1/5th success rule).
+
+\subsection{Regularization to Prevent Transductive Overfitting}
+
+To study if simple, soft constraints can control the excessive optimization capacity at high structural granularities, we introduce two distinct regularizations in $\mathcal{R}(\Lambda)$:
+
+\textbf{1. Elastic Spatial Regularization (ESR):} 
+ESR acts as a spatial regularizer, pulling fine-grained coefficients towards their layer-wise task-specific average. 
+This prevents individual tensors from taking extreme unphysical values while still allowing localized flexibility. 
+Let $T_l$ be the set of tensors in layer $l$, and $\bar{\lambda}_{k, l} = \frac{1}{|T_l|}\sum_{t \in T_l} \lambda_{k, t}$ be their mean. 
+The ESR penalty is defined as:
+\begin{equation}
+\mathcal{R}_{\text{ESR}}(\Lambda) = \sum_{k=1}^K \sum_{l=1}^L \sum_{t \in T_l} \left( \lambda_{k, t} - \bar{\lambda}_{k, l} \right)^2
+\end{equation}
+
+\textbf{2. Depth-wise Total Variation (TV) Smoothness:} 
+TV regularization enforces depth-wise smoothness across transformer layers. 
+It penalizes rapid fluctuations in coefficient values between adjacent layers, reflecting the physical intuition that feature representations evolve smoothly through the network hierarchy. 
+Let $\lambda_{k, l, c}$ be the coefficient for task $k$, layer $l$, and component $c$. 
+The TV penalty is:
+\begin{equation}
+\mathcal{R}_{\text{TV}}(\Lambda) = \sum_{k=1}^K \sum_{l=2}^{L} \sum_{c} \left( \lambda_{k, l, c} - \lambda_{k, l-1, c} \right)^2
+\end{equation}
+The joint regularization is expressed as $\mathcal{R}(\Lambda) = \mathcal{R}_{\text{ESR}}(\Lambda) + \gamma \mathcal{R}_{\text{TV}}(\Lambda)$, where $\gamma$ balances the two terms.
+We benchmark the joint regularizer at Level 5 to evaluate its capacity to mitigate transductive overfitting across both gradient-based and derivative-free optimizers.

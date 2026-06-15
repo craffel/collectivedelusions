@@ -1,0 +1,104 @@
+\section{Methodology: The EpiMerge Framework}
+\label{sec:method}
+
+In this section, we present the mathematical and architectural formulation of \textbf{EpiMerge} (\textbf{Epigenetic Weight Masking}). Inspired by cellular molecular biology, where chemical marks regulate gene expression dynamically without altering the genetic code, EpiMerge dynamically and reversibly scales expert parameters using the input sample as an environmental stimulus. This enables true, sample-wise dynamic merging during a single parallel forward pass.
+
+\subsection{Problem Formulation}
+Let $W_{base}^{(l)} \in \mathbb{R}^{D_{out} \times D_{in}}$ be the static, pre-trained weight matrix of linear layer $l \in \{1, \dots, L\}$ in a shared base model. We are given $K$ task-specific expert networks, where each expert $k \in \{1, \dots, K\}$ shares the base architecture but has been fine-tuned on a separate downstream dataset. For each expert, we define the corresponding \emph{task vector} $T_k^{(l)}$ as the parameter-space delta from the base model initialization:
+\begin{equation}
+    T_k^{(l)} = W_k^{(l)} - W_{base}^{(l)} \in \mathbb{R}^{D_{out} \times D_{in}}
+\end{equation}
+Our objective is to construct a merged model that dynamically blends the task vectors $\{T_k^{(l)}\}$ on-the-fly for each test-time sample $x$, while completely avoiding sequential inference looping, batch-averaging ensembling shortcuts, or manual test-time adaptation tuning.
+
+\subsection{Global Input Representation Extraction via Semantic Sensory Extractor}
+To enable sample-specific adaptation, we first extract a low-dimensional global representational state $\mathbf{h}(x)_b \in \mathbb{R}^d$ for each input sample in a batch. Let $x \in \mathbb{R}^{B \times C \times H \times W}$ be a batch of images of size $B$.
+
+Unlike primitive dynamic routers that rely on average-pooled patch embeddings (which contain only uncontextualized raw pixel projections such as colors and edges), we propose a \textbf{Deep Semantic Sensory Extractor}. We define a completely frozen, unmodified copy of the pre-trained base model $\mathcal{M}_{base}$, which serves as our dedicated sensory transduction organ. 
+
+For each input image $x_b$ in the batch, we perform a single, static forward pass through the frozen sensory extractor to retrieve a highly contextualized and semantically rich representation $\mathbf{z}(x)_b \in \mathbb{R}^D$ ($D=192$ for ViT-Tiny) right before the classification head:
+\begin{equation}
+    \mathbf{z}(x)_b = \mathcal{M}_{base}(x_b) \in \mathbb{R}^D
+\end{equation}
+By routing the inputs through the complete, unmodified transformer blocks of $\mathcal{M}_{base}$, the extracted features $\mathbf{z}(x)_b$ benefit from full self-attention contextualization across deep layers, representing highly abstract and semantic class boundaries rather than primitive edge statistics.
+
+We then project this deep, semantic representation $\mathbf{z}(x)_b$ to our compact latent space of dimension $d = K$ using a frozen random projection matrix $P \in \mathbb{R}^{d \times D}$ initialized from a zero-mean Gaussian distribution with variance $1/D$:
+\begin{equation}
+    \mathbf{h}(x)_b = P \mathbf{z}(x)_b \in \mathbb{R}^d
+\end{equation}
+This random projection maps the rich semantic features onto our low-dimensional coordinate system, providing a stable, high-level feedback signal to guide the Epigenetic Reader Heads across all layers. Since the sensory extractor is fully frozen and shared, this architecture introduces a highly predictable computational trade-off of a single extra static forward pass per batch, completely bypassing expensive backpropagation or iterative test-time optimization loops.
+
+\subsection{Low-Rank Epigenetic Mask Generation with Arbitrary Rank $R$}
+Instead of scaling the entire task vector $T_k^{(l)}$ with a single scalar coefficient, or constructing a full, parameter-heavy $D_{out} \times D_{in}$ gating mask (which would trigger a catastrophic parameter explosion), we propose \textbf{Low-Rank Row-Column Dual Gating} and generalize it to arbitrary gating ranks $R \ge 1$. 
+
+For each task expert $k$, we introduce a pair of small, trainable epigenetic reader tensors:
+\begin{equation}
+    U_k^{(l)} \in \mathbb{R}^{D_{out} \times R \times d} \quad \text{and} \quad V_k^{(l)} \in \mathbb{R}^{D_{in} \times R \times d}
+\end{equation}
+These tensors act as highly efficient Epigenetic Reader Heads (ERHs). Given the global representational state $\mathbf{h}(x)_b \in \mathbb{R}^d$ for sample $b$ and rank component $r \in \{1, \dots, R\}$, the ERHs compute sample-specific, rank-specific row-gating masks $\mathbf{r}_{k, b, r}^{(l)}(x) \in \mathbb{R}^{D_{out}}$ and column-gating masks $\mathbf{c}_{k, b, r}^{(l)}(x) \in \mathbb{R}^{D_{in}}$ via Sigmoid activations:
+\begin{align}
+    \mathbf{r}_{k, b, r}^{(l)}(x) &= \sigma\left( U_{k, r}^{(l)} \mathbf{h}(x)_b \right) \in \mathbb{R}^{D_{out}} \\
+    \mathbf{c}_{k, b, r}^{(l)}(x) &= \sigma\left( V_{k, r}^{(l)} \mathbf{h}(x)_b \right) \in \mathbb{R}^{D_{in}}
+\end{align}
+where $\sigma(\cdot)$ is the element-wise logistic sigmoid function. 
+
+By taking the sum of the outer products across all rank components $r \in \{1, \dots, R\}$, we dynamically construct a coordinate-wise gating matrix $G_{k, b}^{(l)}(x) \in \mathbb{R}^{D_{out} \times D_{in}}$:
+\begin{equation}
+    G_{k, b}^{(l)}(x) = \sum_{r=1}^R \mathbf{r}_{k, b, r}^{(l)}(x) \otimes \mathbf{c}_{k, b, r}^{(l)}(x)
+\end{equation}
+This formulation is highly elegant: it allows fine-grained, coordinate-wise control over every single parameter in the task vector, while requiring only $O(R \cdot d \cdot (D_{out} + D_{in}))$ trainable parameters per layer group, compared to $O(D_{out} \times D_{in})$ for a full-rank mask. By scaling the rank $R \ge 2$, we can smoothly expand the expressive capacity of coordinate gating, smoothing the non-convex gradient landscape and helping the optimizer escape local saddle points.
+
+\subsection{Sample-Specific Weight Reconstruction}
+Using the generated row and column gating masks, we scale each expert's task vector and blend them with the pre-trained base weight to reconstruct a unique, sample-specific weight matrix $W_{merged, b}^{(l)}(x)$ for input $b$:
+\begin{equation}
+    W_{merged, b}^{(l)}(x) = W_{base}^{(l)} + \sum_{k=1}^K \sum_{r=1}^R \left( \mathbf{r}_{k, b, r}^{(l)}(x) \otimes \mathbf{c}_{k, b, r}^{(l)}(x) \right) \odot T_k^{(l)}
+\end{equation}
+where $\odot$ denotes the element-wise Hadamard product. In index notation, the $(i,j)$-th element of the sample-specific weight matrix is reconstructed as:
+\begin{equation}
+    [W_{merged, b}^{(l)}(x)]_{i, j} = [W_{base}^{(l)}]_{i, j} + \sum_{k=1}^K \sum_{r=1}^R \mathbf{r}_{k, b, i, r}^{(l)}(x) \cdot \mathbf{c}_{k, b, j, r}^{(l)}(x) \cdot [T_k^{(l)}]_{i, j}
+\end{equation}
+This formulation represents the core of our epigenetic model: the pre-trained base weight $W_{base}^{(l)}$ acts as the static, constant genetic backbone, while the rank-generalized row and column gating masks dynamically scale the specialized expert task vectors $T_k^{(l)}$ on-the-fly.
+
+\subsection{Vectorized Parallel Forward Pass}
+A significant challenge in sample-wise dynamic merging is executing the forward pass without sacrificing GPU concurrency. Sequentially looping through a batch of size $B$ on a GPU would cause immense latency and serialize tensor operations.
+
+To resolve this, we leverage highly parallel, vectorized tensor contractions using Einstein summation notation (\texttt{torch.einsum}). Let $X \in \mathbb{R}^{B \times N \times D_{in}}$ be the input activation tensor entering linear layer $l$. 
+First, we stack the computed row masks $R \in \mathbb{R}^{K \times B \times D_{out} \times R}$ and column masks $C \in \mathbb{R}^{K \times B \times D_{in} \times R}$ across the task and rank dimensions. The batched parameter deltas $\Delta W \in \mathbb{R}^{B \times D_{out} \times D_{in}}$ are computed in a single parallel step:
+\begin{equation}
+    [\Delta W]_{b, o, i} = \sum_{k=1}^K \sum_{r=1}^R R_{k, b, o, r} \cdot C_{k, b, i, r} \cdot [T_k^{(l)}]_{o, i}
+\end{equation}
+In PyTorch, this is implemented as:
+\begin{align*}
+    \Delta W &= \text{\texttt{torch.einsum}}('\text{kbor},\text{kbir},\text{koi}\rightarrow\text{boi}', R, C, T) \\
+    W_{merged} &= W_{base} + \Delta W \in \mathbb{R}^{B \times D_{out} \times D_{in}}
+\end{align*}
+Finally, the sample-specific output activation $Y \in \mathbb{R}^{B \times N \times D_{out}}$ is computed in parallel across the batch:
+\begin{equation}
+    Y_b = X_b \cdot [W_{merged, b}^{(l)}(x)]^T + \mathbf{b}^{(l)}
+\end{equation}
+which is executed via:
+\begin{equation}
+    Y = \text{\texttt{torch.einsum}}('\text{bni},\text{boi}\rightarrow\text{bno}', X, W_{merged}) + \mathbf{b}^{(l)}
+\end{equation}
+where $\mathbf{b}^{(l)}$ is the shared bias vector. This parallel vectorized formulation maintains perfect I.I.D. batch inference and high GPU tensor core utilization.
+
+\subsection{Optimization-Regularized Calibration}
+The Epigenetic Reader Heads (ERHs) are parameterized by the matrices $\{U_k^{(l)}, V_k^{(l)}\}_{k=1, l=1}^{K, L}$. Since these represent only a tiny fraction ($<0.1\%$) of the total model parameters, we can calibrate them using a extremely compact, stratified calibration dataset $\mathcal{D}_{cal}$.
+
+We construct $\mathcal{D}_{cal}$ by drawing a mere 64 samples (16 samples per task) from the training distributions of our $K=4$ experts. We freeze both the base model $W_{base}$ and the task vectors $T_k$, and optimize only the ERH parameters $\{U, V\}$ offline using backpropagation. We minimize the standard cross-entropy loss over $\mathcal{D}_{cal}$ for 100 steps using the Adam optimizer:
+\begin{equation}
+    \min_{U, V} \mathbb{E}_{(x, y) \sim \mathcal{D}_{cal}} \left[ \mathcal{L}_{CE} \left( f_{EpiMerge}(x; U, V), y \right) \right]
+\end{equation}
+Crucially, this offline calibration is executed only once. During deployment and evaluation, the learned epigenetic masks require zero training, zero online test-time adaptation steps, and zero computational loops, enabling instantaneous, sample-specific dynamic ensembling while accepting a physical trade-off in wall-clock latency and memory storage for sample-specific weight reconstruction.
+
+\subsection{Lightweight Parameter-Free Active-Early Sensory Extraction}
+While the Deep Semantic Sensory Extractor $\mathcal{M}_{base}$ provides outstanding, contextualized feedback signals, it incurs a predictable resource overhead: it requires maintaining a complete frozen copy of the base model in memory (effectively doubling parameters from 1.0x to 2.0x) and requires executing two complete forward passes per batch (tripling latency).
+
+To completely bypass this resource overhead, we propose a lightweight alternative: \textbf{Active-Early Sensory Extraction}. Instead of running a duplicate frozen model, we leverage the active model itself. We partition the $L$ transformer blocks of the active model into an early static stage and a deep dynamic stage. The first $L_{early}$ blocks (e.g., $L_{early}=4$ out of $12$ blocks in a ViT-Tiny backbone) are statically merged using a baseline compromise (e.g., Uniform Merging), meaning they do not require dynamic gating signals and execute extremely fast.
+
+We pass the input image batch $x$ through these $L_{early}$ static blocks, and retrieve the intermediate activation tensor $X^{(L_{early})} \in \mathbb{R}^{B \times N_{tokens} \times D_{embed}}$ at the boundary. We then average pool the activations across the token sequence dimension to obtain a global representational state:
+\begin{equation}
+    \mathbf{z}_{early}(x)_b = \frac{1}{N_{tokens}} \sum_{n=1}^{N_{tokens}} X_{b, n}^{(L_{early})} \in \mathbb{R}^{D_{embed}}
+\end{equation}
+We project this intermediate state to our compact latent space $\mathbf{h}(x)_b = P \mathbf{z}_{early}(x)_b \in \mathbb{R}^d$ and set this as our current feedback signal. The subsequent $L - L_{early}$ blocks are equipped with dynamic Epigenetic Reader Heads, which use this newly extracted $\mathbf{h}(x)_b$ to dynamically modulate their weight matrices on-the-fly for the remainder of the forward pass.
+
+This active-early formulation completely eliminates the redundant frozen duplicate copy, reducing the static parameter footprint to \textbf{exactly 1.0x} and slashes inference latency by running a single forward pass, providing a highly scalable path for production deployments.

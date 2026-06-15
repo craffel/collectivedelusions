@@ -1,0 +1,143 @@
+\section{Detailed Algorithms and Training Pseudocode}
+\label{sec:appendix_algorithms}
+
+To assist practitioners in implementing \textbf{PAC-STM}, we provide complete, step-by-step algorithmic procedures for both the offline calibration phase (Algorithm~\ref{alg:calibration}) and the online serving-time dynamic inference phase (Algorithm~\ref{alg:serving}).
+
+\begin{algorithm}[tb]
+\caption{PAC-STM Offline Calibration Phase}
+\label{alg:calibration}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Pre-trained frozen backbone $f_\theta$ with $L$ layers; $K$ pre-trained LoRA task experts $\{E_k\}_{k=1}^K$; calibration sets $\{\mathcal{C}_k\}_{k=1}^K$ of size $N$ each; prior initialization temperature log-scale $\mathbf{w}_0 = \ln(0.05) \cdot \mathbf{1}$; prior step variance $\sigma_0^2 = 5.0$, transition variance $\sigma^2 = 0.5$; learning rate $\eta = 10^{-3}$; optimization epochs $S = 1000$.
+\STATE \textbf{Output:} Optimized mean trajectory parameters $\mathbf{u}^* \in \mathbb{R}^{L \times K}$.
+\STATE \COMMENT{\textbf{Step 1: Coordinate Subspace Extraction}}
+\FOR{$k = 1$ to $K$}
+    \STATE Extract hidden representations $\{z_b\}_{b=1}^N$ at layer $l_{\text{route}}$ from $\mathcal{C}_k$ using $f_\theta$.
+    \STATE Normalize representations onto unit sphere: $\tilde{z}_b \leftarrow z_b / (\|z_b\|_2 + \epsilon)$.
+    \IF{using UN-PCA-SEP}
+        \STATE Compute top-$d$ singular vectors $V_{k, d} \in \mathbb{R}^{D \times d}$ of $[\tilde{z}_1, \dots, \tilde{z}_N]$ via SVD.
+    \ELSIF{using UN-KPCA-SEP}
+        \STATE Form uncentered kernel matrix $K^{(k)}_{ij} \leftarrow \mathcal{K}(\tilde{z}_i, \tilde{z}_j)$.
+        \STATE Solve eigenvalue problem $K^{(k)} \boldsymbol{\alpha}^{(k)}_p = \lambda^{(k)}_p \boldsymbol{\alpha}^{(k)}_p$ for top-$d$ normalized eigenvectors.
+    \ENDIF
+\ENDFOR
+\STATE \COMMENT{\textbf{Step 2: Trajectory Optimization}}
+\STATE Initialize mean trajectory $\mathbf{u} \leftarrow (\mathbf{u}_1, \dots, \mathbf{u}_L) \in \mathbb{R}^{LK}$ with $\mathbf{u}_l \leftarrow \mathbf{w}_0$.
+\FOR{step $= 1$ to $S$}
+    \STATE Sample a mini-batch of calibration data across tasks.
+    \STATE Compute projected energy coordinates $e_{k, b} \in [0, 1]$ via Eq.~(2) or Eq.~(3).
+    \STATE Compute Gibbs ensembling coefficients dynamically: $\alpha_k(l) \leftarrow \text{Softmax}(e_{k, b} / e^{u_{k, l}})$.
+    \STATE Compute empirical cross-entropy routing loss $\hat{R}_N(\mathbf{u}) \leftarrow \frac{1}{N_{\text{batch}}} \sum \mathcal{L}_{\text{route}}$.
+    \STATE Compute exact closed-form trajectory KL divergence $\text{KL}(Q \| P)$ via Theorem 3.1.
+    \STATE Formulate the PAC-Bayesian deterministic training objective:
+    $$\mathcal{L}_{\text{total}}(\mathbf{u}) \leftarrow \hat{R}_N(\mathbf{u}) + \frac{1}{\sqrt{2N}} \text{KL}(Q \| P)$$
+    \STATE Compute gradients $\nabla_{\mathbf{u}} \mathcal{L}_{\text{total}}(\mathbf{u})$ and update $\mathbf{u} \leftarrow \text{Adam}(\mathbf{u}, \nabla_{\mathbf{u}} \mathcal{L}_{\text{total}}(\mathbf{u}), \eta)$.
+\ENDFOR
+\STATE \textbf{return} $\mathbf{u}^* \leftarrow \mathbf{u}$.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[tb]
+\caption{PAC-STM Online Serving-Time Inference Phase}
+\label{alg:serving}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Incoming request sample $x_b$; pre-trained frozen backbone $f_\theta$; task experts $\{E_k\}_{k=1}^K$; pre-computed projection bases $\{V_{k, d}\}_{k=1}^K$ or eigenvectors $\{\boldsymbol{\alpha}^{(k)}_p\}$; optimized mean trajectory parameters $\mathbf{u}^* \in \mathbb{R}^{L \times K}$; active sparse serving threshold $k_{\text{active}}$ (default $k_{\text{active}}=2$).
+\STATE \textbf{Output:} Network output prediction $y_b$.
+\STATE \COMMENT{\textbf{Step 1: Early Routing Coordinate Extraction}}
+\STATE Forward propagate sample $x_b$ through frozen backbone $f_\theta$ up to layer $l_{\text{route}}$, obtaining hidden feature $z_b \in \mathbb{R}^D$.
+\STATE Normalize onto unit sphere: $\tilde{z}_b \leftarrow z_b / (\|z_b\|_2 + \epsilon)$.
+\FOR{$k = 1$ to $K$}
+    \STATE Compute task coordinate energy $e_{k, b} \leftarrow \|V_{k, d}^T \tilde{z}_b\|_2$ (or via uncentered Kernel PCA).
+\ENDFOR
+\STATE \COMMENT{\textbf{Step 2: Layer-wise Serving with Active Adapter Ensembling}}
+\STATE Initialize activation tensor $A_{l_{\text{route}}} \leftarrow z_b$.
+\FOR{$l = l_{\text{route}} + 1$ to $L$}
+    \STATE Compute full ensembling coefficients: $\alpha_{k}(l) \leftarrow \frac{\exp(e_{k, b} / e^{u^*_{k, l}})}{\sum_{j=1}^K \exp(e_{j, b} / e^{u^*_{j, l}})}$.
+    \IF{$K > 10$ and using Sparse Top-$k$}
+        \STATE Identify the indices of the top-$k_{\text{active}}$ largest coefficients in $\boldsymbol{\alpha}(l)$.
+        \STATE Set all other task coefficients to $0$ and re-normalize the active coefficients to sum to $1$.
+    \ENDIF
+    \STATE Compute expert adapter block outputs $E_k(l)(A_{l-1})$ for active experts.
+    \STATE Blend activations dynamically: $A_l \leftarrow \sum_{k \in \text{active}} \alpha_k(l) \cdot E_k(l)(A_{l-1}) + f_{\theta, l}(A_{l-1})$ (where $f_{\theta, l}$ is the standard frozen backbone layer).
+\ENDFOR
+\STATE Forward propagate $A_L$ through final classification head to obtain prediction $y_b$.
+\STATE \textbf{return} $y_b$.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Catoni's PAC-Bayesian bound and Alquier's Generalization of Unbounded Losses}
+\label{sec:appendix_catoni}
+
+We provide the rigorous mathematical steps to transition from bounded-loss generalization bounds to unbounded, sub-Gaussian cross-entropy routing losses under Alquier's and Catoni's PAC-Bayesian frameworks.
+
+Let $\mathcal{L}_{\text{route}}(\mathbf{w}; z) \in [0, \infty)$ be the sample-wise routing cross-entropy loss under log-temperatures $\mathbf{w}$ for calibration sample $z = (\mathbf{e}_b, y_b)$. We assume that under the prior distribution $P$, the loss is sub-Gaussian. Specifically, we assume there exists a variance factor $s^2 > 0$ such that for all $\gamma > 0$, the log-moment generating function is bounded:
+\begin{equation}
+\ln \mathbb{E}_{\mathbf{w} \sim P} \left[ \exp\left( \gamma \left( R(\mathbf{w}) - \hat{R}_N(\mathbf{w}) \right) \right) \right] \le \frac{\gamma^2 s^2}{2N}
+\end{equation}
+where $R(\mathbf{w}) = \mathbb{E}_z[\mathcal{L}_{\text{route}}(\mathbf{w}; z)]$ is the true risk, and $\hat{R}_N(\mathbf{w}) = \frac{1}{N} \sum_{i=1}^N \mathcal{L}_{\text{route}}(\mathbf{w}; z_i)$ is the empirical risk on calibration set $\mathcal{C}$ of size $N$.
+
+Using Catoni's PAC-Bayesian inequality, for any posterior distribution $Q$ and confidence parameter $\delta \in (0, 1)$, with probability at least $1-\delta$ simultaneously for all distributions $Q$:
+\begin{equation}
+\mathbb{E}_{\mathbf{w} \sim Q} [R(\mathbf{w})] \le \mathbb{E}_{\mathbf{w} \sim Q} [\hat{R}_N(\mathbf{w})] + \frac{\text{KL}(Q \| P) + \ln(1/\delta)}{\gamma} + \frac{\gamma s^2}{2N}
+\end{equation}
+where $\gamma > 0$ is a free tuning parameter of the bound. To find the optimal $\gamma^*$ that minimizes the right-hand side, we differentiate with respect to $\gamma$, yielding:
+\begin{equation}
+\gamma^* = \sqrt{\frac{2N \left( \text{KL}(Q \| P) + \ln(1/\delta) \right)}{s^2}}
+\end{equation}
+Substituting $\gamma^*$ back into Eq.~(22) yields the standard square-root complexity penalty:
+\begin{equation}
+\mathbb{E}_{\mathbf{w} \sim Q} [R(\mathbf{w})] \le \mathbb{E}_{\mathbf{w} \sim Q} [\hat{R}_N(\mathbf{w})] + s \sqrt{\frac{2 \left( \text{KL}(Q \| P) + \ln(1/\delta) \right)}{N}}
+\end{equation}
+which has the same functional dependence on $N$ and $\text{KL}(Q \| P)$ as McAllester's bound (Eq.~11), but with an explicit scale factor $s$ that captures the variance of the unbounded loss.
+
+To derive a highly practical, deterministic optimization objective that is linear in both the empirical risk and the complexity penalty, we can fix $\gamma = \sqrt{2N}$ (under the assumption that $s=1$ without loss of generality), which yields:
+\begin{equation}
+\mathbb{E}_{\mathbf{w} \sim Q} [R(\mathbf{w})] \le \mathbb{E}_{\mathbf{w} \sim Q} [\hat{R}_N(\mathbf{w})] + \frac{\text{KL}(Q \| P)}{\sqrt{2N}} + \frac{\ln(1/\delta) + 1}{\sqrt{2N}}
+\end{equation}
+Since the final term is a constant with respect to the posterior mean trajectory parameters $\mathbf{u}$, the deterministic objective that minimizes this generalization bound is:
+\begin{equation}
+\mathbf{u}^* = \arg\min_{\mathbf{u}} \left( \hat{R}_N(\mathbf{u}) + \lambda \cdot \text{KL}(Q \| P) \right)
+\end{equation}
+where the structural regularization coefficient is given exactly by $\lambda = \frac{1}{\sqrt{2N}}$. This provides a complete, mathematically seamless theoretical guarantee that bridges PAC-Bayesian generalization theory and our deterministic trajectory optimization objective.
+
+\section{Detailed Experimental Configurations and Hyperparameters}
+\label{sec:appendix_hyperparams}
+
+To guarantee reproducibility and full empirical transparency, we list all hyperparameters, architecture configurations, and optimization settings used across our three experimental setups: the simulated Coordinate Sandbox, the non-linear Kernel PCA evaluation, and the real-world pre-trained Vision Transformer (\texttt{ViT-B/16}) validation on MNIST and CIFAR-10. Table~\ref{tab:appendix_hyperparams} provides a comprehensive compilation of these settings.
+
+\begin{table*}[t]
+\centering
+\caption{Comprehensive list of hyperparameters and settings across all evaluation regimes of PAC-STM.}
+\label{tab:appendix_hyperparams}
+\vskip 0.15in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llll}
+\toprule
+\textbf{Hyperparameter / Setting} & \textbf{Sandbox} & \textbf{KPCA} & \textbf{ViT-B/16} \\
+\midrule
+Backbone Architecture & Simulated 14-layer & Simulated 14-layer & Pre-trained \texttt{vit-b-16} \\
+Backbone Parameters / Layers & $L=14$ layers & $L=14$ layers & 12 Blocks ($L=12$) \\
+Representation Dimension $D$ & 192 & 192 & 768 \\
+Number of Experts $K$ & $K=4$ tasks & $K=4$ tasks & $K=2$ tasks \\
+Expert Adapter Architecture & Activation Scaling & Activation Scaling & LoRA \\
+LoRA Rank $r$ / Alpha & N/A & N/A & $r=8$, $\alpha_{\text{lora}}=16$ \\
+Adapted Layer Indices & All $L=14$ layers & All $L=14$ layers & Blocks 5--12 \\
+Routing Layer Index $l_{\text{route}}$ & Layer 4 & Layer 4 & Block 4 \\
+Calibration Sample Size $N$ & $N=16$ per task & $N=16$ per task & $N=16$ per task \\
+Subspace Projection Dimension $d$ & $d=4$ & $d=4$ & $d=4$ (SVD-PCA) \\
+Kernel Function $\mathcal{K}$ & N/A & RBF & N/A \\
+RBF Kernel Gamma $\gamma$ & N/A & $\gamma = 2.0$ & N/A \\
+Prior Temp Scale $\mathbf{w}_0$ & $\ln(0.05) \cdot \mathbf{1} \approx -3.0$ & $\ln(0.05) \cdot \mathbf{1}$ & $\ln(0.05) \cdot \mathbf{1}$ \\
+Prior Search Variance $\sigma_0^2$ & $5.0$ & $5.0$ & $5.0$ \\
+Transition Step Variance $\sigma^2$ & $0.5$ (default) & $0.5$ & $0.5$ \\
+Optimizer / Learning Rate $\eta$ & Adam / $1 \times 10^{-3}$ & Adam / $1 \times 10^{-3}$ & Adam / $1 \times 10^{-3}$ \\
+Calibration Optimization Steps & 1000 steps & 1000 steps & 100 steps \\
+Task-specific Adapter Training & N/A & N/A & SGD / LR $10^{-2}$ / 5 ep. \\
+Confidence Parameter $\delta$ & $0.05$ & $0.05$ & $0.05$ \\
+Subspace Noise Level $\sigma_{\text{noise}}$ & $0.15$ & $0.20$ & Real (No added noise) \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table*}

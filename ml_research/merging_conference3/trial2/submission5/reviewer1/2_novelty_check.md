@@ -1,0 +1,16 @@
+# 2. Novelty and Originality Assessment
+
+## Key Novel Aspects
+1. **Layer-wise Analytical Norm Equalization in Weight Space**: While previous model-merging methods utilize activation statistics (RegMean), Fisher information (Fisher Merging), or complex gradient-based test-time optimization (AdaMerging), NETA is novel in proposing a layer-by-layer Frobenius norm equalization of task vectors that is entirely closed-form, data-free, and parameter-free.
+2. **Identifying and Formalizing the "Overfitting-Optimizer Paradox"**: The paper provides a novel and critical analysis of unsupervised Test-Time Adaptation (TTA) objectives (specifically joint prediction entropy minimization). It mathematically and empirically demonstrates that this objective behaves opportunistically, favoring easy, low-entropy tasks and suppressing harder, high-entropy tasks when the parameter space is highly constrained (Task-Wise AdaMerging).
+3. **Closed-Form scale-compensation factor ($\gamma^l$)**: The mathematical formalization of directional norm contraction in weight space merging (Equation 13) and the subsequent derivation of an automated closed-form compensation factor ($\gamma^l$) is a highly elegant, training-free addition to the model-merging literature.
+
+## Delta from Prior Work
+- **From Standard Task Arithmetic (TA)**: Task Arithmetic assumes that the norms of different task updates are naturally balanced, leading to task dominance. NETA's delta is the introduction of layer-wise weights $w_k^l$ that scale the task vectors dynamically based on their relative Frobenius norms to enforce perfect isotropic magnitude balance.
+- **From Test-Time Weight Adaptation (AdaMerging/SyMerge)**: AdaMerging requires small calibration sets (e.g., 256 unlabeled images) and optimizes layer-wise or task-wise coefficients over several epochs. NETA's delta is completely bypassing this optimization loop, achieving stable, balanced performance entirely zero-shot.
+- **From Pruning-Based Methods (TIES-Merging/DARE)**: TIES-Merging and DARE rely on sign-agreement, thresholding, and stochastic pruning of individual weights to mitigate task interference. NETA retains all weights and achieves balance through structural scaling rather than heuristic sparsification.
+
+## Characterization of Novelty
+The novelty of NETA's core weight-space transform is **incremental but highly elegant and practically valuable**. Normalizing vector norms is a classic mathematical tool, and applying it layer-wise in neural network merging is a logical next step. However, the combination of this simple geometric normalization with several practical, training-free mechanisms—such as the continuous $\alpha$-relaxation, the noise-damping stabilizer $\beta$, the composite visual input block grouping, and the analytical $\gamma^l$ compensation factor—demonstrates a deep and rigorous understanding of deep learning architecture practicalities.
+
+Furthermore, the conceptual contribution of exposing the **Overfitting-Optimizer Paradox** is **significant**. It shifts the perspective on test-time adaptation methods, showing that their performance gains can be unstable, transductively overfit, and highly biased against challenging tasks. For practitioners, this provides a highly valuable cautionary analysis of the limitations of unsupervised joint prediction entropy minimization.

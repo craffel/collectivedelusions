@@ -1,0 +1,24 @@
+# Peer Review Evaluation - Novelty and Delta (2_novelty_check.md)
+
+## 1. Key Novel Aspects of TSAR
+The paper proposes **Task-Space Anchor Regularization (TSAR)**, which introduces a highly practical and mathematically elegant form of geometric regularization to dynamic model merging. While distance-based regularization and centroid-based representation mapping (such as Prototypical Networks) are well-established in few-shot and distance-metric learning, applying these concepts as a coordinate-anchoring regularizer for parameter-fusion routers is a novel and clever synthesis.
+
+The most novel aspects of this work include:
+* **The Concept of Task-Space Anchoring:** Instead of standard $L_2$ weight decay (which pulls weights toward zero, ignoring the representational structure of the pre-trained expert backbones), TSAR pulls the routing parameters toward stable, pre-computed task centroids in a normalized low-dimensional projection space. This leverages the pre-trained expert representations as an anchor system, providing a stable coordinate space for optimization.
+* **Exposing and Proving Layer-Averaging Collapse:** The paper mathematically proves (Equations 5-7) that under linear batch-averaged routing, any layer-wise $L$-layer router collapses to a single-layer global router at deployment. This is a crucial finding that simplifies the conceptual and physical footprint of dynamic routing, proving that a 20-parameter router is functionally equivalent to a 280-parameter router.
+* **Exposing and Characterizing Heterogeneity Collapse:** The paper identifies and formalizes a massive deployment bottleneck in dynamic model merging—the direct mathematical cancellation of routing coefficients under mixed-task deployment streams—and provides a zero-runtime-overhead solution (scaled Sigmoid activations).
+
+## 2. 'Delta' from Prior Work
+The paper systematically differentiates TSAR from existing model-merging and dynamic routing methods:
+* **Static Model Merging (Task Arithmetic, AdaMerging):** Static methods construct a single global parameter configuration for all inputs. The delta here is that TSAR enables **dynamic, sample-specific input routing** that adapts on the fly to heterogeneous test inputs, while resolving the overfitting that traditionally plagues such post-hoc calibration.
+* **Dynamic Model Merging (L3-Router, QWS-Merge):** Prior dynamic routing methods (such as the L3-Router) assumed standard weight decay was sufficient and largely ignored low-data calibration issues.
+  * **QWS-Merge SOTA:** QWS-Merge proposes a highly complex, "quantum-inspired" wave-superposition layer to route coefficients as phase-state transitions. The delta is that TSAR demonstrates that a much simpler, geometrically regularized **classical linear router** achieves significantly higher stability, better generalization, and much easier optimization, outperforming QWS-Merge by a spectacular **+17.18%** Joint Mean accuracy under extreme low-data constraints ($B_{cal}=64$).
+  * **MoE Gating Networks:** Standard Mixture-of-Experts (MoE) gating networks operate directly on high-dimensional feature spaces, resulting in high parameter footprints and extreme vulnerability to calibration noise. The delta is that TSAR projects features onto a compact $K$-dimensional space, reducing parameters by **97.4%** (from 768 to 20 parameters) while dramatically improving robustness on noisy tasks like SVHN.
+
+## 3. Characterization of Novelty
+The novelty of this work is **significant and highly practical**. It is not a theoretical exercise that relies on complex, non-monotonic wave-superposition formulas or expensive on-device backpropagation. Instead, it is a **systems-oriented engineering breakthrough**:
+* **Highly Actionable:** By providing a simple quadratic penalty ($\mathcal{L}_{TSAR}$) and showing that data-independent Random Gaussian projection is superior to PCA under extreme scarcity, the authors provide a highly stable, robust, and zero-variance coordinate projection that can be implemented in a few lines of code.
+* **Supreme Efficiency:** Shrinking the parameter footprint of the router to just 20 parameters (under the single-layer global architecture) makes it exceptionally lightweight and suitable for resource-constrained edge systems or large-scale multi-task servers.
+* **Streaming-Aware Design:** The identification and resolution of heterogeneity collapse directly addresses real-world streaming deployment, ensuring that the proposed dynamic router does not collapse in production servers where inputs are mixed.
+
+Thus, while the mathematical components (centroids, projections, and quadratic penalties) are classical and straightforward, their combination, adaptation, and evaluation within the model-merging routing framework are highly novel, refreshing, and directly aligned with the needs of real-world practitioners.

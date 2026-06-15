@@ -1,0 +1,27 @@
+# Presentation Quality, Strengths, Weaknesses, and Impact Evaluation
+
+## Overall Presentation Quality
+The presentation quality of this submission is **excellent and exemplary**:
+* **Clarity & Structure:** The paper is beautifully organized, following a logical transition from motivating failure modes to empirical/analytical deconstructions, mathematical methodology, systems co-design, and exhaustive empirical sweeps.
+* **Narrative Engagement:** The writing is highly engaging, professional, and mathematically rigorous. The authors' minimalist philosophy (applying Occam's razor to model-merging streams) is consistent and clearly articulated throughout.
+* **Tables & Visualizations:** Figure 5.1 is highly effective at displaying the OOD collapse of QWS-Merge and layer-averaging collapse. The tables are extremely rich in quantitative detail, offering comprehensive summaries of performance, hardware footprints, latency benchmarks, and multi-dimensional ablations.
+
+## Major Strengths
+1. **Aggressive Application of Occam's Razor:** Instead of continuing the trend of designing increasingly complex, heavily-parameterized, wave-inspired "quantum" routing networks, the authors challenge the community by stripping away 100% of routing parameters. They demonstrate that standard, simple classical primitives with regularization (or parameter-free similarity routing) perform better.
+2. **First-Order Mathematical Proof of Layer-Averaging Collapse:** The paper provides a highly rigorous mathematical deconstruction of layer-wise dynamic routing. It proves that intermediate Jacobians act as contractive operators, projecting task vectors onto a shared dominant task subspace and rendering layer-wise coefficients perfectly collinear and redundant.
+3. **Stream-Level Systems Co-design:** Resolving "heterogeneity collapse" at the data-stream level (via Micro-Batch Homogenization) rather than trying to engineer a complex, compromised "robust" model is a highly elegant and practical design paradigm.
+4. **Statistical Rigor in Calibration:** The introduction of *Class-Size Scaling Calibration* ($O(\sqrt{\log C_k / d})$) represents outstanding scholarly depth. It correctly normalizes asymmetrical label/vocabulary spaces by their asymptotic random maximums, preventing statistical over-routing.
+5. **VRAM-Viability under PEFT (LoRA):** Grounding the framework under the LoRA paradigm restricts the serving footprint to a strict $1.04\times$ memory budget. This successfully co-designs the algorithm with the physical constraints of real-world hardware.
+6. **Thoroughness of Evaluation & Ablations:** Validated on high-fidelity synthetic sandboxes, real-world Vision Transformers (DomainNet), and large LLMs (LLaMA-7B). It features rigorous ablations of Unit-Norm Calibration, class-size scaling, out-of-distribution density estimation, massive expert pools ($K=100$), and boundary task soft interpolation.
+
+## Areas for Improvement (Weaknesses)
+1. **Representational Drift on Real Datasets:** While the authors are highly transparent about representational drift under full fine-tuning and propose elegant training-time alignment penalties ($\mathcal{L}_{align}$), a small empirical validation of these training-time penalties or other alignment layers on a real-world dataset (rather than sandbox simulation) would further strengthen the practical utility of this extension.
+2. **Infrastructure Complexity Analysis:** Shifting the burden of robustness to the systems layer (dynamic partitioning, indexing, sequential micro-batch dispatch, and SGMV parallel kernels) introduces significant engineering complexity. A deeper qualitative discussion regarding how this serving layer integrates into production-grade orchestration systems (e.g., vLLM or Kubernetes) would provide valuable deployment context.
+3. **Compute-Constraint Simulations:** While the feature manifold simulations are highly representative, honest, and mathematically sound, evaluating active weights on full datasets during test-time on a large GPU cluster would represent the absolute pinnacle of empirical validation.
+
+## Potential Impact and Significance
+This submission is poised to have a **major, transformative impact** on both the model-merging and systems-ML communities:
+* **Shifting the Research Paradigm:** By exposing the over-parameterization and redundancy of complex wave-inspired and multi-layer routers, it forces the model-merging community to re-evaluate current research directions and shift back toward simple, transparent, and robust design principles.
+* **Practical Serving Blueprint:** The joint co-design of PFSR (zero-shot, zero-parameter) and MBH (stream-level homogenization) with LoRA adapters provides a highly practical, ready-to-deploy blueprint for real-world production registries.
+* **Enabling Instantaneous Hub Scaling:** The training-free and zero-shot nature of PFSR allows practitioners to register or retire experts on the fly in massive model hubs with absolutely zero retraining or joint calibration. This is highly valuable for production environments that maintain dynamic, real-time model registries.
+* **Bridge between Algorithms and Systems:** MBH establishes a unique bridge between systems-level request scheduling and parameter-level dynamic model merging, which will likely inspire serving frameworks (like vLLM, Punica, or S-LoRA) to natively support parameter-free subspace routing.

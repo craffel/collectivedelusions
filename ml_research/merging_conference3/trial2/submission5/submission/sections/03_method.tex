@@ -1,0 +1,150 @@
+\section{Methodology}
+\label{sec:method}
+
+In this section, we formally introduce Norm-Equalized Task Arithmetic (NETA). We first establish the general problem setting and notation, critique standard Task Arithmetic, and then present the mathematical formulation of NETA along with its unique theoretical properties.
+
+\subsection{Problem Setup and Notation}
+Let $\theta_{\text{pre}} \in \mathbb{R}^{D}$ represent the parameter weights of a pre-trained base model. In modern deep networks, the parameter weights are partitioned into $L$ discrete layers or parameter groups (e.g., self-attention projections, feed-forward layers, or projection heads). We denote the weights of the pre-trained base model at a specific layer $l \in \{1, \dots, L\}$ as $\theta_{\text{pre}}^l \in \mathbb{R}^{d_l}$, where $d_l$ is the parameter dimensionality of layer $l$, and $\sum_{l=1}^L d_l = D$.
+
+Suppose we have fine-tuned the base model independently on $K$ distinct downstream tasks. We denote the fine-tuned expert weights for task $k \in \{1, \dots, K\}$ as $\theta_k \in \mathbb{R}^{D}$, and their layer-wise partition as $\theta_k^l \in \mathbb{R}^{d_l}$. 
+
+Following the framework of Task Arithmetic \cite{ilharco2023editing}, we extract a \textit{task vector} $\tau_k^l \in \mathbb{R}^{d_l}$ for each task $k$ and layer $l$, which represents the parameter update direction and magnitude learned during downstream fine-tuning:
+\begin{equation}
+\label{eq:task_vector}
+\tau_k^l = \theta_k^l - \theta_{\text{pre}}^l.
+\end{equation}
+
+\textbf{Active Parameter Scope.} For multi-modal models such as CLIP, downstream visual classification is driven primarily by the visual encoder, whereas the text encoder remains completely frozen and is not task-adapted during visual downstream fine-tuning. Because the text encoder parameters are frozen, their task vectors are identically zero ($\tau_k^l = 0$), which mathematically reduces NETA to standard Task Arithmetic for those parameters. Therefore, NETA's analytical normalization is applied specifically to the 13 active, fine-tuned visual encoder parameter groups, while the unmodified text encoder parameters are merged using standard Task Arithmetic. This ensures that the mathematical scope of NETA is completely defined and well-contained.
+
+\subsection{Standard Task Arithmetic and Task Dominance}
+Standard Task Arithmetic (TA) merges the $K$ task-specific models by directly summing their task vectors and adding them to the pre-trained base model, scaled by a global coefficient $\lambda_0 \in \mathbb{R}$:
+\begin{equation}
+\label{eq:standard_ta}
+\theta_{\text{merged}}^l = \theta_{\text{pre}}^l + \lambda_0 \sum_{k=1}^K \tau_k^l.
+\end{equation}
+
+While standard Task Arithmetic is simple and effective, it relies on a hidden and highly problematic assumption: that the Frobenius norms of the task vectors $\|\tau_k^l\|_F$ are naturally balanced across all tasks. In practice, this assumption is frequently violated. Tasks that are more complex, possess larger training sets, or represent a significant domain shift from the pre-trained distribution (e.g., SVHN) undergo much larger weight modifications during fine-tuning. This discrepancy causes their task vectors to have disproportionately large Frobenius norms compared to other tasks (e.g., MNIST).
+
+When these task vectors are directly summed as in Eq.~\ref{eq:standard_ta}, the high-magnitude task updates dominate the parameter space of the merged model. The representations of the other, lower-magnitude tasks are overwhelmed, leading to destructive interference and severe performance degradation on those tasks.
+
+\subsection{Norm-Equalized Task Arithmetic (NETA)}
+To resolve this update scale imbalance, we propose NETA. Aligned with Occam's razor, NETA balances the task contributions *analytically* in weight space, requiring zero training, zero optimization parameters, and zero calibration data.
+
+For each layer $l \in \{1, \dots, L\}$ and task $k \in \{1, \dots, K\}$, we first compute the Frobenius norm of the task vector:
+\begin{equation}
+\label{eq:frob_norm}
+\|\tau_k^l\|_F = \sqrt{\sum_{i=1}^{d_l} (\tau_{k, i}^l)^2}.
+\end{equation}
+
+We then analytically compute the average task vector Frobenius norm at layer $l$ across all $K$ tasks:
+\begin{equation}
+\label{eq:mean_norm}
+\mu^l = \frac{1}{K} \sum_{j=1}^K \|\tau_j^l\|_F.
+\end{equation}
+
+To balance the relative representation scales of each task expert at layer $l$, we define a layer-wise, task-wise scaling coefficient $w_k^l$ as:
+\begin{equation}
+\label{eq:neta_weight}
+w_k^l = \frac{\mu^l}{\|\tau_k^l\|_F + \beta},
+\end{equation}
+where $\beta \ge 0$ is a noise-damping stabilizer. By default, setting $\beta = 10^{-6}$ acts as a standard numerical stabilizer to prevent division by zero, while setting $\beta$ to a larger threshold (e.g., $10^{-3}$ or $10^{-2}$) provides soft-thresholding noise-damping as detailed below.
+
+The final merged parameter weights $\theta_{\text{merged}}^l$ for layer $l$ in NETA are given by the analytical closed-form:
+\begin{equation}
+\label{eq:neta_merge}
+\theta_{\text{merged}}^l = \theta_{\text{pre}}^l + \lambda_0 \sum_{k=1}^K w_k^l \tau_k^l,
+\end{equation}
+where $\lambda_0$ is the standard global scaling coefficient of Task Arithmetic. The full procedural pipeline of NETA is detailed in Algorithm~\ref{alg:neta}.
+
+\textbf{Layer-Wise vs. Model-Wide Normalization.} 
+An alternative normalization strategy is a global model-wide magnitude equalization, which scales each task vector globally so that the total Frobenius norm across the entire model is equalized across tasks. 
+However, model-wide normalization relies on a flawed assumption that downstream task knowledge is stored uniformly across layers. 
+In deep architectures, different layers serve highly distinct representation functions: shallow layers extract general, domain-agnostic features (e.g., edge or texture detectors), whereas deep layers extract specialized, task-specific features. 
+A complex task representing a severe domain shift (such as SVHN) requires massive parameter updates in both early feature extraction and deep representation layers during fine-tuning. 
+Conversely, an easy task (such as MNIST) requires negligible feature tuning in early layers, with adaptations concentrated in the deep projection heads. 
+Under a model-wide normalization, the massive early-layer SVHN updates would continue to dwarf the tiny early-layer MNIST updates, preserving the severe spatial representation dominance of SVHN in those layers and causing destructive interference in the early visual stream. 
+By contrast, layer-wise equalization guarantees that at \textit{every single level of feature representation}, each task expert contributes an identical update norm. 
+This isotropic balance ensures that no single task expert dominates the visual stream at any stage (early feature extraction, mid-level processing, or deep projection), enforcing true representational fairness across layers.
+
+\textbf{$\alpha$-Relaxed NETA.} In practical deployments, practitioners may face a trade-off between maximizing performance on tasks with high-magnitude updates (such as SVHN) and enforcing perfect multi-task representation fairness across all experts. To accommodate this, we introduce an interpolated extension, \textbf{$\alpha$-relaxed NETA}, which introduces a single continuous relaxation parameter $\alpha \in [0, 1]$:
+\begin{equation}
+\label{eq:alpha_relaxed}
+\theta_{\text{merged}}^l = \theta_{\text{pre}}^l + \lambda_0 \sum_{k=1}^K \left( (1 - \alpha) + \alpha w_k^l \right) \tau_k^l.
+\end{equation}
+By adjusting $\alpha$, practitioners can smoothly interpolate between standard Task Arithmetic ($\alpha = 0$, reflecting raw weight shifts) and full Norm-Equalized Task Arithmetic ($\alpha = 1$, reflecting perfect isotropic balance). This relaxation allows for soft, continuous control over the degree of magnitude equalization, providing a flexible framework to balance overall multi-task capability and representation fairness without incurring any test-time training or backpropagation cost. In a zero-shot scenario where no validation set is available, practitioners can select a default balanced setting (e.g., $\alpha = 0.5$) which extends significant isotropic stabilization and noise-resilience to simpler tasks while partially preserving the high-magnitude representation of complex tasks.
+
+\textbf{Noise Stabilization of Negligible Updates.}
+A potential vulnerability of exact layer-wise norm equalization arises when a specific task expert undergoes near-zero parameter updates in a given intermediate layer during downstream fine-tuning. In such a scenario, the task vector norm $\|\tau_k^l\|_F$ is extremely small (e.g., $10^{-5}$). Under standard NETA (with $\beta = 10^{-6}$), the scaling factor $w_k^l \approx \mu^l / 10^{-6}$ can inflate to an excessively large value (e.g., $10^5$). This would catastrophically amplify fine-tuning noise or negligible directional shifts in that layer, potentially destabilizing the entire merged model. 
+To address this, we generalized NETA to incorporate a tunable noise-damping stabilizer $\beta \ge 0$ in the denominator of the scaling factor (Equation~\ref{eq:neta_weight}). When $\beta$ is set to a slightly larger, physically-grounded threshold (e.g., $\beta \in [10^{-3}, 10^{-2}]$), it acts as an elegant soft-thresholding filter. For layers with substantial updates ($\|\tau_k^l\|_F \gg \beta$), NETA continues to enforce near-perfect magnitude isotropy. However, for layers with negligible updates ($\|\tau_k^l\|_F \ll \beta$), the denominator is dominated by $\beta$, capping the scaling coefficient $w_k^l \approx \mu^l / \beta$ and preventing the amplification of fine-tuning noise. This simple, training-free damping mechanism provides robust protection for representation stability across deep networks.
+
+\textbf{Composite Visual Input Grouping.} While the theoretical formulation in Algorithm~\ref{alg:neta} assumes separate scaling of each layer $l$, practical architectures like CLIP have input-stage parameters (e.g., positional embeddings, class tokens, and patch embedding convolutions) that are structurally distinct from the standard Transformer block layers. In our implementation, we group these multi-dimensional input-stage parameters together with the first visual Transformer layer (`resblocks.0`) to form a single, composite ``visual input block'' (Group 0) for norm calculation and scaling. Specifically, the PyTorch parameter keys mapped to this composite visual block include the input-stage projections and embeddings (\texttt{model.visual.positional\_embedding}, \texttt{model.visual.class\_embedding}, \texttt{model.visual.conv1.weight}, \texttt{model.visual.ln\_pre.weight}, and \texttt{model.visual.ln\_pre.bias}) combined with all parameters belonging to the first transformer layer (\texttt{model.visual.transformer.resblocks.0.*}). From a physical and geometric perspective, normalizing extremely low-dimensional or structurally isolated parameters (such as the single class embedding or position embedding tensors) independently would yield highly unstable scaling factors. Because these input-stage elements undergo very small absolute parameter updates during downstream fine-tuning, their individual Frobenius norms are exceptionally small; scaling them independently would drastically magnify these minor updates, introducing severe spatial and positional distortions in the early feature map. Grouping them jointly with the first Transformer block preserves the relative weight proportions between the input projections and the early representations, maintaining structural and dimensional consistency during the initialization phase of the visual stream.
+
+\begin{algorithm}[tb]
+\caption{Norm-Equalized Task Arithmetic (NETA)}
+\label{alg:neta}
+\begin{algorithmic}[1]
+\STATE {\bfseries Input:} Pre-trained base weights $\{\theta_{\text{pre}}^l\}_{l=1}^L$, Fine-tuned expert weights $\{\{\theta_k^l\}_{k=1}^K\}_{l=1}^L$, Global scaling coefficient $\lambda_0$.
+\STATE {\bfseries Parameter:} Noise-damping stabilizer $\beta \ge 0$ (default $10^{-6}$).
+\FOR{each layer $l = 1, \dots, L$}
+    \FOR{each task $k = 1, \dots, K$}
+        \STATE Extract task vector: $\tau_k^l \leftarrow \theta_k^l - \theta_{\text{pre}}^l$
+        \STATE Compute Frobenius norm: $\|\tau_k^l\|_F \leftarrow \sqrt{\sum_i (\tau_{k, i}^l)^2}$
+    \ENDFOR
+    \STATE Compute mean norm: $\mu^l \leftarrow \frac{1}{K} \sum_{j=1}^K \|\tau_j^l\|_F$
+    \FOR{each task $k = 1, \dots, K$}
+        \STATE Compute NETA coefficient: $w_k^l \leftarrow \frac{\mu^l}{\|\tau_k^l\|_F + \beta}$
+    \ENDFOR
+    \STATE Merge weights: $\theta_{\text{merged}}^l \leftarrow \theta_{\text{pre}}^l + \lambda_0 \sum_{k=1}^K w_k^l \tau_k^l$
+\ENDFOR
+\STATE {\bfseries Return:} Merged weights $\{\theta_{\text{merged}}^l\}_{l=1}^L$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Theoretical Properties}
+NETA possesses two key geometric and mathematical properties that guarantee representation balance while maintaining network stability.
+
+\textbf{Perfect Magnitude Isotropy.}
+For any layer $l \in \{1, \dots, L\}$ and any task expert $k \in \{1, \dots, K\}$, we define the balanced task vector contribution as $\hat{\tau}_k^l = w_k^l \tau_k^l$. The Frobenius norm of this balanced vector is identical to the layer-wise average norm $\mu^l$ (up to the numerical stabilizer $\beta$). 
+
+To verify this, we substitute the NETA scaling coefficient from Eq.~\ref{eq:neta_weight} into the definition of the balanced task vector norm:
+\begin{align}
+\|\hat{\tau}_k^l\|_F &= \|w_k^l \tau_k^l\|_F \nonumber \\
+&= w_k^l \|\tau_k^l\|_F \nonumber \\
+&= \frac{\mu^l}{\|\tau_k^l\|_F + \beta} \|\tau_k^l\|_F.
+\end{align}
+As the numerical stabilizer $\beta \rightarrow 0$ (which holds under our default choice of $\beta = 10^{-6}$ for any non-trivial parameter updates), the expression simplifies directly to:
+\begin{equation}
+\|\hat{\tau}_k^l\|_F \approx \mu^l.
+\end{equation}
+This property guarantees that at every layer, each task expert contributes a parameter update of exactly identical Frobenius norm, achieving perfect isotropic magnitude balance across tasks in weight space.
+
+\textbf{Preservation of Cumulative Individual Norms.}
+While equalizing norms ensures task balance, it is critical that the transformation does not artificially inflate or deflate the overall scale of weight updates, which could lead to activation drift or representation collapse. Under NETA, the sum of the Frobenius norms of the balanced task vectors remains equal to the sum of the norms of the raw task vectors in standard Task Arithmetic at layer $l$ (up to numerical stabilizer $\beta$).
+
+Summing the Frobenius norms of the balanced task vectors yields:
+\begin{equation}
+\sum_{k=1}^K \|\hat{\tau}_k^l\|_F \approx \sum_{k=1}^K \mu^l = K \mu^l.
+\end{equation}
+Substituting the definition of the layer-wise average norm $\mu^l$ from Eq.~\ref{eq:mean_norm} gives:
+\begin{equation}
+K \mu^l = K \left(\frac{1}{K} \sum_{k=1}^K \|\tau_k^l\|_F\right) = \sum_{k=1}^K \|\tau_k^l\|_F.
+\end{equation}
+Therefore, we have:
+\begin{equation}
+\sum_{k=1}^K \|\hat{\tau}_k^l\|_F \approx \sum_{k=1}^K \|\tau_k^l\|_F.
+\end{equation}
+This ensures that NETA preserves the cumulative sum of individual update norms at each layer compared to standard Task Arithmetic. 
+
+However, we must introduce a subtle but critical mathematical qualification: preserving the sum of individual norms does not mathematically guarantee the preservation of the norm of the final, merged update vector itself, i.e., $\|\sum_{k=1}^K w_k^l \tau_k^l\|_F$. The actual norm of the merged update depends heavily on the directional alignment (cosine similarity) between individual task vectors:
+\begin{equation}
+\label{eq:norm_alignment}
+\left\| \sum_{k=1}^K \hat{\tau}_k^l \right\|_F^2 = \sum_{k=1}^K \|\hat{\tau}_k^l\|_F^2 + 2 \sum_{j < k} \langle \hat{\tau}_j^l, \hat{\tau}_k^l \rangle.
+\end{equation}
+Because NETA scales down highly dominant, high-magnitude task updates (such as SVHN), the overall norm of the merged update vector may experience a minor contraction compared to standard Task Arithmetic. This norm contraction mathematically explains the slight performance reductions observed on SVHN and CIFAR-10, as the cumulative update scale applied to the pre-trained weights is effectively reduced. 
+
+In practical applications, this contraction can be easily compensated for by slightly scaling up the global scaling coefficient $\lambda_0$ when applying NETA compared to standard Task Arithmetic. Alternatively, a training-free and fully closed-form solution to resolve this contraction is to scale the merged NETA update vector at each layer analytically using a compensation factor:
+\begin{equation}
+\label{eq:compensation_factor}
+\gamma^l = \frac{\left\| \sum_{k=1}^K \tau_k^l \right\|_F}{\left\| \sum_{k=1}^K w_k^l \tau_k^l \right\|_F + \beta}.
+\end{equation}
+Rescaling the merged update by $\gamma^l$ guarantees that the final parameter-space update vector has exactly the same Frobenius norm as standard Task Arithmetic, analytically compensating for any directional norm contraction without requiring any calibration data or manual hyperparameter sweeps. We present this analytical norm-restoration as a highly valuable closed-form extension of NETA, and discuss its empirical implications during our scale analysis (Section~\ref{sec:ablations}). This subtle but rigorous distinction establishes a clear and scientifically honest baseline for understanding the geometric mechanics of model merging.

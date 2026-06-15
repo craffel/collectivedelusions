@@ -1,0 +1,56 @@
+# Peer Review: SABLE (Sample-wise Activation Blending of Low-Rank Experts)
+
+## 1. Summary of the Paper
+This paper presents **SABLE (Sample-wise Activation Blending of Low-Rank Experts)**, a minimalist, network-level, and stateless framework designed to address "heterogeneity collapse" in test-time dynamic model merging under mixed-task streams. Traditional parameter-space routers compute a single set of merged weights per batch, forcing them to average routing coefficients across the batch dimension. In mixed-task streams, this averaging collapses task specialization back to static uniform-merge levels. SABLE elegant shifts the ensembling step from parameter space to activation space using the distributive law of matrix multiplication. This allows SABLE to apply per-sample ensembling coefficients within a single batch, completely avoiding heterogeneity collapse without requiring complex, stateful systems-level scheduling wrappers (such as Micro-Batch Homogenization, MBH). SABLE uses parallel low-rank ($r=8$) LoRA adapter passes alongside a shared base model forward pass, blending activations on-the-fly. The authors evaluate SABLE in a synthetic 14-layer coordinate sandbox and on physical neural networks (CNN, MLP, and ResNet-18 features) under both standard and domain-confounded streams. SABLE achieves flatline joint mean accuracy (0.00% collapse) across homogeneous and heterogeneous streams, natively outperforming the state-of-the-art systems-heavy MBH pipeline while operating in a stateless, single-pass forward execution.
+
+---
+
+## 2. Strengths and Weaknesses
+
+### Strengths
+- **Elegant and Clean Formulation:** Shifting model merging from parameter space to activation space via the distributive law of matrix multiplication is mathematically clean and highly effective. It solves a complex systems-level batching problem entirely at the architectural network level.
+- **Bypasses Systems Complexity:** By completely removing stateful scheduling, buffering, sorting, and stream partitioning, SABLE returns model serving to a stateless, highly reproducible, and system-agnostic format. The physical serving benchmarks on an NVIDIA A100 GPU demonstrate a substantial 6.8$\times$ latency reduction (12.4 ms vs 84.6 ms) and 36.4% memory savings compared to the MBH systems pipeline.
+- **Thorough and Multi-Dimensional Ablation Studies:** The authors conduct multiple comprehensive sweeps over critical hyperparameters and structural configurations. This includes sweeps over adapter rank $r$, active expert limits $M$ (Top-$M$ pruning), routing temperature $\tau$, OOD threshold $\gamma_{\text{OOD}}$, and mid-layer routing depth $L_{\text{route}}$, providing strong architectural insights.
+- **Principled Data-Free Deployment Path:** The introduction of weight-space L2-normalization (Refined Zero-Data Centroids) to prevent vector cancellation when constructing task prototypes post-hoc directly from expert parameters is a highly creative and mathematically sound heuristic that enables robust zero-calibration deployment.
+- **Rigorous Activation and Confounded Analysis:** The paper goes beyond standard accuracy metrics to track layer-by-layer activation similarities (quantifying representational drift) and designs a highly rigorous joint Top-2 retrieval recall metric to validate activation blending under domain-confounded overlapping streams.
+- **Excellent Transparency and Scholarly Tone:** The authors are exceptionally honest and self-aware regarding the theoretical and physical limitations of SABLE (e.g., dual-space mismatches, vector cancellation, representational blurring, and cumulative non-linear drift), which greatly elevates the intellectual value of the work.
+
+### Weaknesses
+- **Lack of Statistical Rigor (No Random Seeds, No Confidence Intervals):** Across all quantitative accuracy and latency tables (Tables 1, 3, 5, 6, 7, 8), the authors report single point-estimates. There are no error bars, standard deviations, or confidence intervals, and there is no mention of running multiple trials over different random seeds. 
+  - For example, in Table 5 (Sandbox), SABLE Late Adaptation (68.10%) is compared against PFSR+MBH (67.20%). The margin is only **0.90%**. Without reporting statistical variance over multiple seeds, it is impossible to verify if SABLE actually outperforms PFSR+MBH or if this difference is within the range of random initialization noise.
+- **Toy-Scale Evaluation and Limited Datasets:** The physical evaluations of SABLE are restricted **exclusively to grayscale MNIST and FashionMNIST** (using 1,000 training samples per task) across small toy-scale backbones (a 3-layer CNN, a 4-layer MLP, and a 2-layer MLP head on frozen ResNet-18 features). The paper lacks evaluations on full-color, high-resolution natural image datasets (such as CIFAR-100, ImageNet, or the VTAB benchmark) or modern natural language processing tasks (such as GLUE) using standard pre-trained architectures (e.g., ViT-B/16, LLaMA). While the authors include "actionable blueprints" for ViT and LLaMA, these remain conceptual and lack empirical validation.
+- **Speculative "Low-Rank Regularization Paradox":** In Table 3, SABLE Hybrid displays a non-monotonic trend where $r=2$ (62.10%) consistently and significantly outperforms $r=4$ (58.90%). The authors attribute this to a "Low-Rank Regularization Paradox" where $r=2$ acts as an aggressive filter for representation noise. This claim is highly speculative and lacks empirical proof (e.g., train/validation loss curves, overfitting metrics, or multi-dataset evaluations). It is highly likely an artifact of suboptimal hyperparameter selection (e.g., learning rates, training epochs) or seed-specific variance.
+- **Weak and Under-Optimized Parametric Baseline:** The Linear Router (Unreg) is trained on an extremely small calibration split of only 64 samples with no apparent regularization, resulting in poor performance (55.50% joint accuracy). This represents a "strawman" comparison. A stronger parametric router baseline trained on a larger subset of the data with proper regularization should be included.
+- **Ambiguity in Wall-Clock Serving Benchmarks:** The authors note in Section 4.5 that naive sequential loops in standard PyTorch introduce massive CUDA kernel launch overhead that dominates wall-clock time, and that production deployments must leverage specialized serving frameworks (such as S-LoRA or Punica) to vectorize computations. However, they do not clarify if their own benchmark of 12.4 ms was obtained using Punica/S-LoRA, or if they used a naive loop and somehow bypassed the overhead, or if these are simulated/theoretical wall-clock times.
+
+---
+
+## 3. Form Evaluation Ratings
+
+### Soundness: Good
+*Justification:* The activation blending formulation is mathematically correct and provides a robust solution to heterogeneity collapse. However, the rating is downgraded from Excellent because the paper lacks statistical rigor (absolutely no random seeds, standard deviations, or confidence intervals are reported) and relies on speculative explanations (such as the "Low-Rank Regularization Paradox") and an under-optimized parametric baseline to justify some of its empirical claims.
+
+### Presentation: Excellent
+*Justification:* The paper is beautiful, polished, and exceptionally clear. The mathematical equations are precise, Figure 1 provides an outstanding structural schematic, and the discussion of limitations is remarkably honest, self-aware, and comprehensive. 
+
+### Significance: Good
+*Justification:* Resolving stream heterogeneity at the network level is highly relevant to PEFT and multi-expert serving frameworks (e.g., S-LoRA, Punica), as it enables real-time dynamic ensembling with zero queuing delay. Currently, the significance of the contribution is bottlenecked by the toy-scale and synthetic nature of the physical experiments. If validated on standard-scale foundation models and natural datasets, the significance would be Excellent.
+
+### Originality: Excellent
+*Justification:* While the mathematical core of activation blending relies on the linear algebraic distributive law, the overall architectural combination of PEFT, non-parametric coordinate projections, Mid-Layer Routing/Late Adaptation, Refined Zero-Data Centroids, and the Layer-Dependent Hybrid-Rank Protocol is highly creative, practical, and original.
+
+---
+
+## 4. Overall Recommendation
+**Score: 4: Weak Accept**
+
+*Justification:* This is a technically solid paper that introduces an elegant, stateless network-level solution to a major systems bottleneck (heterogeneity collapse). SABLE's mathematical formulation, thorough ablation studies, and highly detailed serving benchmarks are extremely impressive. However, the empirical validation is severely limited to toy-scale grayscale datasets (MNIST/FashionMNIST) and small architectures, leaving standard deep architectures and natural datasets as unproven conceptual blueprints. Furthermore, the complete lack of statistical confidence reporting (no seeds or error bars) and the inclusion of speculative claims (the "Low-Rank Regularization Paradox") limit its immediate impact. It is a very strong candidate for publication, but requires elevated experimental scale and statistical rigor before it can be fully accepted as a standard paradigm.
+
+---
+
+## 5. Questions and Constructive Suggestions for the Authors
+1. **Report Statistical Variance:** Please run all physical experiments (CNN, MLP, ResNet-18) over at least 3 to 5 random seeds and report standard deviations or confidence intervals in all tables. This is particularly critical for justifying small performance margins (e.g., Table 5's 0.90% margin) and verifying non-monotonic trends.
+2. **Expand Experimental Scale:** Please evaluate SABLE empirically on at least one high-dimensional natural image dataset (e.g., CIFAR-100 or tasks from the VTAB benchmark) using a pre-trained standard-scale vision backbone (such as ResNet-50 or ViT-B/16) to validate your "actionable blueprint" and prove SABLE's generalizability beyond grayscale toy datasets.
+3. **Investigate or Tone Down the "Low-Rank Regularization Paradox":** Provide solid empirical evidence (such as training/validation loss curves, representation noise analyses, or multi-seed consistency checks) to support the claim that $r=2$ acts as a powerful regularizer compared to $r=4$ in Table 3. If no such evidence is available, please tone down the speculative "paradox" language and acknowledge that this could be an artifact of optimization hyperparameters or random initialization.
+4. **Clarify Serving Benchmark Software Stack:** Please explicitly clarify the exact software stack and implementation details used to obtain the 12.4 ms wall-clock latency on the NVIDIA A100. Did you integrate SABLE with specialized frameworks like S-LoRA or Punica to vectorize computations, or did you use naive PyTorch sequential loops? If the latter, how did you bypass the CUDA kernel launch overhead?
+5. **Strengthen the Parametric Baseline:** Provide a stronger, properly regularized Linear Router baseline trained on a larger calibration split (e.g., 200 to 500 samples) to ensure a fair and rigorous comparison against parametric routing.

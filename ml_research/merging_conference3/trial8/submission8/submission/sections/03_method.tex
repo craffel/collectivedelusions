@@ -1,0 +1,200 @@
+\section{Methodology: SRC-DE}
+\label{submission:sec:method}
+
+We present the mathematical and architectural details of {\bf SRC-DE} (Shrinkage-Regularized Coordinate Density Estimation) for robust, sample-efficient OOD task rejection in dynamic model merging.
+
+\begin{figure*}[htbp]
+\centering
+\begin{small}
+\begin{verbatim}
++---------------------------------------------------------------------------------+
+|                        Shared Pre-trained Base Model                            |
+|       [Input Query b] ---> (Blocks 1-3) ---> [Activation h_b^(3)]               |
++----------------------------------------+----------------------------------------+
+                                         |
+                                         v (Early Block Hook)
++---------------------------------------------------------------------------------+
+|                         Coordinate Space Projection                             |
+|          Project h_b^(3) against registered task centroids:                     |
+|             u_{k, b} = cos_sim(h_b^(3), \mu_k^(3))                              |
+|          Maps high-dimensional activations to coordinate vector u_b            |
++----------------------------------------+----------------------------------------+
+                                         |
+                                         v
++---------------------------------------------------------------------------------+
+|                     SRC-DE (Shrinkage-Regularized Router)                       |
+|          Evaluate coordinate vector u_b under task diagonal GMMs:               |
+|                log P(u_b | GMM_k) with regularized \Sigma*                       |
+|                                                                                 |
+|                   \Sigma* = (1 - \alpha_opt)\Sigma + \alpha_opt T               |
+|                   (Analytical Ledoit-Wolf Covariance Shrinkage)                 |
++----------------------------------------+----------------------------------------+
+                                         |
+                                         v
+                            Is max_k log P(u_b | GMM_k) >= \eta ?
+                             /                             \
+                            / Yes                           \ No
+                           v                                 v
++----------------------------------------+     +----------------------------------+
+|       Route to Specialist Expert       |     |          OOD Rejection           |
+|   Blend selected expert LoRAs          |     |   Bypass experts                 |
+|   Run Blocks 4-12 in single pass       |     |   Execute fallback pipeline      |
++----------------------------------------+     +----------------------------------+
+\end{verbatim}
+\end{small}
+\caption{Overall system architecture of the dynamic model merging serving pipeline with SRC-DE. Early activations are hooked, projected to similarity coordinate space, and evaluated using our analytical covariance-shrunk coordinate density boundary for robust routing or dual-path fallback.}
+\label{fig:system_schematic}
+\end{figure*}
+
+\subsection{Coordinate Space Projection}
+During on-device serving, for each incoming query $b$, we extract its early-stage representation $h^{(3)}_b \in \mathbb{R}^D$ from the third transformer block (specifically at block index 2 under 0-indexing, corresponding to Layer 3) of the shared frozen backbone. We map this representation into a low-dimensional similarity coordinate vector $u_b = [u_{1, b}, \dots, u_{K, b}]^T \in \mathbb{R}^K$, where $K$ is the number of registered task experts. The coordinate $u_{k, b}$ represents the cosine similarity of the sample's representation against the pre-computed centroid $\mu^{(3)}_k$ of calibration task $k$, as formulated in Equation~\ref{eq:cos_sim}:
+\begin{equation}
+\label{eq:cos_sim}
+    u_{k, b} = \text{cos\_sim}(h^{(3)}_b, \mu^{(3)}_k) = \frac{h^{(3)}_b \cdot \mu^{(3)}_k}{\|h^{(3)}_b\|_2 \|\mu^{(3)}_k\|_2}
+\end{equation}
+This projection compresses high-dimensional representations ($D=192$ in ViT-Tiny) into a highly interpretable task-similarity coordinate space $\mathbb{R}^K$.
+
+\subsection{Mathematical Deconstruction of Diagonal GMM Overfitting}
+To detect out-of-distribution (OOD) tasks, prior works fit a multi-component diagonal Gaussian Mixture Model (GMM) over the coordinate space during an offline calibration phase. For each task $k$, a GMM with $M$ components is estimated using the expectation-maximization (EM) algorithm over task calibration coordinates $\{u_s\}_{s \in \mathcal{C}_k}$, where $\mathcal{C}_k$ is the task calibration set.
+
+\paragraph{Why Diagonal Covariance?} While similarity coordinates are calculated over a shared backbone feature space and may present mild semantic correlations, a diagonal covariance structure is strictly preferred for edge hardware deployment. Parameterizing the GMM with diagonal covariance matrices reduces storage requirements from $\mathcal{O}(K^2)$ parameters per component to a highly efficient $\mathcal{O}(K)$ parameters. Similarly, evaluating the log-density of diagonal Gaussian components scales as $\mathcal{O}(K)$ floating-point operations (FLOPs) rather than $\mathcal{O}(K^2)$ for full covariance models. This linear scaling is vital for extreme resource-constrained microcontrollers, allowing the router to scale linearly with the number of registered task experts $K$. Although diagonal parameterization discards valuable cross-task correlation structure, this represents an unavoidable trade-off between statistical fidelity and the strict memory/compute envelopes of on-device model routing.
+
+Let $\pi_{k, m}$, $\mu_{k, m} \in \mathbb{R}^K$, and $\Sigma_{k, m} \in \mathbb{R}^{K \times K}$ represent the mixture weight, component mean vector, and diagonal covariance matrix of component $m$ for task $k$, respectively. The diagonal covariance is parameterized as $\Sigma_{k, m} = \text{diag}(\sigma^2_{k, m, 1}, \dots, \sigma^2_{k, m, K})$. The maximum likelihood estimator (MLE) of the coordinate variance for dimension $j \in \{1, \dots, K\}$ is given by Equation~\ref{eq:gmm_variance}:
+\begin{equation}
+\label{eq:gmm_variance}
+    \sigma^2_{k, m, j} = \frac{1}{\sum_{s \in \mathcal{C}_k} \gamma_{s, m}} \sum_{s \in \mathcal{C}_k} \gamma_{s, m} (u_{s, j} - \mu_{k, m, j})^2
+\end{equation}
+where $\gamma_{s, m}$ is the posterior responsibility of component $m$ for calibration sample $s$. This maximum likelihood estimator, formulated in Equation~\ref{eq:gmm_variance}, computes the local empirical coordinate variance per component and acts as the foundation of GMM density boundaries. 
+
+\paragraph{The Low-Resource Variance Collapse:} Under edge deployment conditions, the calibration split is heavily restricted to conserve on-device computation ($N = |\mathcal{C}_k| \le 64$ samples). When $N$ is small, several coordinates (particularly inactive dimensions corresponding to unpredicted task similarities) exhibit near-zero variance across calibration samples. As a result, the unregularized variance estimate $\sigma^2_{k, m, j}$ collapses toward zero. During test-time, any minor covariate shift or representation perturbation $\delta_b$ added to the input query $b$ shifts the coordinates away from the collapsed calibration support. The log-likelihood under the collapsed Gaussian density:
+\begin{equation}
+\label{eq:collapsed_gaussian}
+\begin{split}
+    &\log \mathcal{N}(u_b \mid \mu_{k,m}, \Sigma_{k,m}) \propto \\
+    &-\frac{1}{2} \sum_{j=1}^K \left[ \log(\sigma^2_{k,m,j}) + \frac{(u_{b,j} - \mu_{k,m,j})^2}{\sigma^2_{k,m,j}} \right]
+\end{split}
+\end{equation}
+drops catastrophically because the quadratic error is divided by a collapsed variance $\sigma^2_{k,m,j} \to 0$, as formulated in Equation~\ref{eq:collapsed_gaussian}. This causes massive log-likelihood spikes, leading the router to incorrectly reject valid in-distribution samples under the slightest noise.
+
+\paragraph{Bounded Similarity Spaces and Non-Gaussianity:} We note a fundamental structural characteristic of the similarity coordinate space: because coordinates $u_{k, b}$ are computed via cosine similarity, they are strictly bounded within the interval $[-1, 1]$. In practice, active task coordinates are highly skewed and concentrated near $1.0$, while inactive task coordinates are concentrated around $0.0$ or mildly negative values. Fitting standard, unconstrained Gaussian distributions over bounded, skewed supports technically violates the assumption of unconstrained normality. This boundary constraint can cause density calibration issues near $1.0$, where a Gaussian component might assign non-zero probability mass to the mathematically impossible region $u_{k, b} > 1.0$. While we find that the diagonal GMM remains an extremely effective and computationally lightweight density model for OOD rejection, modeling these coordinate distributions using bounded or skewed probability families (such as Beta distributions or truncated Gaussians) is a mathematically rigorous direction for future work.
+
+\subsection{Ledoit-Wolf Covariance Shrinkage}
+To stabilize density boundaries without requiring costly hyperparameter searches or non-adaptive global bounds, SRC-DE applies an analytical Ledoit-Wolf-style shrinkage regularizer to the GMM covariance matrices immediately following the EM optimization convergence. By executing covariance shrinkage as a post-fit regularization step, SRC-DE avoids interfering with the expectation-maximization iterations, ensuring complete compatibility with standard optimized, high-performance GMM implementations (such as scikit-learn) with zero computational overhead during fitting. For each mixture component, we regularize the estimated diagonal covariance matrix $\Sigma_{k, m}$ by shrinking it toward a structured diagonal target $T \in \mathbb{R}^{K \times K}$, as formulated in Equation~\ref{eq:covariance_shrinkage}:
+\begin{equation}
+\label{eq:covariance_shrinkage}
+    \Sigma^{*}_{k, m} = (1 - \alpha) \Sigma_{k, m} + \alpha T
+\end{equation}
+Depending on the dimensional scale of the task registry $K$, we formulate two mathematically rigorous shrinkage targets:
+\begin{enumerate}
+    \item {\bf Global Coordinate-Wise Diagonal Target (Primary for Small-Scale $K$):} To preserve the unique dimensional scales of different similarity coordinates (which represent task-specific similarities), we define $T$ as a diagonal matrix containing the global coordinate-wise sample variances computed across all calibration samples of the registry, as formulated in Equation~\ref{eq:global_target}:
+    \begin{equation}
+    \label{eq:global_target}
+        T = \text{diag}(\sigma^2_{\text{global}, 1}, \dots, \sigma^2_{\text{global}, K})
+    \end{equation}
+    where $\sigma^2_{\text{global}, j}$ is the sample variance of coordinate $j$ across the entire task calibration set. This target successfully mitigates the over-regularization scale-damping bias of sphericity in low dimensions, maintaining coordinate scale integrity. The Global Coordinate-Wise Diagonal Target is the primary target used for all main experimental evaluations under the vision task registry in Section 4 ($K=4$).
+    \item {\bf Spherical Diagonal Target (Primary for High-Dimensional $K$):} For high-dimensional task registries ($K \ge 16$), coordinate-wise variances tend to exhibit uniform background scales, making an isotropic assumption a powerful prior. We define $T$ as a spherical diagonal matrix $T = \nu I$, where the scaling parameter $\nu$ is the average of the diagonal component variances, as formulated in Equation~\ref{eq:spherical_target}:
+    \begin{equation}
+    \label{eq:spherical_target}
+        \nu = \frac{1}{K} \text{tr}(\Sigma_{k, m}) = \frac{1}{K} \sum_{j=1}^K \sigma^2_{k, m, j}
+    \end{equation}
+    This target is deployed as the primary target for the high-dimensional scaling simulations in Section 4.6 ($K \ge 16$).
+\end{enumerate}
+
+The shrinkage intensity $\alpha \in [0, 1]$ controls the trade-off between the empirical coordinate variances and the robust target. To minimize estimation error, we analytically derive the shrinkage intensity $\alpha_{\text{opt}}$ that minimizes the expected mean-squared error (MSE) between the shrunk estimator and the true covariance matrix under the standard statistical assumption of a fixed, non-random target, as formulated in Equation~\ref{eq:alpha_opt}:
+\begin{equation}
+\label{eq:alpha_opt}
+\begin{split}
+    &\alpha_{\text{opt}} = \\
+    &\max\left(0, \min\left(1, \frac{\sum_{j=1}^K \text{Var}(\hat{\sigma}^2_{k, m, j})}{\sum_{j=1}^K (\sigma^2_{k, m, j} - T_{j, j})^2}\right)\right)
+\end{split}
+\end{equation}
+where $T_{j, j}$ denotes the $j$-th diagonal element of the target matrix $T$ (with $T_{j, j} = \sigma^2_{\text{global}, j}$ for the Global Coordinate-Wise Diagonal Target, and $T_{j, j} = \nu$ for the Spherical Diagonal Target), and $\text{Var}(\hat{\sigma}^2_{k, m, j})$ represents the variance of the coordinate variance estimators. By computing $\alpha_{\text{opt}}$ analytically, SRC-DE dynamically scales the regularization intensity. If sample size $N$ is extremely small or the coordinates are highly noisy, $\alpha_{\text{opt}} \to 1$, shrinking the model toward the robust target $T$ and stabilizing the density. In clean, high-sample regimes, $\alpha_{\text{opt}} \to 0$, allowing the model to capture fine-grained task-similarity correlations.
+
+\paragraph{Theoretical Limitation of Random Shrinkage Targets:} We candidly address a formal limitation and mathematical simplification in the analytical derivation of $\alpha_{\text{opt}}$ (Equation~\ref{eq:alpha_opt}). The standard Ledoit-Wolf formulation assumes that the shrinkage target $T$ is fixed and non-random. While this is a highly reasonable approximation for our primary Global Coordinate-Wise Diagonal Target ($T = \text{diag}(\sigma^2_{\text{global}})$) because it is estimated over a much larger multi-task calibration pool, this assumption is theoretically violated by the Spherical Diagonal Target ($T = \nu I$). Because $\nu$ is computed directly from the very same estimated component variances ($\nu = \frac{1}{K} \sum_{j=1}^K \sigma^2_{j}$), the target itself is a random variable correlated with the sample variance estimators. Ignoring this covariance term in the derivation of $\alpha_{\text{opt}}$ represents a mathematical simplification. Therefore, the Spherical Diagonal target should be understood as a heuristically motivated, empirically validated, highly effective heuristic rather than a mathematically strict optimal estimator. We position the Spherical Diagonal target as a robust statistical regularizer whose empirical effectiveness in high dimensions is thoroughly demonstrated, while leaving the formal statistical derivation of joint shrinkage estimators under random, sample-dependent targets as an open, mathematically rich challenge for future research.
+
+\paragraph{Non-Gaussianity on Bounded Similarity Supports:} A fundamental statistical characteristic of our similarity coordinates is that they are computed via cosine similarities, which strictly reside on the bounded interval $[-1, 1]$. Fitting unconstrained Gaussian components to these bounded coordinates introduces a theoretical inconsistency, as standard Gaussians assign non-zero probability mass to impossible regions ($u_{j} > 1.0$ or $u_{j} < -1.0$). This boundary violation is particularly pronounced for highly active tasks where coordinate distributions are strongly skewed toward $1.0$. While modeling bounded supports formally requires more complex alternatives---such as Beta mixtures or truncated Gaussians---estimating their parameters under extreme data scarcity ($N \le 16$) is highly unstable, as their likelihood estimators lack closed-form, linear M-step updates and are extremely sensitive to local boundary singularities. For example, fitting Beta distributions or truncated Gaussians via Expectation-Maximization requires iterative numerical optimizations for each M-step update, which are prone to numerical non-convergence and catastrophic boundary singularities when sample sizes are small. In contrast, unconstrained diagonal Gaussians remain highly stable, positive-definite, and computationally lightweight. Under SRC-DE, we position our diagonal Gaussian assumption as a highly robust, computationally efficient, and closed-form approximation of the underlying similarity density, leaving the formal integration of bounded-support mixture models as an open, mathematically rich challenge for future high-dimensional routing research.
+
+\paragraph{Extension to Dynamic Online Noise Adaptation:} While classical Ledoit-Wolf shrinkage stabilizes coordinate-space densities under low-resource training, edge-deployed routing models also face severe, dynamic test-time representation noise. In Section 4.4, we evaluate a Noise-Adapted variant of SRC-DE that further robustifies the shrunk covariance boundaries by injecting test-time noise directly into the regularized diagonal elements. To realize this adaptively on-device without assuming oracle prior knowledge of the test-time noise scale, we propose a practical, online dynamic noise estimator ($\hat{\sigma}^2_{\text{runtime}}$) using an exponential moving average (EMA) over centroid distances, with a formal description and algorithm detailed in Appendix~\ref{sec:dynamic_noise_estimator}.
+
+\subsection{The SRC-DE Pipeline Algorithm}
+\label{submission:sec:algorithm}
+
+We provide a structured, step-by-step pseudo-code description of the full SRC-DE pipeline in Algorithm~\ref{alg:src_de}, illustrating both the offline calibration phase and the real-time online inference phase.
+
+\begin{algorithm}[tb]
+   \caption{Shrinkage-Regularized Coordinate Density Estimation (SRC-DE)}
+   \label{alg:src_de}
+\begin{algorithmic}[1]
+   \STATE {\bfseries Input:} Calibration sets $\mathcal{C}_k = \{h_s\}_{s=1}^N$ for each task $k$, target safety threshold $\eta$, incoming query $b$ with representation $h_b \in \mathbb{R}^D$.
+   \STATE {\bfseries Output:} Routing decision $r_b \in \{1, \dots, K\} \cup \{\text{OOD Rejection}\}$.
+   
+   \STATE \COMMENT{{\bf Phase 1: Offline Calibration (Run once per task registry)}}
+   \FOR{each registered task $k = 1, \dots, K$}
+       \STATE Compute task centroid: $\mu^{(3)}_k = \frac{1}{N} \sum_{s=1}^N h_s$.
+   \ENDFOR
+   \FOR{each task $k = 1, \dots, K$}
+       \STATE Project calibration features to coordinate space:
+       \STATE \quad $u_{s, p} = \text{cos\_sim}(h_s, \mu^{(3)}_p)$ for $s \in \{1,\dots,N\}, p \in \{1,\dots,K\}$.
+       \STATE Map $\mathcal{C}_k$ to $N \times K$ coordinate matrix $U_k$.
+   \ENDFOR
+   \STATE Compute global target variances: $\sigma^2_{\text{global}, j} = \text{Var}(\{u_{s, j}\}_{s, k})$ for $j = 1,\dots,K$.
+   \STATE $T = \text{diag}(\sigma^2_{\text{global}, 1}, \dots, \sigma^2_{\text{global}, K})$.
+   \FOR{each task $k = 1, \dots, K$}
+       \STATE Fit a GMM with $M$ components using EM on $U_k$ to get $\pi_{k,m}$, $\mu_{k,m}$, and diagonal $\Sigma_{k,m}$.
+       \STATE Extract posterior responsibilities: $\gamma_{s, m} = P(\text{component } m \mid u_s)$.
+       \FOR{each component $m = 1, \dots, M$}
+           \STATE $W_m = \sum_{s=1}^N \gamma_{s, m}$.
+           \FOR{each coordinate dimension $j = 1, \dots, K$}
+               \STATE Variance MLE: $\sigma^2_{j} = \Sigma_{k, m, j, j}$.
+               \STATE Estimator variance:
+               \STATE \quad $\text{Var}(\hat{\sigma}^2_{j}) = \frac{1}{W_m^2} \sum_{s=1}^N \gamma_{s, m}^2 \left[ (u_{s, j} - \mu_{k, m, j})^2 - \sigma^2_{j} \right]^2$.
+           \ENDFOR
+           \STATE Compute optimal shrinkage:
+           \STATE \quad $\alpha_{\text{opt}} = \max\left(0, \min\left(1, \frac{\sum_{j=1}^K \text{Var}(\hat{\sigma}^2_{j})}{\sum_{j=1}^K (\sigma^2_{j} - T_{j,j})^2}\right)\right)$.
+           \STATE Regularize covariance: $\Sigma^{*}_{k, m} = (1 - \alpha_{\text{opt}}) \Sigma_{k, m} + \alpha_{\text{opt}} T$.
+           \STATE Update GMM covariance: $\Sigma_{k, m} \leftarrow \Sigma^{*}_{k, m}$.
+           \STATE Overwrite cached Cholesky precision (Fixes scikit-learn bug):
+           \STATE \quad $\text{precisions\_cholesky\_}_{k, m} \leftarrow 1 / \sqrt{\text{diag}(\Sigma^{*}_{k, m})}$.
+       \ENDFOR
+   \ENDFOR
+   
+   \STATE \COMMENT{{\bf Phase 2: Real-Time Online Inference (Run per query)}}
+   \STATE Given incoming query representation $h_b$:
+   \STATE Project to coordinates: $u_{b, p} = \text{cos\_sim}(h_b, \mu^{(3)}_p)$ for $p = 1, \dots, K$.
+   \FOR{each registered task $k = 1, \dots, K$}
+       \STATE Evaluate log-likelihood under regularized density:
+       \STATE \quad $\mathcal{L}_k(u_b) = \log \sum_{m=1}^M \pi_{k, m} \mathcal{N}(u_b \mid \mu_{k, m}, \Sigma^{*}_{k, m})$.
+   \ENDFOR
+   \IF{$\max_k \mathcal{L}_k(u_b) \ge \eta$}
+       \STATE \textbf{return} Predicted task expert $k^* = \text{argmax}_k \mathcal{L}_k(u_b)$.
+   \ELSE
+       \STATE \textbf{return} OOD Rejection (Execute fallback pipeline).
+   \ENDIF
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Online Inference \& Fallback Routing}
+During online serving, the query's similarity coordinate $u_b$ is evaluated under each task GMM. The regularized log-likelihood is computed as:
+\begin{equation}
+\begin{split}
+    &\mathcal{L}_k(u_b) = \log P(u_b \mid \text{GMM}_k) \\
+    &= \log \sum_{m=1}^M \pi_{k, m} \mathcal{N}(u_b \mid \mu_{k, m}, \Sigma^{*}_{k, m})
+\end{split}
+\end{equation}
+We route the sample to task-specific adapters using a dual-path routing and fallback mechanism controlled by a safety threshold $\eta$:
+\begin{equation}
+    \text{Route}(u_b) = \begin{cases}
+        \text{argmax}_k \mathcal{L}_k(u_b) & \text{if } \max_k \mathcal{L}_k(u_b) \ge \eta \\
+        \text{OOD Fallback} & \text{otherwise}
+    \end{cases}
+\end{equation}
+If the maximum log-likelihood satisfies the safety threshold, the sample is classified as in-distribution, and routed to the predicted task adapter $k^*$. The downstream blocks (Layers 4--12) of the vision transformer are executed in a single-pass using activation scattering and gathering to dynamically blend the pre-trained weights and expert weights. Conversely, if the likelihood falls below $\eta$, the query is rejected as OOD, bypassing the active expert paths and triggering a modality-specific fallback pipeline (e.g., executing only the shared base model or returning an "OOD / Unknown" class label).
+
+\subsection{Practical Threshold Selection in the Absence of OOD Data}
+In practical edge serving scenarios, out-of-distribution (OOD) data is entirely unknown during the offline calibration phase. Consequently, a practitioner cannot rely on validation sets containing OOD examples to search for an optimal classification threshold $\eta$. To resolve this, we propose a robust, distribution-free heuristic that bounds the False Positive Rate (FPR) of in-distribution samples (which acts as a False Rejection Rate).
+
+Let $\mathcal{C}_k = \{u_1, \dots, u_N\}$ be the calibration coordinate vectors for task $k$, and let $\{\mathcal{L}_k(u_s)\}_{s=1}^N$ be their corresponding regularized GMM log-likelihoods. For a user-specified false rejection budget $\epsilon \in (0, 1)$ (e.g., $\epsilon = 0.05$ or $0.10$, representing a target 95\% or 90\% true positive rate on in-distribution calibration data), we define the task-specific threshold $\eta_k$ as the $\epsilon$-th percentile of the empirical log-likelihood distribution:
+\begin{equation}
+    \eta_k = \text{Percentile}\left( \{\mathcal{L}_k(u_s)\}_{s=1}^N, \epsilon \times 100 \right)
+\end{equation}
+By setting the safety threshold to $\eta_k$ for each task, the practitioner mathematically guarantees that at most a fraction $\epsilon$ of in-distribution calibration samples will be falsely rejected as OOD. During online inference, the global safety threshold check can be executed task-specifically as $\mathcal{L}_{k^*}(u_b) \ge \eta_{k^*}$ where $k^* = \text{argmax}_k \mathcal{L}_k(u_b)$. This percentile-based calibration operates entirely on the in-distribution calibration data, ensuring that the OOD rejection module is immediately deployable without requiring any speculative or synthetic OOD validation suites.

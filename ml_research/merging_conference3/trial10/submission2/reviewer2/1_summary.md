@@ -1,0 +1,32 @@
+# Evaluation 1: Summary of the Paper
+
+## Main Topic and Motivation
+The paper addresses the challenge of **dynamic model merging** (also known as test-time ensembling) in multi-task sequential serving workloads. Modern systems use dynamic model merging to blend task-specific Parameter-Efficient Fine-Tuning (PEFT) adapters, such as Low-Rank Adaptations (LoRAs), on-the-fly based on input query activations. This avoids the prohibitive storage and memory footprints of deploying separate full-parameter models. 
+
+While stateless activation-space routers (e.g., SABLE) achieve high ensembling accuracy, they suffer from the **"routing jitter paradox"**—high-frequency oscillations in expert ensembling weights across consecutive queries caused by sample-level coordinate noise. To mitigate this, stateful routing methods (e.g., ChemMerge, PAC-Kinetics) introduce temporal memory states (often modeled as continuous-time chemical kinetics or state-space systems) to smooth routing trajectories.
+
+However, existing stateful routers enforce **spatial homogeneity**: they apply a single, global ensembling weight vector uniformly across all network layers. The authors argue that this spatial homogeneity assumption is fundamentally flawed because deep neural network layers are highly heterogeneous. Early layers extract low-level features and perform transient representational alignment, middle layers perform task integration, and late layers refine output logits. Forcing all layers to share a single temporal memory scale compromises the trade-off between adaptation speed (needed at early layers to track task switches) and decision stability (needed at deep layers to protect logits from noise).
+
+---
+
+## Proposed Approach: LDS-Kinetics
+To address this limitation, the authors introduce **Layer-Decoupled Stateful Kinetics (LDS-Kinetics)**, a framework that treats network depth as an active variable in temporal-spatial ensembling:
+1. **Depth-Decoupled Recurrence**: The ensembling layers of a network are partitioned into $M$ disjoint blocks (or individual layers). Each block maintains an independent concentration state vector $s^{(m)}_t$ that evolves according to its own block-specific, learnable state-retention parameters $u^{(m)}$ and unconstrained coordinate injection (coupling) matrices $W^{(m)}$.
+2. **Online Similarity Scaling**: To suppress phase lag during sudden task switches, the state retention rate is scaled down online using the rolling cosine similarity of consecutive coordinate signals ($Sim_t$). When a task switch occurs, $Sim_t \to 0$, causing the states to be rapidly flushed.
+3. **Gibbs Softmax Policy**: The raw state vectors are mapped to ensembling weights using a multi-temperature Gibbs policy, with block-specific learnable temperatures $\tau^{(m)}_k$.
+4. **PAC-Bayesian Regularization**: Decoupling parameters across $M$ blocks dramatically increases the parameter search space, introducing a severe threat of transductive overfitting on short calibration streams (e.g., $T=32$). To mitigate this, the authors derive a unified complexity penalty from Catoni's $\beta$-mixing PAC-Bayesian bound designed for stationary mixing stochastic processes. This regularizer centers the learnable parameters around safe, SABLE-grounded default priors $\Theta_0$ (neutral memory, identity coupling, neutral temperature).
+
+---
+
+## Key Findings and Claims
+1. **The "Tempo-Gradient" Along Network Depth**: Through extensive parameter sweeps, the paper demonstrates that deep neural networks naturally organize temporal ensembling scales along their depth. Early blocks learn high decay rates (low temporal memory) to quickly adapt and align representational spaces. Late blocks learn low decay rates (high temporal memory) to act as stable low-pass filters that shield the final classifier and logits from high-frequency coordinate noise.
+2. **Symmetry Pathologies and Overfitting in Decoupled Spaces**: Unregularized decoupled routing optimized via Empirical Risk Minimization (Decoupled ERM) collapses and performs identically to global baseline models. The authors deconstruct this optimization-level pathology, revealing that under the Adam optimizer, correlated gradients and identical SABLE-grounded initializations force parameters across all blocks into a degenerate lockstep update path on the first step. Adding random perturbations breaks this symmetry but exposes the model to transductive overfitting under low calibration data ($T=32$). The PAC-Bayesian complexity penalty simultaneously solves both issues: its KL gradient acts as a uniform bias that breaks the starting sign-symmetry under Adam, while its complexity penalty restricts parameter complexity to prevent statistical overfitting.
+3. **Mathematical Necessity of Kinetics under Non-Linearity**: Under non-linear representation propagation (GELU + LN), stateful kinetics is mathematically required to maintain stable representational pathways. High-frequency routing weight fluctuations from stateless routing compound across depths, causing extreme representational drift that degrades classifier alignment.
+4. **Negligible Inference Overhead**: Managing independent state recurrences can be executed in parallel as batched tensor operations (packing states into an $M \times K$ matrix). This batched formulation completely bypasses sequential CPU loops or GPU synchronization calls, resulting in a negligible latency overhead ($<1\%$ of Transformer token generation times).
+
+---
+
+## Explicitly Claimed Contributions (with Evidence)
+* **Contribution 1: Formulating LDS-Kinetics**: The authors propose the first dynamic model merging framework that decouples stateful ensembling dynamics along network depths, generalizing to arbitrary block scales $M$ (Section 3).
+* **Contribution 2: Learning-Theoretic PAC-Bayesian Complexity Penalty**: The authors integrate a unified learning-theoretic regularization based on Catoni's $\beta$-mixing bound to mathematically constrain high-dimensional decoupled routing parameters (Section 3.5).
+* **Contribution 3: Empirical Deconstruction of Spatial-Temporal Dynamics**: The authors conduct multi-dimensional sweeps inside a 14-layer coordinate sandbox and on a physical 6-layer sequence model, demonstrating depth-dependent tempos (the "tempo-gradient"), identifying the optimization lockstep pathology, evaluating the impact of non-linear activations (GELU + LN), and analyzing latency overhead (Section 4).
