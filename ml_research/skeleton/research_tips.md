@@ -16,29 +16,29 @@ Most of these things can be learned from experience, but reading them and keepin
 
 - Many papers are most heavily influenced by a small number of papers. Papers that cite, or papers cited by, these "highly influential" papers can be a good starting point for a literature search.  
 - Keep track of how related papers justify their contributions. For example, what experiments are done to prove the points made in the work?  
-- Papers often overstate their results. Keep a skeptical mind and read closely before investing too much in past work.
+- Papers sometimes overstate their results. Keep a skeptical mind and read closely before investing too much in past work.
 
 ## Experimentation
 
-- After you've picked a problem and a plan of attack, try to design your first experiment as a minimum viable proof-of-concept of the idea. Toy settings or scaled-down are fine at this stage.  
+- After you've picked a problem and a plan of attack, try to design your first experiment as a minimum viable proof-of-concept of the idea. However, a single minimal experiment is insufficient for a final paper \- when things start to work, scale up.
+- Modern machine learning is heavily empirical. Running experiments on diverse experimental settings (for example, multiple domains, model families, or scales) makes results more convincing.
 - When evaluating a newly proposed method, it's best to reuse and reproduce an experimental setting proposed in past published work. If you aren't able to reproduce baseline numbers from past work, this is a big warning sign. Iterate on your reimplementation until you can resolve the differences.
 - On the other hand, proposing and using a new experimental setting itself can be part of the contribution as long as you can justify it.
-- Modern machine learning is heavily empirical. Running experiments on diverse experimental settings (for example, multiple domains, model families, or scales) makes results more convincing.
 
 ## Implementation
 
-- **Codebase Evaluation & Reuse:** When starting an implementation, **mandate: Do not write complex training loops from scratch if an existing, working repository can be cloned and modified.** Evaluate existing repositories by asking:
+- When starting an implementation, do not write complex training loops from scratch if an existing, working repository can be cloned and modified. Evaluate existing repositories by asking:
   - Does it use standard frameworks (PyTorch, Hugging Face)?
   - Does it have a `requirements.txt` or `environment.yml`?
   - Is the training script modular and easy to modify?
-- **Dataset Management:** Leverage standard Hugging Face `datasets` or `torchvision` datasets rather than writing custom download/parsing scripts to save valuable time and reduce disk I/O errors.
-- Use uv for managing your environment.  
-- Use git for tracking changes and commit frequently.  
+- Leverage standard Hugging Face `datasets` or `torchvision` datasets rather than writing custom download/parsing scripts.
+- Use `uv` for managing your environment.  
+- Use `git` for tracking changes and commit frequently.  
 - Keep a changelog.  
 - As much as possible, save intermediate artifacts to avoid having to re-run expensive experiments later.  
 - Use an experiment tracking system if it's helpful for you; the best system to use is the one that you will actually use to help you keep rigorous track of your work.  
-- As much as possible, avoid reimplementing existing methods to avoid introducing bugs. Reuse code released with papers as much as possible, even if just as a reference point.  
-- Machine learning research experiments almost always face bugs in the following order: Syntax error, mismatched shapes, out-of-memory error, distributed computation failures (if relevant), and then more subtle bugs which make the results incorrect such as bad hyperparameters. This last category is the most pernicious and often the most time-consuming to debug, but these subtle bugs are very common in research because there is rarely known "correct" behavior.  
+- Machine learning research experiments almost always face bugs in the following order: Syntax error, mismatched shapes, out-of-memory error, distributed computation failures (if relevant), and then more subtle bugs that make the results incorrect such as bad hyperparameters. This last category is the most pernicious and often the most time-consuming to debug, but these subtle bugs are very common in research because there is rarely known "correct" behavior for novel research ideas.:w
+
 - Keep code concise and clean.  
 - Make sure experiments fail early and loudly if there is an issue.  
 - Concrete tests for all parts of research code can be unnecessary, but be sure to implement sanity checks and inspect inputs and outputs to surface unexpected behavior.
