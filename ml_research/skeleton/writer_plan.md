@@ -34,19 +34,16 @@ This agent is invoked every 10 minutes. On each start:
 - **Submission:** The final submission PDF *must* be saved as `submission/submission.pdf`. All corresponding LaTeX source files must also be present in the `submission/` directory.
 - **State Management:** When Phase 3 is finished, update `progress.json` to set `{"phase": 4}`. Do NOT indicate completion yet.
 
-## Phase 4: Iterative Refinement
-- **Condition:** If Phase 3 is complete and time remains, do not blindly edit your work. Instead, enter a continuous review-and-improve loop.
+## Phase 4: Refinement
+- **Condition:** If Phase 3 is complete, perform a mock review and revise the submission.
 - **Action:**
-    1.  **Check Time:** Run `squeue -h -j $SLURM_JOB_ID -O TimeLeft`. If the remaining time is less than 15 minutes, jump to step 5.
-    2.  **Trigger Mock Review:** Compile your current draft to `submission/submission_draft.pdf`. Then, run the script `./run_mock_review.sh` to invoke the Mock Reviewer. This will overwrite `mock_review.md` with fresh feedback.
-    3.  **Analyze & Plan:** Read the new `mock_review.md` carefully. Extract a prioritized list of weaknesses. Update `revision_plan.md` detailing how you will address the newly identified flaws. Write a brief "rebuttal" in `progress.md`.
-    4.  **Execute Revisions:** Execute your plan. Based on the severity of the critiques, you have three options:
+    1.  **Trigger Mock Review:** Compile your current draft to `submission/submission_draft.pdf`. Then, run the script `./run_mock_review.sh` to invoke the Mock Reviewer. This will write `mock_review.md` with fresh feedback.
+    2.  **Analyze & Plan:** Read `mock_review.md` carefully. Extract a prioritized list of weaknesses. Update `revision_plan.md` detailing how you will address the newly identified flaws. Write a brief "rebuttal" in `progress.md`.
+    3.  **Execute Revisions:** Execute your plan. Based on the severity of the critiques, you have three options:
         *   **Fundamental Pivot (`{"phase": 1}`):** If the reviewer points out fatal theoretical flaws or severe novelty issues, you may update `progress.json` to `{"phase": 1}` to rewrite `final_idea.md` and pivot the research direction entirely.
         *   **Empirical Fixes (`{"phase": 2}`):** If the reviewer demands new baselines, ablations, or fixes to the methodology, you may update `progress.json` to `{"phase": 2}` to return to experimentation.
-        *   **Presentation Fixes:** If the issues are formatting, clarity, or missing citations, stay in Phase 4 to rewrite the LaTeX.
-        **Once revisions are applied, you MUST loop back to Step 1.**
-    5.  **Final Handoff:** ONLY if you have less than 15 minutes remaining, you may declare the paper finished by setting `{"phase": "completed"}` in `progress.json`.
-- **Requirements:** You are strictly forbidden from setting the phase to `completed` if you have more than 15 minutes left. Even if you feel the paper is perfect and all critiques are addressed, science is never finished. You must run the mock reviewer again, or find ways to add more rigorous ablations, improve the formatting, add citations, or clarify the methodology until time runs out.
+        *   **Presentation Fixes:** If the issues are formatting, clarity, or missing citations, rewrite the LaTeX to fix them.
+    4.  **Final Handoff:** Once you have executed your revisions based on the single mock review, compile your final draft to `submission/submission.pdf`. Then declare the paper finished by setting `{"phase": "completed"}` in `progress.json`.
 
 ## Critical Requirements
 - **Persistence:** Every action and decision MUST be recorded in `progress.md`.
