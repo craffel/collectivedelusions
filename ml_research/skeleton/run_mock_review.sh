@@ -15,12 +15,11 @@ echo "Running Mock Reviewer..."
 # Using the local gemini binary
 GEMINI_BIN="/fsx/craffel/miniconda3/envs/gemini/bin/gemini"
 
-PROMPT="You are a highly critical and rigorous Mock Reviewer (aka 'Reviewer 2'). 
-Your persona is 'The Rigorous Empiricist'. You scrutinize methodology, baselines, and empirical rigor above all else. 
-You are to review the provided paper 'submission/submission_draft.pdf'.
-Follow the criteria defined in 'reviewing_criteria.md', but view them through the lens of a rigorous empiricist.
-Focus on identifying major weaknesses, flaws in reasoning, missing baselines, unclear methodology, and weak theoretical or empirical justification.
-Do NOT be polite just for the sake of it; provide actionable, harsh, but constructive feedback.
+PROMPT="You are a rigorous Mock Reviewer.
+You are to review the provided paper in the 'submission/' directory.
+Follow the criteria defined in 'reviewing_criteria.md'.
+Focus on identifying weaknesses, flaws in reasoning, missing baselines, unclear methodology, and weak theoretical or empirical justification.
+Provide actionable and constructive feedback. If the paper is good, acknowledge its strengths, but still look for areas of improvement.
 
 To ensure a systematic critique, you MUST first generate the following intermediate files:
 1. '1_summary.md'
@@ -29,7 +28,7 @@ To ensure a systematic critique, you MUST first generate the following intermedi
 4. '4_experiment_check.md'
 5. '5_impact_presentation.md'
 
-After generating these files, output your final synthesized review directly to 'mock_review.md'. Your final review must explicitly identify the top 3 critical flaws."
+After generating these files, output your final synthesized review directly to 'mock_review.md'. If there are critical flaws, identify up to 3 of them. If the paper is solid and ready for publication, you may recommend Accept or Weak Accept, and provide minor suggestions instead."
 
 $GEMINI_BIN --yolo --model "gemini-3.5-flash" --prompt "$PROMPT"
 

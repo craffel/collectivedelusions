@@ -38,4 +38,3 @@ Please provide an overall recommendation for this submission. Choices:
     3: Weak reject: A paper with clear merits, but also some weaknesses, which overall outweigh the merits. Papers in this category require revisions before they can be meaningfully built upon by others. glease use sparingly.
     2: Reject: For instance, a paper with technical flaws, weak evaluation, inadequate reproducibility, incompletely addressed ethical considerations, or writing so poor that it is not possible to understand its key claims.
     1: Strong Reject: For instance, a paper with well-known results, unaddressed ethical considerations, or a poorly written paper where it is impossible to tell what the nature of its contribution is.
-
