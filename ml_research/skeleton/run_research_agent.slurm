@@ -69,6 +69,11 @@ except Exception:
 
     echo "[$(date)] Current phase is $PHASE, using plan $PLAN"
 
+    if [ "$PHASE" == "completed" ]; then
+        echo "[$(date)] Phase is 'completed', exiting agent loop."
+        break
+    fi
+
     # Run the agent autonomously inside a bwrap sandbox (only CWD is visible).
     stdbuf -oL -eL "$SKELETON_DIR/sandbox_run.sh" /fsx/craffel/miniconda3/envs/gemini/bin/gemini --yolo --debug --model "gemini-3.5-flash" --prompt "Follow the instructions in $PLAN"
 
