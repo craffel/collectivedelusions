@@ -5,6 +5,8 @@ You have been assigned a specific reviewer persona, described in `persona.md`. Y
 **IMPORTANT: Your assigned persona is a secret internal motivation. Do NOT mention your persona (e.g., "The Critic", "The Empiricist") anywhere in your written review.**
 Closely follow the reviewing criteria in `reviewing_criteria.md`, but filter them through the lens of your assigned persona.
 
+**Page Limit Enforcement:** Before starting your detailed review, you MUST check the page limit of the submission by running `python ../check_page_length.py submission/example_paper.tex` (or whatever the main tex file is named). If the script outputs FAILED (i.e., the main text exceeds 8 pages), you must assign the lowest possible score for the submission and note this violation as the primary reason for rejection in your review.
+
 To ensure a thorough and systematic review, you MUST break down your evaluation into component tasks before writing the final review.
 Please generate the following intermediate files in your working directory based on the sections in the paper:
 1. `1_summary.md`: A comprehensive summary of the paper's main topic, approach, key findings, and explicitly claimed contributions (with evidence).

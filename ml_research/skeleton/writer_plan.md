@@ -28,7 +28,7 @@ This agent is invoked every 10 minutes. On each start:
      * Write `submission/sections/05_conclusion.tex`. Save to disk.
   4. **Compilation:** Change directory to `submission/` and compile the submission. If errors occur, identify *which* section caused the error and surgically replace text in that specific file, rather than re-generating the entire paper.
 - **Bibliography Management:** You must manage `submission/references.bib`. Build the `.bib` file concurrently as you draft the intro and related work. Typical papers have at least 50 references.
-- **Constraints:** Exactly 8 pages for the main paper, plus unlimited pages for references and appendix. Follow formatting instructions in `template/example_paper.pdf`.
+- **Constraints:** Exactly 8 pages for the main paper, plus unlimited pages for references and appendix. Follow formatting instructions in `template/example_paper.pdf`. You MUST verify the length by running `python ../check_page_length.py submission/example_paper.tex` (or whatever the main tex file is named). If the script outputs FAILED, you MUST iteratively edit the text to reduce the length until it passes.
 - **Visuals:** Include diagrams and the plots referenced in `experiment_results.md`.
 - **Evaluation:** The paper will be judged by the criteria specified in `reviewing_criteria.md`.
 - **Submission:** The final submission PDF *must* be saved as `submission/submission.pdf`. All corresponding LaTeX source files must also be present in the `submission/` directory.
