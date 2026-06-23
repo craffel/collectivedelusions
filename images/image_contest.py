@@ -78,36 +78,50 @@ def generate_round_submissions(round_n):
         image_parts.append(img)
 
     for i in range(1, 11):
-        print(f"Generating image {i}/10...", end="\r")
-        try:
-            # Using generate_content for native image generation with gemini-3.1-flash-image-preview
-            response = client.models.generate_content(
-                model="gemini-3.1-flash-image-preview",
-                contents=[full_prompt] + image_parts,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE"],
+        print(f"Generating image {i}/10...")
+        attempt = 0
+        while True:
+            try:
+                # Using generate_content for native image generation with gemini-3.1-flash-image-preview
+                response = client.models.generate_content(
+                    model="gemini-3.1-flash-image-preview",
+                    contents=[full_prompt] + image_parts,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                    )
                 )
-            )
-            
-            found_image = False
-            for part in response.candidates[0].content.parts:
-                if part.inline_data:
-                    image_bytes = part.inline_data.data
-                    img = Image.open(BytesIO(image_bytes))
-                    img.save(submission_dir / f"submission_{i}.jpg")
-                    found_image = True
-                    break
-            
-            if not found_image:
-                print(f"\nWarning: No image generated for submission {i}. Response: {response.text}")
-            
-            # Rate limit backoff
-            time.sleep(1)
-        except Exception as e:
-            print(f"\nError generating image {i}: {e}")
-            if "429" in str(e):
-                print("Rate limit reached. Sleeping for 5 seconds...")
-                time.sleep(5)
+                
+                found_image = False
+                if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                    for part in response.candidates[0].content.parts:
+                        if part.inline_data:
+                            image_bytes = part.inline_data.data
+                            img = Image.open(BytesIO(image_bytes))
+                            img.save(submission_dir / f"submission_{i}.jpg")
+                            found_image = True
+                            break
+                
+                if not found_image:
+                    print(f"\nWarning: No image generated for submission {i}. Attempt {attempt+1}")
+                    try:
+                        if hasattr(response, 'text') and response.text:
+                            print(f"Response: {response.text}")
+                    except Exception:
+                        pass
+                    attempt += 1
+                    time.sleep(5)
+                    continue
+                
+                # Success
+                time.sleep(2)
+                break
+                
+            except Exception as e:
+                attempt += 1
+                print(f"\nError generating image {i} (Attempt {attempt}): {e}")
+                sleep_time = min((2 ** attempt) * 5, 120)
+                print(f"Sleeping for {sleep_time} seconds before retrying...")
+                time.sleep(sleep_time)
     print("\nGeneration complete.")
 
 def judge_round_winners(round_n):
@@ -138,42 +152,50 @@ def judge_round_winners(round_n):
         content_parts.append(img)
 
     print(f"--- Round {round_n}: Judging winners ---")
-    try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=content_parts
-        )
-        
-        response_text = response.text
-        print(f"Judge response: {response_text}")
-        
-        # Simple parsing for numbers
-        import re
-        numbers = re.findall(r'\b(10|[1-9])\b', response_text)
-        # Try to find unique numbers in case Gemini repeated them
-        unique_winners = []
-        for n in numbers:
-            if n not in unique_winners:
-                unique_winners.append(n)
-        
-        selected_indices = [int(n) for n in unique_winners[:3]]
-        
-        if len(selected_indices) < 3:
-            print("Warning: Judge did not return 3 clear winners. Picking first 3 as fallback.")
-            # Fallback to the first available if not enough winners were chosen
-            selected_indices += [i for i in [1, 2, 3] if i not in selected_indices]
-            selected_indices = selected_indices[:3]
+    attempt = 0
+    while True:
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=content_parts
+            )
+            
+            response_text = response.text
+            print(f"Judge response: {response_text}")
+            
+            # Simple parsing for numbers
+            import re
+            numbers = re.findall(r'\b(10|[1-9])\b', response_text)
+            # Try to find unique numbers in case Gemini repeated them
+            unique_winners = []
+            for n in numbers:
+                if n not in unique_winners:
+                    unique_winners.append(n)
+            
+            selected_indices = [int(n) for n in unique_winners[:3]]
+            
+            if len(selected_indices) < 3:
+                print("Warning: Judge did not return 3 clear winners. Picking first 3 as fallback.")
+                # Fallback to the first available if not enough winners were chosen
+                selected_indices += [i for i in [1, 2, 3] if i not in selected_indices]
+                selected_indices = selected_indices[:3]
 
-        for idx in selected_indices:
-            if 1 <= idx <= len(submissions):
-                src = submissions[idx-1]
-                shutil.copy(src, winners_dir / src.name)
-                print(f"Winner selected: {src.name}")
-            else:
-                print(f"Warning: Judge picked invalid index {idx}")
+            for idx in selected_indices:
+                if 1 <= idx <= len(submissions):
+                    src = submissions[idx-1]
+                    shutil.copy(src, winners_dir / src.name)
+                    print(f"Winner selected: {src.name}")
+                else:
+                    print(f"Warning: Judge picked invalid index {idx}")
+                    
+            break
 
-    except Exception as e:
-        print(f"Error during judging: {e}")
+        except Exception as e:
+            attempt += 1
+            print(f"Error during judging (Attempt {attempt}): {e}")
+            sleep_time = min((2 ** attempt) * 5, 120)
+            print(f"Sleeping for {sleep_time} seconds before retrying judging...")
+            time.sleep(sleep_time)
 
 def main():
     parser = argparse.ArgumentParser(description="Run the image generation contest.")
