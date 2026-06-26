@@ -24,7 +24,8 @@ if not API_KEY:
     sys.exit(1)
 
 client = genai.Client(api_key=API_KEY)
-MODEL_NAME = "gemini-3-flash-preview" # Updated from 2.0 to 3.0 flash preview
+JUDGE_MODEL = None
+GEN_MODEL = None
 
 BASE_DIR = None
 GEN_PROMPT_FILE = None
@@ -82,9 +83,9 @@ def generate_round_submissions(round_n):
         attempt = 0
         while True:
             try:
-                # Using generate_content for native image generation with gemini-3.1-flash-image-preview
+                # Using generate_content for native image generation with provided model
                 response = client.models.generate_content(
-                    model="gemini-3.1-flash-image-preview",
+                    model=GEN_MODEL,
                     contents=[full_prompt] + image_parts,
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE"],
@@ -156,7 +157,7 @@ def judge_round_winners(round_n):
     while True:
         try:
             response = client.models.generate_content(
-                model=MODEL_NAME,
+                model=JUDGE_MODEL,
                 contents=content_parts
             )
             
@@ -200,9 +201,15 @@ def judge_round_winners(round_n):
 def main():
     parser = argparse.ArgumentParser(description="Run the image generation contest.")
     parser.add_argument("base_dir", type=str, help="The base images directory (e.g., images_v2)")
+    parser.add_argument("--judge-model", type=str, required=True, help="The model to use for judging (e.g., gemini-3-flash-preview)")
+    parser.add_argument("--gen-model", type=str, required=True, help="The model to use for generation (e.g., gemini-3.1-flash-image-preview)")
     parser.add_argument("num_rounds", type=int, nargs="?", default=1, help="Number of rounds to run")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for initial image selection")
     args = parser.parse_args()
+
+    global JUDGE_MODEL, GEN_MODEL
+    JUDGE_MODEL = args.judge_model
+    GEN_MODEL = args.gen_model
 
     if args.seed is not None:
         random.seed(args.seed)
