@@ -1,7 +1,16 @@
-import pathlib
-from PIL import Image
+with open('image_contest.py', 'r') as f:
+    lines = f.readlines()
 
-class FluxImageGenerator:
+start_idx = -1
+end_idx = -1
+for i, line in enumerate(lines):
+    if line.startswith("class FluxImageGenerator(ImageGenerator):"):
+        start_idx = i
+    if line.startswith("class ImageJudge:"):
+        end_idx = i
+        break
+
+new_class = """class FluxImageGenerator(ImageGenerator):
     def __init__(self):
         print("Loading Flux 2 dev pipeline...")
         import torch
@@ -36,3 +45,10 @@ class FluxImageGenerator:
         
         image.save(output_path)
         torch.cuda.empty_cache()
+
+"""
+
+lines = lines[:start_idx] + [new_class] + lines[end_idx:]
+
+with open('image_contest.py', 'w') as f:
+    f.writelines(lines)
