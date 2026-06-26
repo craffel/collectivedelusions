@@ -60,8 +60,8 @@ class FluxImageGenerator(ImageGenerator):
     def __init__(self):
         print("Loading Flux 2 dev pipeline...")
         import torch
-        from diffusers import DiffusionPipeline
-        self.pipe = DiffusionPipeline.from_pretrained(
+        from diffusers import Flux2Pipeline
+        self.pipe = Flux2Pipeline.from_pretrained(
             "black-forest-labs/FLUX.2-dev",
             torch_dtype=torch.bfloat16,
             device_map="balanced"
@@ -69,36 +69,35 @@ class FluxImageGenerator(ImageGenerator):
         print("Flux 2 dev pipeline loaded.")
 
     def generate(self, full_prompt: str, seed_images: list[pathlib.Path], output_path: pathlib.Path, attempt: int = 0):
-        image_parts = []
-        for img_path in seed_images:
-            img = Image.open(img_path)
-            image_parts.append(img)
-            
-        translation_prompt = (
-            "You are an expert AI image prompt engineer. Below is a description of an image contest, "
-            "along with the user's prompt asking you to generate a new image based on the 3 winning images from the previous round (attached). "
-            "Please analyze the previous winning images and the contest description, and write a highly detailed text-to-image prompt "
-            "for a diffusion model. The prompt should describe a single new image that captures the spirit of the contest "
-            "and evolves from the previous winners. ONLY output the text prompt, nothing else."
-            f"\n\n--- Contest Info & User Prompt ---\n{full_prompt}"
-        )
+        import torch
         
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[translation_prompt] + image_parts,
-        )
-        flux_prompt = response.text.strip()
-        print(f"  Attempt {attempt+1} Flux prompt: {flux_prompt[:100]}...")
+        # Load and combine the seed images into a single horizontal composite image
+        opened_images = [Image.open(img_path).convert("RGB") for img_path in seed_images]
+        
+        target_size = 512
+        resized_images = [img.resize((target_size, target_size)) for img in opened_images]
+        
+        total_w = target_size * len(resized_images)
+        grid_image = Image.new('RGB', (total_w, target_size))
+        
+        x_offset = 0
+        for img in resized_images:
+            grid_image.paste(img, (x_offset, 0))
+            x_offset += target_size
+            
+        print(f"  Attempt {attempt+1} feeding prompt and composite image directly to Flux...")
         
         image = self.pipe(
-            prompt=flux_prompt,
+            prompt=full_prompt,
+            image=grid_image,
             guidance_scale=3.5,
             num_inference_steps=28,
-            height=1024,
-            width=1024,
+            height=target_size,
+            width=total_w,
         ).images[0]
         
         image.save(output_path)
+        torch.cuda.empty_cache()
 
 class ImageJudge:
     def judge(self, submissions: list[pathlib.Path], judge_prompt: str, winners_dir: pathlib.Path):
