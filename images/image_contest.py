@@ -239,16 +239,25 @@ def main():
         judge_round_winners(n)
         print(f"=== COMPLETED ROUND {n} ===")
         
-        # Generate README and push to Git
-        print(f"Updating README and pushing to GitHub for Round {n}...")
+        # Generate README and push to Hugging Face
+        print(f"Updating README and pushing to Hugging Face dataset for Round {n}...")
         try:
             generate_readme.generate_readme(args.base_dir)
-            subprocess.run(["git", "add", "."], check=True, capture_output=True)
-            subprocess.run(["git", "commit", "-m", f"Add results for Round {n}"], check=True, capture_output=True)
-            subprocess.run(["git", "push", "origin", "main"], check=True, capture_output=True)
-            print("Successfully pushed to GitHub!")
-        except subprocess.CalledProcessError as e:
-            print(f"Git push failed: {e.stderr.decode('utf-8') if e.stderr else str(e)}")
+            
+            from huggingface_hub import HfApi
+            api = HfApi()
+            
+            folder_name = pathlib.Path(args.base_dir).name
+            path_in_repo = f"images/{folder_name}"
+            
+            api.upload_folder(
+                repo_id="craffel/collectivedelusions",
+                repo_type="dataset",
+                folder_path=str(BASE_DIR),
+                path_in_repo=path_in_repo,
+                commit_message=f"Add results for {folder_name} Round {n}"
+            )
+            print("Successfully pushed to Hugging Face dataset!")
         except Exception as e:
             print(f"Failed to update README or push: {e}")
             
