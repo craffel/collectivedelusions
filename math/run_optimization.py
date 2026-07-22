@@ -32,22 +32,10 @@ api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
 EQUATIONS = {
-    1: {
-        "text": "(sin(pi*x/2) + 1)^(x + 1)^1.5",
-        "func": lambda x: (np.sin(np.pi * x / 2) + 1) ** ((x + 1) ** 1.5)
-    },
-    2: {
-        "text": "exp((x + 1)^(3/2) ln(sin(pi*x/2) + 1))",
-        "func": lambda x: np.exp(((x + 1) ** 1.5) * np.log(np.sin(np.pi * x / 2) + 1))
-    },
-    3: {
-        "text": "(sin(pi*x/4) + cos(pi*x/4))^(2*(x + 1)^(3/2))",
-        "func": lambda x: (np.sin(np.pi * x / 4) + np.cos(np.pi * x / 4)) ** (2 * (x + 1) ** 1.5)
-    },
-    4: {
-        "text": "(2*cos^2(pi*(1 - x)/4))^((x + 1)*sqrt(x + 1))",
-        "func": lambda x: (2 * (np.cos(np.pi * (1 - x) / 4) ** 2)) ** ((x + 1) * np.sqrt(x + 1))
-    }
+    1: "(sin(pi*x/2) + 1)^(x + 1)^1.5",
+    2: "exp((x + 1)^(3/2) ln(sin(pi*x/2) + 1))",
+    3: "(sin(pi*x/4) + cos(pi*x/4))^(2*(x + 1)^(3/2))",
+    4: "(2*cos^2(pi*(1 - x)/4))^((x + 1)*sqrt(x + 1))"
 }
 
 GENERATOR_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function {equation_text}.
@@ -65,7 +53,7 @@ Below are {n_guesses} possible values for m and b, provided as tuples.
 Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose."""
 
 
-def approximate_mse(m: float, b: float, equation_option: int = 1) -> float:
+def approximate_mse(m: float, b: float) -> float:
     """
     Approximates the Mean Squared Error (MSE) between the linear function
     y = mx + b and the target function over the interval [0, 1].
@@ -73,12 +61,12 @@ def approximate_mse(m: float, b: float, equation_option: int = 1) -> float:
     Parameters:
     m (float): The slope of the linear model.
     b (float): The y-intercept of the linear model.
-    equation_option (int): The equation option ID (1 to 4).
 
     Returns:
     float: The approximated MSE.
     """
-    target_function = EQUATIONS[equation_option]["func"]
+    def target_function(x):
+        return (np.sin(np.pi * x / 2) + 1) ** ((x + 1) ** 1.5)
 
     def squared_error(x):
         return (m * x + b - target_function(x)) ** 2
@@ -125,7 +113,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             raise ValueError("GEMINI_API_KEY environment variable must be set to run the experiment.")
         client = genai.Client(api_key=api_key)
 
-    equation_text = EQUATIONS[equation_option]["text"]
+    equation_text = EQUATIONS[equation_option]
     
     if judge_approximate_mse:
         judge_instruction = "Choose the pair of values that achieves the lowest mean-squared error. You should explicitly approximate the mean-squared error for each option."
@@ -187,7 +175,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
         elif judge_model == "mse":
             valid_guesses = [g for g in guesses if g is not None]
             if valid_guesses:
-                chosen = min(valid_guesses, key=lambda g: approximate_mse(g[0], g[1], equation_option=equation_option))
+                chosen = min(valid_guesses, key=lambda g: approximate_mse(g[0], g[1]))
             else:
                 chosen = None
         elif judge_model == "random":
@@ -195,7 +183,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             chosen = random.choice(valid_guesses) if valid_guesses else None
 
         if chosen is not None:
-            mse = approximate_mse(chosen[0], chosen[1], equation_option=equation_option)
+            mse = approximate_mse(chosen[0], chosen[1])
             chosen_json = {"m": chosen[0], "b": chosen[1], "approx_mse": mse}
         else:
             chosen_json = None
@@ -213,7 +201,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
     final_iterates_json = []
     for idx, iterate in enumerate(iterates):
         if iterate is not None:
-            mse = approximate_mse(iterate[0], iterate[1], equation_option=equation_option)
+            mse = approximate_mse(iterate[0], iterate[1])
             final_iterates_json.append({
                 "step": idx + 1,
                 "m": iterate[0],
@@ -322,7 +310,7 @@ if __name__ == "__main__":
                 f"  Steps: {args.n_steps}\n"
                 f"  Guesses per step: {args.n_guesses}\n"
                 f"  Max past iterates: {args.max_past_iterates}\n"
-                f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]['text']})\n"
+                f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
                 f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
                 f"  Output Directory: {args.output_dir}")
 

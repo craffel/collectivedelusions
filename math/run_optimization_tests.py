@@ -9,7 +9,7 @@
 
 import unittest
 import numpy as np
-from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS
+from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS, approximate_mse
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -65,14 +65,18 @@ class TestParseMaxPastIterates(unittest.TestCase):
             parse_max_past_iterates("3.5")
 
 
-class TestEquations(unittest.TestCase):
-    def test_equation_evaluation(self):
-        # Test x = 0.5 and x = 0.0 for all equations to make sure they evaluate without error
-        for opt_id, opt in EQUATIONS.items():
-            for x in [0.0, 0.5, 1.0]:
-                val = opt["func"](x)
-                self.assertTrue(isinstance(val, (float, np.float64, int, np.int64)))
-                self.assertFalse(np.isnan(val))
+class TestEquationsAndMSE(unittest.TestCase):
+    def test_equations_are_strings(self):
+        # Make sure EQUATIONS dictionary holds valid string prompt segments
+        for opt_id, text in EQUATIONS.items():
+            self.assertTrue(isinstance(text, str))
+            self.assertTrue(len(text) > 0)
+
+    def test_approximate_mse_runs(self):
+        # Test approximate_mse evaluates cleanly and returns valid float MSE values
+        mse = approximate_mse(1.0, 2.0)
+        self.assertTrue(isinstance(mse, float))
+        self.assertTrue(mse >= 0.0)
 
 
 if __name__ == "__main__":
