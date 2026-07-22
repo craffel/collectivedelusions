@@ -30,6 +30,20 @@ logger.addHandler(handler)
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
+GENERATOR_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function (sin(pi*x/2) + 1)^(x + 1)^1.5.
+{past_iterates}
+Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose at this iteration."""
+
+ITERATES_DESCRIPTION = """Below are the values found in past iterations.
+{past_iterates}
+Come up with a new set of values that improve upon past iterations."""
+
+JUDGE_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function (sin(pi*x/2) + 1)^(x + 1)^1.5.
+Below are {n_guesses} possible values for m and b, provided as tuples.
+{guesses}
+Choose the pair of values that provide the best fit.
+Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose."""
+
 
 def approximate_mse(m: float, b: float) -> float:
     """
@@ -92,17 +106,8 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             raise ValueError("GEMINI_API_KEY environment variable must be set to run the experiment.")
         client = genai.Client(api_key=api_key)
 
-    generator_prompt_template = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function (sin(pi*x/2) + 1)^(x + 1)^1.5.
-{past_iterates}
-Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose at this iteration."""
-    iterates_description = """Below are the values found in past iterations.
-{past_iterates}
-Come up with a new set of values that improve upon past iterations."""
-    judge_prompt_template = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function (sin(pi*x/2) + 1)^(x + 1)^1.5.
-Below are {n_guesses} possible values for m and b, provided as tuples.
-{guesses}
-Choose the pair of values that provide the best fit.
-Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose."""
+    logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE}\n")
+    logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE}\n")
 
     iterates = []
     for i in range(n_steps):
@@ -115,9 +120,9 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
         else:
             visible_iterates = iterates[-max_past_iterates:] if max_past_iterates > 0 else []
 
-        generator_prompt = generator_prompt_template.format(
+        generator_prompt = GENERATOR_PROMPT_TEMPLATE.format(
             past_iterates=(
-                iterates_description.format(past_iterates="\n".join(str(t) for t in visible_iterates)) if visible_iterates else ""
+                ITERATES_DESCRIPTION.format(past_iterates="\n".join(str(t) for t in visible_iterates)) if visible_iterates else ""
             )
         )
         for j in range(n_guesses):
@@ -131,7 +136,7 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
         
         logger.info(f"Generated guesses for Round {i + 1}: {guesses}")
         
-        judge_prompt = judge_prompt_template.format(
+        judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
             n_guesses=n_guesses,
             guesses="\n".join(str(g) for g in guesses)
         )
