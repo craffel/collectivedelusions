@@ -140,6 +140,8 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
         logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}', judge_instruction=judge_instruction)}\n")
 
     iterates = []
+    rounds_data = []
+
     for i in range(n_steps):
         logger.info(f"--- Round {i + 1} ---")
         guesses = []
@@ -165,7 +167,13 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
                     break
                 logger.warning(f"No match found in generator response (guess {j + 1}/{n_guesses}). Retrying generation...")
         
-        logger.info(f"Generated guesses for Round {i + 1}: {guesses}")
+        # Convert guesses list to JSON-serializable list
+        round_guesses_json = []
+        for g in guesses:
+            if g is not None:
+                round_guesses_json.append({"m": g[0], "b": g[1]})
+            else:
+                round_guesses_json.append(None)
         
         if is_llm_judge:
             judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
@@ -186,9 +194,42 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             valid_guesses = [g for g in guesses if g is not None]
             chosen = random.choice(valid_guesses) if valid_guesses else None
 
-        logger.info(f"Judge ({judge_model}) chose for Round {i + 1}: {chosen}")
+        if chosen is not None:
+            mse = approximate_mse(chosen[0], chosen[1], equation_option=equation_option)
+            chosen_json = {"m": chosen[0], "b": chosen[1], "approx_mse": mse}
+        else:
+            chosen_json = None
+
+        rounds_data.append({
+            "round": i + 1,
+            "guesses": round_guesses_json,
+            "chosen": chosen_json
+        })
+
         iterates.append(chosen)
-    return iterates
+        logger.info(f"Round {i + 1} completed.")
+
+    # Format final iterates data for JSON serialization
+    final_iterates_json = []
+    for idx, iterate in enumerate(iterates):
+        if iterate is not None:
+            mse = approximate_mse(iterate[0], iterate[1], equation_option=equation_option)
+            final_iterates_json.append({
+                "step": idx + 1,
+                "m": iterate[0],
+                "b": iterate[1],
+                "approx_mse": mse
+            })
+        else:
+            final_iterates_json.append({
+                "step": idx + 1,
+                "error": "Failed to extract values"
+            })
+
+    return {
+        "rounds": rounds_data,
+        "final_iterates": final_iterates_json
+    }
 
 
 def parse_max_past_iterates(value):
@@ -205,6 +246,7 @@ def parse_max_past_iterates(value):
 
 if __name__ == "__main__":
     import argparse
+    import json
 
     parser = argparse.ArgumentParser(
         description="Run LLM-based optimization of a linear fit of a target function."
@@ -251,8 +293,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Ask the judge model to explicitly approximate and choose the lowest MSE.",
     )
+    parser.add_argument(
+        "--output_dir", "--output-dir",
+        type=str,
+        required=True,
+        help="The directory path where results.json, config.json, and the log file will be saved.",
+    )
 
     args = parser.parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Configure isolated local logging FileHandler to save a transcript of the log by default
+    log_file_path = os.path.join(args.output_dir, "optimization.log")
+    file_handler = logging.FileHandler(log_file_path, mode="w")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(file_handler)
+
+    # Save parsed configuration to config.json
+    config_path = os.path.join(args.output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=4)
 
     logger.info(f"Starting experiment with:\n"
                 f"  Generator Model: {args.generator_model}\n"
@@ -261,7 +323,8 @@ if __name__ == "__main__":
                 f"  Guesses per step: {args.n_guesses}\n"
                 f"  Max past iterates: {args.max_past_iterates}\n"
                 f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]['text']})\n"
-                f"  Judge Approx MSE: {args.judge_approximate_mse}")
+                f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
+                f"  Output Directory: {args.output_dir}")
 
     results = run_experiment(
         generator_model=args.generator_model,
@@ -273,11 +336,9 @@ if __name__ == "__main__":
         judge_approximate_mse=args.judge_approximate_mse,
     )
 
-    logger.info("Experiment complete. Optimization iterates:")
-    for idx, iterate in enumerate(results):
-        if iterate is not None:
-            m, b = iterate
-            mse = approximate_mse(m, b, equation_option=args.equation_option)
-            logger.info(f"Step {idx + 1:02d}: m = {m:.6f}, b = {b:.6f} | Approx MSE = {mse:.6f}")
-        else:
-            logger.error(f"Step {idx + 1:02d}: Failed to extract values from model response.")
+    # Save results to results.json
+    results_path = os.path.join(args.output_dir, "results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=4)
+
+    logger.info(f"Experiment complete. Results saved to {args.output_dir}")
