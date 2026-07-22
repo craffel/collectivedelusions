@@ -103,8 +103,13 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
         )
         print(generator_prompt)
         for j in range(n_guesses):
-            response = wrapped_generate(client, generator_model, generator_prompt)
-            guesses.append(extract_answer(response.text))
+            while True:
+                response = wrapped_generate(client, generator_model, generator_prompt)
+                ans = extract_answer(response.text)
+                if ans is not None:
+                    guesses.append(ans)
+                    break
+                print("No match found in generator response. Retrying generation...")
         judge_prompt = judge_prompt_template.format(
             n_guesses=n_guesses,
             guesses="\n".join(str(g) for g in guesses)
