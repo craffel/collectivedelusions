@@ -7,13 +7,24 @@
 # ]
 # ///
 
+import logging
 import os
 import re
+import sys
 import time
 
 from google import genai
 import numpy as np
 import scipy.integrate
+
+# Configure isolated local logging to completely suppress third-party package noise
+logger = logging.getLogger("optimization")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(handler)
 
 # Initialize client lazily or if API key is present, to prevent crash on --help
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -95,13 +106,13 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
 
     iterates = []
     for i in range(n_steps):
+        logger.info(f"--- Round {i + 1} ---")
         guesses = []
         generator_prompt = generator_prompt_template.format(
             past_iterates=(
                 iterates_description.format(past_iterates="\n".join(str(t) for t in iterates)) if iterates else ""
             )
         )
-        print(generator_prompt)
         for j in range(n_guesses):
             while True:
                 response = wrapped_generate(client, generator_model, generator_prompt)
@@ -109,14 +120,18 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
                 if ans is not None:
                     guesses.append(ans)
                     break
-                print("No match found in generator response. Retrying generation...")
+                logger.warning(f"No match found in generator response (guess {j + 1}/{n_guesses}). Retrying generation...")
+        
+        logger.info(f"Generated guesses for Round {i + 1}: {guesses}")
+        
         judge_prompt = judge_prompt_template.format(
             n_guesses=n_guesses,
             guesses="\n".join(str(g) for g in guesses)
         )
-        print(judge_prompt)
         response = wrapped_generate(client, judge_model, judge_prompt)
-        iterates.append(extract_answer(response.text))
+        chosen = extract_answer(response.text)
+        logger.info(f"Judge chose for Round {i + 1}: {chosen}")
+        iterates.append(chosen)
     return iterates
 
 
@@ -153,11 +168,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    print(f"Starting experiment with:\n"
-          f"  Generator Model: {args.generator_model}\n"
-          f"  Judge Model: {args.judge_model}\n"
-          f"  Steps: {args.n_steps}\n"
-          f"  Guesses per step: {args.n_guesses}\n")
+    logger.info(f"Starting experiment with:\n"
+                f"  Generator Model: {args.generator_model}\n"
+                f"  Judge Model: {args.judge_model}\n"
+                f"  Steps: {args.n_steps}\n"
+                f"  Guesses per step: {args.n_guesses}")
 
     results = run_experiment(
         generator_model=args.generator_model,
@@ -166,11 +181,11 @@ if __name__ == "__main__":
         n_guesses=args.n_guesses,
     )
 
-    print("\nExperiment complete. Optimization iterates:")
+    logger.info("Experiment complete. Optimization iterates:")
     for idx, iterate in enumerate(results):
         if iterate is not None:
             m, b = iterate
             mse = approximate_mse(m, b)
-            print(f"Step {idx + 1:02d}: m = {m:.6f}, b = {b:.6f} | Approx MSE = {mse:.6f}")
+            logger.info(f"Step {idx + 1:02d}: m = {m:.6f}, b = {b:.6f} | Approx MSE = {mse:.6f}")
         else:
-            print(f"Step {idx + 1:02d}: Failed to extract values from model response.")
+            logger.error(f"Step {idx + 1:02d}: Failed to extract values from model response.")
