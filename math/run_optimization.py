@@ -156,12 +156,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
                 logger.warning(f"No match found in generator response (guess {j + 1}/{n_guesses}). Retrying generation...")
         
         # Convert guesses list to JSON-serializable list
-        round_guesses_json = []
-        for g in guesses:
-            if g is not None:
-                round_guesses_json.append({"m": g[0], "b": g[1]})
-            else:
-                round_guesses_json.append(None)
+        round_guesses_json = [{"m": g[0], "b": g[1]} for g in guesses]
         
         if is_llm_judge:
             judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
@@ -173,14 +168,9 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             response = wrapped_generate(client, judge_model, judge_prompt)
             chosen = extract_answer(response.text)
         elif judge_model == "mse":
-            valid_guesses = [g for g in guesses if g is not None]
-            if valid_guesses:
-                chosen = min(valid_guesses, key=lambda g: approximate_mse(g[0], g[1]))
-            else:
-                chosen = None
+            chosen = min(guesses, key=lambda g: approximate_mse(g[0], g[1]))
         elif judge_model == "random":
-            valid_guesses = [g for g in guesses if g is not None]
-            chosen = random.choice(valid_guesses) if valid_guesses else None
+            chosen = random.choice(guesses)
 
         if chosen is not None:
             mse = approximate_mse(chosen[0], chosen[1])
