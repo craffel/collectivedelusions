@@ -98,10 +98,26 @@ def wrapped_generate(client, model, prompt):
                 contents=prompt,
             )
         except genai.errors.ServerError:
+            logger.warning("Google GenAI Server Error encountered. Retrying in 1 second...")
             time.sleep(1)
+        except genai.errors.APIError as e:
+            # Code 429 indicates rate-limiting (Resource Exhausted)
+            if e.code == 429:
+                logger.warning("Google GenAI Rate limit reached (429). Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                raise e
 
 
-def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all", equation_option: int = 1, judge_approximate_mse: bool = False):
+def run_experiment(
+    generator_model: str,
+    judge_model: str,
+    n_steps: int = 10,
+    n_guesses: int = 10,
+    max_past_iterates: str | int = "all",
+    equation_option: int = 1,
+    judge_approximate_mse: bool = False
+) -> dict:
     client = genai.Client()
 
     equation_text = EQUATIONS[equation_option]
@@ -161,7 +177,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
                 chosen = extract_answer(response.text)
                 if chosen is not None:
                     break
-                logger.warning("No match found in judge response. Retrying generation...")
+                logger.warning("No match found in judge response. Retrying selection...")
         elif judge_model == "mse":
             chosen = min(guesses, key=lambda g: approximate_mse(g[0], g[1]))
         elif judge_model == "random":
