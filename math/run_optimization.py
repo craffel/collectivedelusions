@@ -9,6 +9,7 @@
 
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -128,7 +129,10 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
     
     # Log formatted templates once on startup
     logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE.format(equation_text=equation_text, past_iterates='{past_iterates}')}\n")
-    logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}')}\n")
+    
+    is_llm_judge = judge_model not in ["mse", "random"]
+    if is_llm_judge:
+        logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}')}\n")
 
     iterates = []
     for i in range(n_steps):
@@ -158,14 +162,25 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
         
         logger.info(f"Generated guesses for Round {i + 1}: {guesses}")
         
-        judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
-            equation_text=equation_text,
-            n_guesses=n_guesses,
-            guesses="\n".join(str(g) for g in guesses)
-        )
-        response = wrapped_generate(client, judge_model, judge_prompt)
-        chosen = extract_answer(response.text)
-        logger.info(f"Judge chose for Round {i + 1}: {chosen}")
+        if is_llm_judge:
+            judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+                equation_text=equation_text,
+                n_guesses=n_guesses,
+                guesses="\n".join(str(g) for g in guesses)
+            )
+            response = wrapped_generate(client, judge_model, judge_prompt)
+            chosen = extract_answer(response.text)
+        elif judge_model == "mse":
+            valid_guesses = [g for g in guesses if g is not None]
+            if valid_guesses:
+                chosen = min(valid_guesses, key=lambda g: approximate_mse(g[0], g[1], equation_option=equation_option))
+            else:
+                chosen = None
+        elif judge_model == "random":
+            valid_guesses = [g for g in guesses if g is not None]
+            chosen = random.choice(valid_guesses) if valid_guesses else None
+
+        logger.info(f"Judge ({judge_model}) chose for Round {i + 1}: {chosen}")
         iterates.append(chosen)
     return iterates
 
@@ -198,7 +213,7 @@ if __name__ == "__main__":
         "--judge_model", "--judge-model",
         type=str,
         required=True,
-        help="The Gemini model to use for judging guesses.",
+        help="The Gemini model to use for judging guesses, or 'mse' to choose the guess with the lowest MSE directly, or 'random' to choose a random guess.",
     )
     parser.add_argument(
         "--n_steps", "--n-steps",
