@@ -8,7 +8,7 @@
 # ///
 
 import unittest
-from run_optimization import extract_answer
+from run_optimization import extract_answer, parse_max_past_iterates
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -42,6 +42,27 @@ class TestExtractAnswer(unittest.TestCase):
         self.assertIsNone(extract_answer("Just some random text"))
         self.assertIsNone(extract_answer(r"\boxed{(1.0)}"))
         self.assertIsNone(extract_answer(r"\boxed{(1. 0, 2.0)}"))
+
+
+class TestParseMaxPastIterates(unittest.TestCase):
+    def test_valid_all(self):
+        self.assertEqual(parse_max_past_iterates("all"), "all")
+        self.assertEqual(parse_max_past_iterates("ALL"), "all")
+        self.assertEqual(parse_max_past_iterates("All"), "all")
+
+    def test_valid_integers(self):
+        self.assertEqual(parse_max_past_iterates("0"), 0)
+        self.assertEqual(parse_max_past_iterates("3"), 3)
+        self.assertEqual(parse_max_past_iterates("100"), 100)
+
+    def test_invalid_values(self):
+        with self.assertRaises(ValueError):
+            parse_max_past_iterates("-5")
+        with self.assertRaises(ValueError):
+            parse_max_past_iterates("invalid")
+        with self.assertRaises(ValueError):
+            parse_max_past_iterates("3.5")
+
 
 if __name__ == "__main__":
     unittest.main()

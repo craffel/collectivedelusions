@@ -84,7 +84,7 @@ def wrapped_generate(client, model, prompt):
             time.sleep(1)
 
 
-def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10):
+def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all"):
     global client
     if client is None:
         api_key = os.environ.get("GEMINI_API_KEY")
@@ -108,9 +108,16 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
     for i in range(n_steps):
         logger.info(f"--- Round {i + 1} ---")
         guesses = []
+        
+        # Slices the list of past iterates if configured
+        if max_past_iterates == "all":
+            visible_iterates = iterates
+        else:
+            visible_iterates = iterates[-max_past_iterates:] if max_past_iterates > 0 else []
+
         generator_prompt = generator_prompt_template.format(
             past_iterates=(
-                iterates_description.format(past_iterates="\n".join(str(t) for t in iterates)) if iterates else ""
+                iterates_description.format(past_iterates="\n".join(str(t) for t in visible_iterates)) if visible_iterates else ""
             )
         )
         for j in range(n_guesses):
@@ -133,6 +140,18 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
         logger.info(f"Judge chose for Round {i + 1}: {chosen}")
         iterates.append(chosen)
     return iterates
+
+
+def parse_max_past_iterates(value):
+    if value.lower() == "all":
+        return "all"
+    try:
+        ivalue = int(value)
+        if ivalue < 0:
+            raise ValueError()
+        return ivalue
+    except ValueError:
+        raise ValueError(f"Invalid value: {value}. Must be 'all' or a non-negative integer.")
 
 
 if __name__ == "__main__":
@@ -165,6 +184,12 @@ if __name__ == "__main__":
         default=10,
         help="The number of guesses to generate per step (default: 10).",
     )
+    parser.add_argument(
+        "--max_past_iterates", "--max-past-iterates",
+        type=parse_max_past_iterates,
+        default="all",
+        help="The maximum number of past iterates sent to the generator. Can be 'all' or a non-negative integer (default: 'all').",
+    )
 
     args = parser.parse_args()
 
@@ -172,13 +197,15 @@ if __name__ == "__main__":
                 f"  Generator Model: {args.generator_model}\n"
                 f"  Judge Model: {args.judge_model}\n"
                 f"  Steps: {args.n_steps}\n"
-                f"  Guesses per step: {args.n_guesses}")
+                f"  Guesses per step: {args.n_guesses}\n"
+                f"  Max past iterates: {args.max_past_iterates}")
 
     results = run_experiment(
         generator_model=args.generator_model,
         judge_model=args.judge_model,
         n_steps=args.n_steps,
         n_guesses=args.n_guesses,
+        max_past_iterates=args.max_past_iterates,
     )
 
     logger.info("Experiment complete. Optimization iterates:")
