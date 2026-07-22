@@ -27,10 +27,6 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(handler)
 
-# Initialize client lazily or if API key is present, to prevent crash on --help
-api_key = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key) if api_key else None
-
 EQUATIONS = {
     1: "(sin(pi*x/2) + 1)^(x + 1)^1.5",
     2: "exp((x + 1)^(3/2) ln(sin(pi*x/2) + 1))",
@@ -106,12 +102,7 @@ def wrapped_generate(client, model, prompt):
 
 
 def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all", equation_option: int = 1, judge_approximate_mse: bool = False):
-    global client
-    if client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable must be set to run the experiment.")
-        client = genai.Client(api_key=api_key)
+    client = genai.Client()
 
     equation_text = EQUATIONS[equation_option]
     
@@ -165,18 +156,19 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
                 guesses="\n".join(str(g) for g in guesses),
                 judge_instruction=judge_instruction
             )
-            response = wrapped_generate(client, judge_model, judge_prompt)
-            chosen = extract_answer(response.text)
+            while True:
+                response = wrapped_generate(client, judge_model, judge_prompt)
+                chosen = extract_answer(response.text)
+                if chosen is not None:
+                    break
+                logger.warning("No match found in judge response. Retrying generation...")
         elif judge_model == "mse":
             chosen = min(guesses, key=lambda g: approximate_mse(g[0], g[1]))
         elif judge_model == "random":
             chosen = random.choice(guesses)
 
-        if chosen is not None:
-            mse = approximate_mse(chosen[0], chosen[1])
-            chosen_json = {"m": chosen[0], "b": chosen[1], "approx_mse": mse}
-        else:
-            chosen_json = None
+        mse = approximate_mse(chosen[0], chosen[1])
+        chosen_json = {"m": chosen[0], "b": chosen[1], "approx_mse": mse}
 
         rounds_data.append({
             "round": i + 1,
@@ -190,19 +182,13 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
     # Format final iterates data for JSON serialization
     final_iterates_json = []
     for idx, iterate in enumerate(iterates):
-        if iterate is not None:
-            mse = approximate_mse(iterate[0], iterate[1])
-            final_iterates_json.append({
-                "step": idx + 1,
-                "m": iterate[0],
-                "b": iterate[1],
-                "approx_mse": mse
-            })
-        else:
-            final_iterates_json.append({
-                "step": idx + 1,
-                "error": "Failed to extract values"
-            })
+        mse = approximate_mse(iterate[0], iterate[1])
+        final_iterates_json.append({
+            "step": idx + 1,
+            "m": iterate[0],
+            "b": iterate[1],
+            "approx_mse": mse
+        })
 
     return {
         "rounds": rounds_data,
@@ -279,6 +265,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Fail fast if GEMINI_API_KEY is not set
+    if "GEMINI_API_KEY" not in os.environ:
+        logger.error("Error: GEMINI_API_KEY environment variable is not set. Please set it before running the script.")
+        sys.exit(1)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
