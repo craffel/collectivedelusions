@@ -61,7 +61,7 @@ Come up with a new set of values that improve upon past iterations."""
 JUDGE_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function {equation_text}.
 Below are {n_guesses} possible values for m and b, provided as tuples.
 {guesses}
-Choose the pair of values that provide the best fit.
+{judge_instruction}
 Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose."""
 
 
@@ -117,7 +117,7 @@ def wrapped_generate(client, model, prompt):
             time.sleep(1)
 
 
-def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all", equation_option: int = 1):
+def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all", equation_option: int = 1, judge_approximate_mse: bool = False):
     global client
     if client is None:
         api_key = os.environ.get("GEMINI_API_KEY")
@@ -127,12 +127,17 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
 
     equation_text = EQUATIONS[equation_option]["text"]
     
+    if judge_approximate_mse:
+        judge_instruction = "Choose the pair of values that achieves the lowest mean-squared error. You should explicitly approximate the mean-squared error for each option."
+    else:
+        judge_instruction = "Choose the pair of values that provide the best fit."
+
     # Log formatted templates once on startup
     logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE.format(equation_text=equation_text, past_iterates='{past_iterates}')}\n")
     
     is_llm_judge = judge_model not in ["mse", "random"]
     if is_llm_judge:
-        logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}')}\n")
+        logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}', judge_instruction=judge_instruction)}\n")
 
     iterates = []
     for i in range(n_steps):
@@ -166,7 +171,8 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
                 equation_text=equation_text,
                 n_guesses=n_guesses,
-                guesses="\n".join(str(g) for g in guesses)
+                guesses="\n".join(str(g) for g in guesses),
+                judge_instruction=judge_instruction
             )
             response = wrapped_generate(client, judge_model, judge_prompt)
             chosen = extract_answer(response.text)
@@ -240,6 +246,11 @@ if __name__ == "__main__":
         default=1,
         help="The mathematical equation option to optimize (1, 2, 3, or 4) (default: 1).",
     )
+    parser.add_argument(
+        "--judge_approximate_mse", "--judge-approximate-mse",
+        action="store_true",
+        help="Ask the judge model to explicitly approximate and choose the lowest MSE.",
+    )
 
     args = parser.parse_args()
 
@@ -249,7 +260,8 @@ if __name__ == "__main__":
                 f"  Steps: {args.n_steps}\n"
                 f"  Guesses per step: {args.n_guesses}\n"
                 f"  Max past iterates: {args.max_past_iterates}\n"
-                f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]['text']})")
+                f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]['text']})\n"
+                f"  Judge Approx MSE: {args.judge_approximate_mse}")
 
     results = run_experiment(
         generator_model=args.generator_model,
@@ -258,6 +270,7 @@ if __name__ == "__main__":
         n_guesses=args.n_guesses,
         max_past_iterates=args.max_past_iterates,
         equation_option=args.equation_option,
+        judge_approximate_mse=args.judge_approximate_mse,
     )
 
     logger.info("Experiment complete. Optimization iterates:")
