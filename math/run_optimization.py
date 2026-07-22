@@ -43,13 +43,23 @@ def approximate_mse(m: float, b: float) -> float:
 
 
 def extract_answer(response: str) -> tuple[float, float] | None:
-    pattern = r"\$\\boxed\{\(([0-9]+\.?[0-9]*),\s*([0-9]+\.?[0-9]*)\)\}\$"
+    # Captures:
+    # - Optional negative/positive signs (- or +)
+    # - Integers and floats (including leading dot floats like -.5)
+    # - Scientific notation (e.g., 1.2e-3)
+    # - Robust/optional whitespace inside \boxed{...} and (...)
+    # - Optional LaTeX '$' surrounding characters
+    pattern = r"\\boxed\s*\{\s*\(\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*,\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\)\s*\}"
+    
     matches = re.findall(pattern, response)
-    if len(matches) == 1:
-        str_tuple = matches[0]
-        return float(str_tuple[0]), float(str_tuple[1])
-    else:
-        return None
+    if matches:
+        # Extract the last match, which is typically the final answer
+        str_tuple = matches[-1]
+        try:
+            return float(str_tuple[0]), float(str_tuple[1])
+        except ValueError:
+            return None
+    return None
 
 
 def wrapped_generate(client, model, prompt):
