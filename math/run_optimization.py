@@ -116,7 +116,8 @@ def run_experiment(
     n_guesses: int = 10,
     max_past_iterates: str | int = "all",
     equation_option: int = 1,
-    judge_approximate_mse: bool = False
+    judge_approximate_mse: bool = False,
+    early_stopping_mse: float = 0.18
 ) -> dict:
     client = genai.Client()
 
@@ -136,6 +137,7 @@ def run_experiment(
 
     iterates = []
     rounds_data = []
+    consecutive_low_mse = 0
 
     for i in range(n_steps):
         logger.info(f"--- Round {i + 1} ---")
@@ -195,6 +197,16 @@ def run_experiment(
         iterates.append(chosen)
         logger.info(f"Round {i + 1} completed.")
 
+        # Check early stopping condition
+        if mse < early_stopping_mse:
+            consecutive_low_mse += 1
+        else:
+            consecutive_low_mse = 0
+
+        if consecutive_low_mse >= 3:
+            logger.info(f"Early stopping triggered: attained MSE < {early_stopping_mse} for {consecutive_low_mse} consecutive rounds.")
+            break
+
     # Format final iterates data for JSON serialization
     final_iterates_json = []
     for idx, iterate in enumerate(iterates):
@@ -246,13 +258,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_steps", "--n-steps",
         type=int,
-        default=10,
+        default=20,
         help="The number of optimization steps to run (default: 10).",
     )
     parser.add_argument(
         "--n_guesses", "--n-guesses",
         type=int,
-        default=10,
+        default=5,
         help="The number of guesses to generate per step (default: 10).",
     )
     parser.add_argument(
@@ -272,6 +284,12 @@ if __name__ == "__main__":
         "--judge_approximate_mse", "--judge-approximate-mse",
         action="store_true",
         help="Ask the judge model to explicitly approximate and choose the lowest MSE.",
+    )
+    parser.add_argument(
+        "--early_stopping_mse", "--early-stopping-mse",
+        type=float,
+        default=0.18,
+        help="The MSE threshold for early stopping. If MSE is below this value for 3 consecutive rounds, the experiment stops (default: 0.18).",
     )
     parser.add_argument(
         "--output_dir", "--output-dir",
@@ -309,6 +327,7 @@ if __name__ == "__main__":
                 f"  Max past iterates: {args.max_past_iterates}\n"
                 f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
                 f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
+                f"  Early Stopping MSE: {args.early_stopping_mse}\n"
                 f"  Output Directory: {args.output_dir}")
 
     results = run_experiment(
@@ -319,6 +338,7 @@ if __name__ == "__main__":
         max_past_iterates=args.max_past_iterates,
         equation_option=args.equation_option,
         judge_approximate_mse=args.judge_approximate_mse,
+        early_stopping_mse=args.early_stopping_mse,
     )
 
     # Save results to results.json
