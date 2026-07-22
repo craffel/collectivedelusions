@@ -30,7 +30,26 @@ logger.addHandler(handler)
 api_key = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key) if api_key else None
 
-GENERATOR_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function (sin(pi*x/2) + 1)^(x + 1)^1.5.
+EQUATIONS = {
+    1: {
+        "text": "(sin(pi*x/2) + 1)^(x + 1)^1.5",
+        "func": lambda x: (np.sin(np.pi * x / 2) + 1) ** ((x + 1) ** 1.5)
+    },
+    2: {
+        "text": "exp((x + 1)^(3/2) ln(sin(pi*x/2) + 1))",
+        "func": lambda x: np.exp(((x + 1) ** 1.5) * np.log(np.sin(np.pi * x / 2) + 1))
+    },
+    3: {
+        "text": "(sin(pi*x/4) + cos(pi*x/4))^(2*(x + 1)^(3/2))",
+        "func": lambda x: (np.sin(np.pi * x / 4) + np.cos(np.pi * x / 4)) ** (2 * (x + 1) ** 1.5)
+    },
+    4: {
+        "text": "(2*cos^2(pi*(1 - x)/4))^((x + 1)*sqrt(x + 1))",
+        "func": lambda x: (2 * (np.cos(np.pi * (1 - x) / 4) ** 2)) ** ((x + 1) * np.sqrt(x + 1))
+    }
+}
+
+GENERATOR_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function {equation_text}.
 {past_iterates}
 Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose at this iteration."""
 
@@ -38,28 +57,27 @@ ITERATES_DESCRIPTION = """Below are the values found in past iterations.
 {past_iterates}
 Come up with a new set of values that improve upon past iterations."""
 
-JUDGE_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function (sin(pi*x/2) + 1)^(x + 1)^1.5.
+JUDGE_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function {equation_text}.
 Below are {n_guesses} possible values for m and b, provided as tuples.
 {guesses}
 Choose the pair of values that provide the best fit.
 Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose."""
 
 
-def approximate_mse(m: float, b: float) -> float:
+def approximate_mse(m: float, b: float, equation_option: int = 1) -> float:
     """
     Approximates the Mean Squared Error (MSE) between the linear function
-    y = mx + b and the target function y = (sin(pi*x/2) + 1)^((x + 1)^1.5)
-    over the interval [0, 1].
+    y = mx + b and the target function over the interval [0, 1].
 
     Parameters:
     m (float): The slope of the linear model.
     b (float): The y-intercept of the linear model.
+    equation_option (int): The equation option ID (1 to 4).
 
     Returns:
     float: The approximated MSE.
     """
-    def target_function(x):
-        return (np.sin(np.pi * x / 2) + 1) ** ((x + 1) ** 1.5)
+    target_function = EQUATIONS[equation_option]["func"]
 
     def squared_error(x):
         return (m * x + b - target_function(x)) ** 2
@@ -98,7 +116,7 @@ def wrapped_generate(client, model, prompt):
             time.sleep(1)
 
 
-def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all"):
+def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_guesses=10, max_past_iterates="all", equation_option: int = 1):
     global client
     if client is None:
         api_key = os.environ.get("GEMINI_API_KEY")
@@ -106,8 +124,11 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             raise ValueError("GEMINI_API_KEY environment variable must be set to run the experiment.")
         client = genai.Client(api_key=api_key)
 
-    logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE}\n")
-    logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE}\n")
+    equation_text = EQUATIONS[equation_option]["text"]
+    
+    # Log formatted templates once on startup
+    logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE.format(equation_text=equation_text, past_iterates='{past_iterates}')}\n")
+    logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}')}\n")
 
     iterates = []
     for i in range(n_steps):
@@ -121,6 +142,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
             visible_iterates = iterates[-max_past_iterates:] if max_past_iterates > 0 else []
 
         generator_prompt = GENERATOR_PROMPT_TEMPLATE.format(
+            equation_text=equation_text,
             past_iterates=(
                 ITERATES_DESCRIPTION.format(past_iterates="\n".join(str(t) for t in visible_iterates)) if visible_iterates else ""
             )
@@ -137,6 +159,7 @@ def run_experiment(generator_model: str, judge_model: str, n_steps: int=10, n_gu
         logger.info(f"Generated guesses for Round {i + 1}: {guesses}")
         
         judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+            equation_text=equation_text,
             n_guesses=n_guesses,
             guesses="\n".join(str(g) for g in guesses)
         )
@@ -195,6 +218,13 @@ if __name__ == "__main__":
         default="all",
         help="The maximum number of past iterates sent to the generator. Can be 'all' or a non-negative integer (default: 'all').",
     )
+    parser.add_argument(
+        "--equation_option", "--equation-option",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=1,
+        help="The mathematical equation option to optimize (1, 2, 3, or 4) (default: 1).",
+    )
 
     args = parser.parse_args()
 
@@ -203,7 +233,8 @@ if __name__ == "__main__":
                 f"  Judge Model: {args.judge_model}\n"
                 f"  Steps: {args.n_steps}\n"
                 f"  Guesses per step: {args.n_guesses}\n"
-                f"  Max past iterates: {args.max_past_iterates}")
+                f"  Max past iterates: {args.max_past_iterates}\n"
+                f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]['text']})")
 
     results = run_experiment(
         generator_model=args.generator_model,
@@ -211,13 +242,14 @@ if __name__ == "__main__":
         n_steps=args.n_steps,
         n_guesses=args.n_guesses,
         max_past_iterates=args.max_past_iterates,
+        equation_option=args.equation_option,
     )
 
     logger.info("Experiment complete. Optimization iterates:")
     for idx, iterate in enumerate(results):
         if iterate is not None:
             m, b = iterate
-            mse = approximate_mse(m, b)
+            mse = approximate_mse(m, b, equation_option=args.equation_option)
             logger.info(f"Step {idx + 1:02d}: m = {m:.6f}, b = {b:.6f} | Approx MSE = {mse:.6f}")
         else:
             logger.error(f"Step {idx + 1:02d}: Failed to extract values from model response.")

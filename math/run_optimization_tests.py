@@ -8,7 +8,8 @@
 # ///
 
 import unittest
-from run_optimization import extract_answer, parse_max_past_iterates
+import numpy as np
+from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -62,6 +63,16 @@ class TestParseMaxPastIterates(unittest.TestCase):
             parse_max_past_iterates("invalid")
         with self.assertRaises(ValueError):
             parse_max_past_iterates("3.5")
+
+
+class TestEquations(unittest.TestCase):
+    def test_equation_evaluation(self):
+        # Test x = 0.5 and x = 0.0 for all equations to make sure they evaluate without error
+        for opt_id, opt in EQUATIONS.items():
+            for x in [0.0, 0.5, 1.0]:
+                val = opt["func"](x)
+                self.assertTrue(isinstance(val, (float, np.float64, int, np.int64)))
+                self.assertFalse(np.isnan(val))
 
 
 if __name__ == "__main__":
