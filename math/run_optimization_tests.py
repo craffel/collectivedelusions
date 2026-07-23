@@ -8,8 +8,9 @@
 # ///
 
 import unittest
+from unittest.mock import MagicMock
 import numpy as np
-from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS, approximate_mse
+from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS, approximate_mse, fallback_extract_answer
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -77,6 +78,29 @@ class TestEquationsAndMSE(unittest.TestCase):
         mse = approximate_mse(1.0, 2.0)
         self.assertTrue(isinstance(mse, float))
         self.assertTrue(mse >= 0.0)
+
+
+class TestFallbackExtraction(unittest.TestCase):
+    def test_fallback_extract_answer_logic(self):
+        # Mock client
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+        
+        # Test case 1: fallback returns "NONE" (preventing hallucination)
+        mock_response.text = "NONE"
+        res = fallback_extract_answer(mock_client, "some input text")
+        self.assertIsNone(res)
+        
+        # Test case 2: fallback returns "none" in lowercase/whitespace
+        mock_response.text = "  none  \n"
+        res = fallback_extract_answer(mock_client, "some input text")
+        self.assertIsNone(res)
+        
+        # Test case 3: fallback returns valid boxed tuple
+        mock_response.text = "$\\boxed{(5.62, 0.65)}$"
+        res = fallback_extract_answer(mock_client, "some input text")
+        self.assertEqual(res, (5.62, 0.65))
 
 
 if __name__ == "__main__":

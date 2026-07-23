@@ -109,6 +109,25 @@ def wrapped_generate(client, model, prompt):
                 raise e
 
 
+def fallback_extract_answer(client, response_text: str) -> tuple[float, float] | None:
+    extraction_prompt = f"""Below is a model response choosing or generating a linear fit (m, b) from a list of options or calculations.
+Read the response and extract the chosen or generated pair as a tuple (m, b).
+
+Instructions:
+1. If the response contains a specific chosen or generated pair of values for m and b, output EXACTLY $\\boxed{{(m, b)}}$, replacing m and b with those exact values.
+2. If the response does NOT contain any clear, specific chosen or generated values for m and b, output EXACTLY the word 'NONE'. Do not guess or hallucinate any values.
+
+Model response:
+{response_text}"""
+    try:
+        # Use gemini-3.5-flash to extract the choice accurately
+        res = wrapped_generate(client, "gemini-3.5-flash", extraction_prompt)
+        return extract_answer(res.text)
+    except Exception as e:
+        logger.warning(f"Fallback extraction failed: {e}")
+        return None
+
+
 def run_experiment(
     generator_model: str,
     judge_model: str,
@@ -159,6 +178,9 @@ def run_experiment(
             while True:
                 response = wrapped_generate(client, generator_model, generator_prompt)
                 ans = extract_answer(response.text)
+                if ans is None:
+                    logger.info("Attempting fallback extraction for generator response...")
+                    ans = fallback_extract_answer(client, response.text)
                 if ans is not None:
                     guesses.append(ans)
                     break
@@ -177,6 +199,9 @@ def run_experiment(
             while True:
                 response = wrapped_generate(client, judge_model, judge_prompt)
                 chosen = extract_answer(response.text)
+                if chosen is None:
+                    logger.info("Attempting fallback extraction for judge response...")
+                    chosen = fallback_extract_answer(client, response.text)
                 if chosen is not None:
                     break
                 logger.warning("No match found in judge response. Retrying selection...")
