@@ -8,9 +8,9 @@
 # ///
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import numpy as np
-from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS, approximate_mse, fallback_extract_answer
+from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS, approximate_mse, fallback_extract_answer, run_experiment
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -101,6 +101,50 @@ class TestFallbackExtraction(unittest.TestCase):
         mock_response.text = "$\\boxed{(5.62, 0.65)}$"
         res = fallback_extract_answer(mock_client, "some input text")
         self.assertEqual(res, (5.62, 0.65))
+
+
+class TestResume(unittest.TestCase):
+    def test_resume_reconstruction(self):
+        # Create a mock initial_results dict with 2 completed rounds
+        mock_initial = {
+            "rounds": [
+                {
+                    "round": 1,
+                    "guesses": [{"m": 5.62, "b": 0.65}],
+                    "chosen": {"m": 5.62, "b": 0.65, "approx_mse": 0.15} # < 0.18
+                },
+                {
+                    "round": 2,
+                    "guesses": [{"m": 5.62, "b": 0.65}],
+                    "chosen": {"m": 5.62, "b": 0.65, "approx_mse": 0.12} # < 0.18
+                }
+            ]
+        }
+        
+        # Mock Client and models
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+        mock_response.text = "$\\boxed{(5.62, 0.65)}$"
+        
+        with patch('google.genai.Client', return_value=mock_client):
+            # Run experiment for 3 steps, resuming from 2 completed rounds.
+            # Round 3 should execute, and since its MSE will be < 0.18, 
+            # the consecutive_low_mse count will hit 3, triggering early stopping!
+            results = run_experiment(
+                generator_model="mock-gen",
+                judge_model="mock-judge",
+                n_steps=3,
+                n_guesses=1,
+                initial_results=mock_initial,
+                early_stopping_mse=0.18
+            )
+            
+            # Since Round 1 and Round 2 were already completed, and Round 3 completed
+            # and triggered early stopping immediately, rounds should have exactly 3 items.
+            self.assertEqual(len(results["rounds"]), 3)
+            self.assertEqual(results["rounds"][2]["round"], 3)
+            self.assertEqual(len(results["final_iterates"]), 3)
 
 
 if __name__ == "__main__":

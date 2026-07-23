@@ -136,7 +136,9 @@ def run_experiment(
     max_past_iterates: str | int = "all",
     equation_option: int = 1,
     judge_approximate_mse: bool = False,
-    early_stopping_mse: float = 0.18
+    early_stopping_mse: float = 0.18,
+    initial_results: dict = None,
+    output_dir: str = None
 ) -> dict:
     client = genai.Client()
 
@@ -158,7 +160,21 @@ def run_experiment(
     rounds_data = []
     consecutive_low_mse = 0
 
-    for i in range(n_steps):
+    if initial_results:
+        for r_data in initial_results.get("rounds", []):
+            rounds_data.append(r_data)
+            chosen_data = r_data["chosen"]
+            iterates.append((chosen_data["m"], chosen_data["b"]))
+            
+            # Recalculate consecutive low MSE so far from resumed history
+            if chosen_data.get("approx_mse", float("inf")) < early_stopping_mse:
+                consecutive_low_mse += 1
+            else:
+                consecutive_low_mse = 0
+
+    start_round = len(rounds_data)
+
+    for i in range(start_round, n_steps):
         logger.info(f"--- Round {i + 1} ---")
         guesses = []
         
@@ -228,20 +244,38 @@ def run_experiment(
         else:
             consecutive_low_mse = 0
 
+        # Progressively write results.json after each completed round
+        if output_dir:
+            progressive_results = {
+                "rounds": rounds_data,
+                "final_iterates": [
+                    {
+                        "step": r["round"],
+                        "m": r["chosen"]["m"],
+                        "b": r["chosen"]["b"],
+                        "approx_mse": r["chosen"]["approx_mse"]
+                    }
+                    for r in rounds_data
+                ]
+            }
+            results_path = os.path.join(output_dir, "results.json")
+            with open(results_path, "w") as f:
+                json.dump(progressive_results, f, indent=4)
+
         if consecutive_low_mse >= 3:
             logger.info(f"Early stopping triggered: attained MSE < {early_stopping_mse} for {consecutive_low_mse} consecutive rounds.")
             break
 
-    # Format final iterates data for JSON serialization
-    final_iterates_json = []
-    for idx, iterate in enumerate(iterates):
-        mse = approximate_mse(iterate[0], iterate[1])
-        final_iterates_json.append({
-            "step": idx + 1,
-            "m": iterate[0],
-            "b": iterate[1],
-            "approx_mse": mse
-        })
+    # Build final_iterates on the fly from rounds_data dynamically to ensure zero-duplication in memory
+    final_iterates_json = [
+        {
+            "step": r["round"],
+            "m": r["chosen"]["m"],
+            "b": r["chosen"]["b"],
+            "approx_mse": r["chosen"]["approx_mse"]
+        }
+        for r in rounds_data
+    ]
 
     return {
         "rounds": rounds_data,
@@ -330,12 +364,28 @@ if __name__ == "__main__":
         logger.error("Error: GEMINI_API_KEY environment variable is not set. Please set it before running the script.")
         sys.exit(1)
 
-    # Create output directory
+    # Check for existing partial results.json to support resuming
+    results_path = os.path.join(args.output_dir, "results.json")
+    initial_results = None
+    if os.path.exists(results_path):
+        try:
+            with open(results_path, "r") as f:
+                initial_results = json.load(f)
+            completed_rounds = len(initial_results.get("rounds", []))
+            if completed_rounds >= args.n_steps:
+                logger.info(f"Experiment in {args.output_dir} is already completed ({completed_rounds}/{args.n_steps} rounds). Exiting.")
+                sys.exit(0)
+            elif completed_rounds > 0:
+                logger.info(f"Resuming experiment in {args.output_dir} from round {completed_rounds + 1} ({completed_rounds}/{args.n_steps} rounds already completed).")
+        except Exception as e:
+            logger.warning(f"Could not parse existing results.json, starting from scratch. Error: {e}")
+
+    # Create output directory if starting fresh
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Configure isolated local logging FileHandler to save a transcript of the log by default
+    # Configure isolated local logging FileHandler to save/append a transcript of the log by default
     log_file_path = os.path.join(args.output_dir, "optimization.log")
-    file_handler = logging.FileHandler(log_file_path, mode="w")
+    file_handler = logging.FileHandler(log_file_path, mode="a") # Use append mode to preserve logs on resume
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(file_handler)
 
@@ -364,9 +414,11 @@ if __name__ == "__main__":
         equation_option=args.equation_option,
         judge_approximate_mse=args.judge_approximate_mse,
         early_stopping_mse=args.early_stopping_mse,
+        initial_results=initial_results,
+        output_dir=args.output_dir
     )
 
-    # Save results to results.json
+    # Save final results to results.json (completely validated and outputted)
     results_path = os.path.join(args.output_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=4)
