@@ -138,7 +138,9 @@ def run_experiment(
     judge_approximate_mse: bool = False,
     early_stopping_mse: float = 0.18,
     initial_results: dict = None,
-    output_dir: str = None
+    output_dir: str = None,
+    generator_show_mse: bool = False,
+    judge_show_mse: bool = False
 ) -> dict:
     client = genai.Client()
 
@@ -165,8 +167,10 @@ def run_experiment(
             rounds_data.append(r_data)
             chosen_data = r_data["chosen"]
             iterates.append((chosen_data["m"], chosen_data["b"]))
-            
-            # Recalculate consecutive low MSE so far from resumed history
+        
+        # Recalculate consecutive low MSE so far from resumed history
+        for r_data in rounds_data:
+            chosen_data = r_data["chosen"]
             if chosen_data.get("approx_mse", float("inf")) < early_stopping_mse:
                 consecutive_low_mse += 1
             else:
@@ -184,10 +188,19 @@ def run_experiment(
         else:
             visible_iterates = iterates[-max_past_iterates:] if max_past_iterates > 0 else []
 
+        # Formats the visible past iterates, conditionally appending their MSE
+        past_iterates_strings = []
+        for m_val, b_val in visible_iterates:
+            if generator_show_mse:
+                it_mse = approximate_mse(m_val, b_val)
+                past_iterates_strings.append(f"({m_val}, {b_val}) with MSE = {it_mse:.6f}")
+            else:
+                past_iterates_strings.append(f"({m_val}, {b_val})")
+
         generator_prompt = GENERATOR_PROMPT_TEMPLATE.format(
             equation_text=equation_text,
             past_iterates=(
-                ITERATES_DESCRIPTION.format(past_iterates="\n".join(str(t) for t in visible_iterates)) if visible_iterates else ""
+                ITERATES_DESCRIPTION.format(past_iterates="\n".join(past_iterates_strings)) if visible_iterates else ""
             )
         )
         for j in range(n_guesses):
@@ -205,11 +218,20 @@ def run_experiment(
         # Convert guesses list to JSON-serializable list
         round_guesses_json = [{"m": g[0], "b": g[1]} for g in guesses]
         
+        # Formats the proposed guesses, conditionally appending their MSE
+        guesses_strings = []
+        for g_val in guesses:
+            if judge_show_mse:
+                g_mse = approximate_mse(g_val[0], g_val[1])
+                guesses_strings.append(f"({g_val[0]}, {g_val[1]}) with MSE = {g_mse:.6f}")
+            else:
+                guesses_strings.append(f"({g_val[0]}, {g_val[1]})")
+
         if is_llm_judge:
             judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
                 equation_text=equation_text,
                 n_guesses=n_guesses,
-                guesses="\n".join(str(g) for g in guesses),
+                guesses="\n".join(guesses_strings),
                 judge_instruction=judge_instruction
             )
             while True:
@@ -351,6 +373,16 @@ if __name__ == "__main__":
         help="The MSE threshold for early stopping. If MSE is below this value for 3 consecutive rounds, the experiment stops (default: 0.18).",
     )
     parser.add_argument(
+        "--generator_show_mse", "--generator-show-mse",
+        action="store_true",
+        help="Provide the generator model with the MSE of every past iterate in its prompt.",
+    )
+    parser.add_argument(
+        "--judge_show_mse", "--judge-show-mse",
+        action="store_true",
+        help="Provide the judge model with the MSE of every proposed guess in its prompt.",
+    )
+    parser.add_argument(
         "--output_dir", "--output-dir",
         type=str,
         required=True,
@@ -403,6 +435,8 @@ if __name__ == "__main__":
                 f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
                 f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
                 f"  Early Stopping MSE: {args.early_stopping_mse}\n"
+                f"  Generator Show MSE: {args.generator_show_mse}\n"
+                f"  Judge Show MSE: {args.judge_show_mse}\n"
                 f"  Output Directory: {args.output_dir}")
 
     results = run_experiment(
@@ -415,7 +449,9 @@ if __name__ == "__main__":
         judge_approximate_mse=args.judge_approximate_mse,
         early_stopping_mse=args.early_stopping_mse,
         initial_results=initial_results,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        generator_show_mse=args.generator_show_mse,
+        judge_show_mse=args.judge_show_mse
     )
 
     # Save final results to results.json (completely validated and outputted)

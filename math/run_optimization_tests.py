@@ -147,5 +147,52 @@ class TestResume(unittest.TestCase):
             self.assertEqual(len(results["final_iterates"]), 3)
 
 
+class TestMSEPromptOptions(unittest.TestCase):
+    def test_generator_and_judge_prompt_formatting_with_mse(self):
+        # Verify generator and judge prompts can dynamically accept and show MSE
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+        mock_response.text = "$\\boxed{(5.62, 0.65)}$"
+        
+        mock_initial = {
+            "rounds": [
+                {
+                    "round": 1,
+                    "guesses": [{"m": 5.62, "b": 0.65}],
+                    "chosen": {"m": 5.62, "b": 0.65, "approx_mse": 0.15}
+                }
+            ]
+        }
+        
+        with patch('google.genai.Client', return_value=mock_client):
+            # Run experiment for 2 steps, resuming from 1 completed round
+            results = run_experiment(
+                generator_model="mock-gen",
+                judge_model="mock-judge",
+                n_steps=2,
+                n_guesses=1,
+                initial_results=mock_initial,
+                generator_show_mse=True,
+                judge_show_mse=True
+            )
+            
+            # Inspect mock calls to verify prompts contains the MSE string
+            calls = mock_client.models.generate_content.call_args_list
+            
+            # Find prompt text from calls list
+            prompts = [call[1]['contents'] for call in calls]
+            
+            # Generator prompt should contain: "with MSE = 0.150000" (reconstructed from initial round chosen)
+            generator_prompts = [p for p in prompts if "Below are the values found in past iterations." in p]
+            self.assertTrue(len(generator_prompts) >= 1)
+            self.assertTrue("with MSE =" in generator_prompts[0])
+            
+            # Judge prompt should contain: "with MSE = <value>" for proposed guess
+            judge_prompts = [p for p in prompts if "Below are 1 possible values" in p]
+            self.assertTrue(len(judge_prompts) >= 1)
+            self.assertTrue("with MSE =" in judge_prompts[0])
+
+
 if __name__ == "__main__":
     unittest.main()
