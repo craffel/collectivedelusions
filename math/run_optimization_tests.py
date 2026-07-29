@@ -10,7 +10,15 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
-from run_optimization import extract_answer, parse_max_past_iterates, EQUATIONS, approximate_mse, fallback_extract_answer, run_experiment
+from run_optimization import (
+    extract_answer,
+    parse_max_past_iterates,
+    EQUATIONS,
+    approximate_mse,
+    fallback_extract,
+    run_experiment,
+    TUPLE_EXTRACTION_PROMPT
+)
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -81,7 +89,7 @@ class TestEquationsAndMSE(unittest.TestCase):
 
 
 class TestFallbackExtraction(unittest.TestCase):
-    def test_fallback_extract_answer_logic(self):
+    def test_fallback_extract_logic(self):
         # Mock client
         mock_client = MagicMock()
         mock_response = MagicMock()
@@ -89,17 +97,17 @@ class TestFallbackExtraction(unittest.TestCase):
         
         # Test case 1: fallback returns "NONE" (preventing hallucination)
         mock_response.text = "NONE"
-        res = fallback_extract_answer(mock_client, "some input text")
+        res = fallback_extract(mock_client, "some input text", TUPLE_EXTRACTION_PROMPT, extract_answer)
         self.assertIsNone(res)
         
         # Test case 2: fallback returns "none" in lowercase/whitespace
         mock_response.text = "  none  \n"
-        res = fallback_extract_answer(mock_client, "some input text")
+        res = fallback_extract(mock_client, "some input text", TUPLE_EXTRACTION_PROMPT, extract_answer)
         self.assertIsNone(res)
         
         # Test case 3: fallback returns valid boxed tuple
         mock_response.text = "$\\boxed{(5.62, 0.65)}$"
-        res = fallback_extract_answer(mock_client, "some input text")
+        res = fallback_extract(mock_client, "some input text", TUPLE_EXTRACTION_PROMPT, extract_answer)
         self.assertEqual(res, (5.62, 0.65))
 
 

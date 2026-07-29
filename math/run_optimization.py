@@ -53,6 +53,23 @@ Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b 
 APPROXIMATE_MSE_PROMPT_TEMPLATE = r"""If the function {equation_text} is approximated by the line y = mx + b with m = {m} and b = {b} over the interval [0, 1], what is the mean squared error (MSE) of this approximation?
 Carefully derive an estimate of the MSE and provide your final approximated value in the format $\boxed{{val}}$, replacing val with your approximated MSE."""
 
+TUPLE_EXTRACTION_PROMPT = """Below is a model response choosing or generating a linear fit (m, b) from a list of options or calculations.
+Read the response and extract the chosen or generated pair as a tuple (m, b).
+
+Instructions:
+1. If the response contains a specific chosen or generated pair of values for m and b, output EXACTLY $\\boxed{{(m, b)}}$, replacing m and b with those exact values.
+2. If the response does NOT contain any clear, specific chosen or generated values for m and b, output EXACTLY the word 'NONE'. Do not guess or hallucinate any values.
+
+Model response:
+{response_text}"""
+
+SINGLE_EXTRACTION_PROMPT = """Below is a model response approximating the Mean Squared Error (MSE) of a line.
+Read the response and extract the final approximated value.
+Format the final response EXACTLY as $\\boxed{{val}}$, replacing val with the approximated value. If no approximation is present, output EXACTLY the word 'NONE'.
+
+Model response:
+{response_text}"""
+
 
 def approximate_mse(m: float, b: float) -> float:
     """
@@ -126,38 +143,43 @@ def wrapped_generate(client, model, prompt):
                 raise e
 
 
-def fallback_extract_answer(client, response_text: str) -> tuple[float, float] | None:
-    extraction_prompt = f"""Below is a model response choosing or generating a linear fit (m, b) from a list of options or calculations.
-Read the response and extract the chosen or generated pair as a tuple (m, b).
-
-Instructions:
-1. If the response contains a specific chosen or generated pair of values for m and b, output EXACTLY $\\boxed{{(m, b)}}$, replacing m and b with those exact values.
-2. If the response does NOT contain any clear, specific chosen or generated values for m and b, output EXACTLY the word 'NONE'. Do not guess or hallucinate any values.
-
-Model response:
-{response_text}"""
+def fallback_extract(client, response_text: str, prompt_template: str, parser):
+    extraction_prompt = prompt_template.format(response_text=response_text)
     try:
-        # Use gemini-3.5-flash to extract the choice accurately
         res = wrapped_generate(client, "gemini-3.5-flash", extraction_prompt)
-        return extract_answer(res.text)
+        return parser(res.text)
     except Exception as e:
         logger.warning(f"Fallback extraction failed: {e}")
         return None
 
 
-def fallback_extract_single_value(client, response_text: str) -> float | None:
-    extraction_prompt = f"""Below is a model response approximating the Mean Squared Error (MSE) of a line.
-Read the response and extract the final approximated value.
-Format the final response EXACTLY as $\\boxed{{val}}$, replacing val with the approximated value. If no approximation is present, output EXACTLY the word 'NONE'.
-
-Model response:
-{response_text}"""
-    try:
-        res = wrapped_generate(client, "gemini-3.5-flash", extraction_prompt)
-        return extract_single_value(res.text)
-    except Exception as e:
-        logger.warning(f"Fallback single value extraction failed: {e}")
-        return None
+def generate_and_parse_with_fallback(
+    client,
+    model: str,
+    prompt: str,
+    primary_parser,
+    fallback_parser=None,
+    label: str = "generation"
+):
+    """
+    Unified LLM prompting and extraction function.
+    Handles rate-limiting/API retries internally, primary regex extraction,
+    and optional LLM fallback extraction. If extraction completely fails,
+    it retries the full LLM invocation loop.
+    """
+    while True:
+        response = wrapped_generate(client, model, prompt)
+        ans = primary_parser(response.text)
+        if ans is not None:
+            return ans
+            
+        if fallback_parser:
+            logger.info(f"Attempting fallback extraction for {label} response...")
+            ans = fallback_parser(client, response.text)
+            if ans is not None:
+                return ans
+                
+        logger.warning(f"Failed to extract a valid answer for {label}. Retrying full generation...")
 
 
 def run_experiment(
@@ -220,6 +242,7 @@ def run_experiment(
                 d["mse"] = chosen_past["approx_mse"]
             visible_iterates_dicts.append(d)
 
+        # Format past iterates strings cleanly and dynamically
         past_iterates_strings = []
         for d in visible_iterates_dicts:
             if "mse" in d and d["mse"] is not None:
@@ -234,39 +257,40 @@ def run_experiment(
             )
         )
         for j in range(n_guesses):
-            while True:
-                response = wrapped_generate(client, generator_model, generator_prompt)
-                ans = extract_answer(response.text)
-                if ans is None:
-                    logger.info("Attempting fallback extraction for generator response...")
-                    ans = fallback_extract_answer(client, response.text)
-                if ans is not None:
-                    guess_entry = {"m": ans[0], "b": ans[1]}
-                    if generator_approximate_mse:
-                        logger.info(f"Prompting generator to approximate MSE for new guess ({ans[0]}, {ans[1]})...")
-                        prompt = APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=ans[0], b=ans[1])
-                        approx_resp = wrapped_generate(client, generator_model, prompt)
-                        approx_val = extract_single_value(approx_resp.text)
-                        if approx_val is None:
-                            logger.info("Attempting fallback extraction for generator MSE approximation response...")
-                            approx_val = fallback_extract_single_value(client, approx_resp.text)
-                        logger.info(f"Generator approximated MSE for guess ({ans[0]}, {ans[1]}) as: {approx_val}")
-                        guess_entry["approximated_mse_by_generator"] = approx_val
-                    guesses.append(guess_entry)
-                    break
-                logger.warning(f"No match found in generator response (guess {j + 1}/{n_guesses}). Retrying generation...")
+            ans = generate_and_parse_with_fallback(
+                client,
+                model=generator_model,
+                prompt=generator_prompt,
+                primary_parser=extract_answer,
+                fallback_parser=lambda c, r: fallback_extract(c, r, TUPLE_EXTRACTION_PROMPT, extract_answer),
+                label=f"generator guess {j + 1}/{n_guesses}"
+            )
+            
+            # Proactively approximate MSE for this generator guess as soon as it is generated
+            guess_entry = {"m": ans[0], "b": ans[1]}
+            if generator_approximate_mse:
+                approx_val = generate_and_parse_with_fallback(
+                    client,
+                    model=generator_model,
+                    prompt=APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=ans[0], b=ans[1]),
+                    primary_parser=extract_single_value,
+                    fallback_parser=lambda c, r: fallback_extract(c, r, SINGLE_EXTRACTION_PROMPT, extract_single_value),
+                    label=f"generator MSE approximation for guess ({ans[0]}, {ans[1]})"
+                )
+                guess_entry["approximated_mse_by_generator"] = approx_val
+            guesses.append(guess_entry)
 
         # Conditionally prompt the judge to approximate the MSE of each proposed guess
         if judge_approximate_mse and is_llm_judge:
             for d in guesses:
-                logger.info(f"Prompting judge to approximate MSE for proposed guess ({d['m']}, {d['b']})...")
-                prompt = APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=d["m"], b=d["b"])
-                response = wrapped_generate(client, judge_model, prompt)
-                approx_val = extract_single_value(response.text)
-                if approx_val is None:
-                    logger.info("Attempting fallback extraction for judge MSE approximation response...")
-                    approx_val = fallback_extract_single_value(client, response.text)
-                logger.info(f"Judge approximated MSE for proposed guess ({d['m']}, {d['b']}) as: {approx_val}")
+                approx_val = generate_and_parse_with_fallback(
+                    client,
+                    model=judge_model,
+                    prompt=APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=d["m"], b=d["b"]),
+                    primary_parser=extract_single_value,
+                    fallback_parser=lambda c, r: fallback_extract(c, r, SINGLE_EXTRACTION_PROMPT, extract_single_value),
+                    label=f"judge MSE approximation for proposed guess ({d['m']}, {d['b']})"
+                )
                 d["mse"] = approx_val
                 # Save approximated MSE under custom key inside guesses for results.json backwards compatibility
                 d["approximated_mse_by_judge"] = approx_val
@@ -288,15 +312,14 @@ def run_experiment(
                 n_guesses=n_guesses,
                 guesses="\n".join(guesses_strings)
             )
-            while True:
-                response = wrapped_generate(client, judge_model, judge_prompt)
-                chosen = extract_answer(response.text)
-                if chosen is None:
-                    logger.info("Attempting fallback extraction for judge response...")
-                    chosen = fallback_extract_answer(client, response.text)
-                if chosen is not None:
-                    break
-                logger.warning("No match found in judge response. Retrying selection...")
+            chosen = generate_and_parse_with_fallback(
+                client,
+                model=judge_model,
+                prompt=judge_prompt,
+                primary_parser=extract_answer,
+                fallback_parser=lambda c, r: fallback_extract(c, r, TUPLE_EXTRACTION_PROMPT, extract_answer),
+                label="judge final selection"
+            )
             
             # Find chosen guess dictionary directly
             chosen_dict = None
