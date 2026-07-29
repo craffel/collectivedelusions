@@ -35,6 +35,7 @@ EQUATIONS = {
 }
 
 GENERATOR_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function {equation_text}.
+Your goal is to minimize the mean squared error (MSE) of the linear approximation.
 {past_iterates}
 Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose at this iteration."""
 
@@ -43,10 +44,14 @@ ITERATES_DESCRIPTION = """Below are the values found in past iterations.
 Come up with a new set of values that improve upon past iterations."""
 
 JUDGE_PROMPT_TEMPLATE = r"""You are working to iteratively find a line of best fit (y = mx + b) over the interval [0, 1] for the function {equation_text}.
+Your goal is to minimize the mean squared error (MSE) of the linear approximation.
 Below are {n_guesses} possible values for m and b, provided as tuples.
 {guesses}
-{judge_instruction}
+Choose the pair of values that provide the best fit.
 Provide your final response in the format $\boxed{{(m, b)}}$, replacing m and b with the values you choose."""
+
+APPROXIMATE_MSE_PROMPT_TEMPLATE = r"""If the function {equation_text} is approximated by the line y = mx + b with m = {m} and b = {b} over the interval [0, 1], what is the mean squared error (MSE) of this approximation?
+Carefully derive an estimate of the MSE and provide your final approximated value in the format $\boxed{{val}}$, replacing val with your approximated MSE."""
 
 
 def approximate_mse(m: float, b: float) -> float:
@@ -90,6 +95,18 @@ def extract_answer(response: str) -> tuple[float, float] | None:
     return None
 
 
+def extract_single_value(response: str) -> float | None:
+    # Captures a single boxed float, supporting scientific notation and negative values
+    pattern = r"\\boxed\s*\{\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\}"
+    matches = re.findall(pattern, response)
+    if matches:
+        try:
+            return float(matches[-1])
+        except ValueError:
+            return None
+    return None
+
+
 def wrapped_generate(client, model, prompt):
     while True:
         try:
@@ -128,6 +145,21 @@ Model response:
         return None
 
 
+def fallback_extract_single_value(client, response_text: str) -> float | None:
+    extraction_prompt = f"""Below is a model response approximating the Mean Squared Error (MSE) of a line.
+Read the response and extract the final approximated value.
+Format the final response EXACTLY as $\\boxed{{val}}$, replacing val with the approximated value. If no approximation is present, output EXACTLY the word 'NONE'.
+
+Model response:
+{response_text}"""
+    try:
+        res = wrapped_generate(client, "gemini-3.5-flash", extraction_prompt)
+        return extract_single_value(res.text)
+    except Exception as e:
+        logger.warning(f"Fallback single value extraction failed: {e}")
+        return None
+
+
 def run_experiment(
     generator_model: str,
     judge_model: str,
@@ -135,38 +167,30 @@ def run_experiment(
     n_guesses: int = 10,
     max_past_iterates: str | int = "all",
     equation_option: int = 1,
-    judge_approximate_mse: bool = False,
     early_stopping_mse: float = 0.18,
     initial_results: dict = None,
     output_dir: str = None,
     generator_show_mse: bool = False,
-    judge_show_mse: bool = False
+    judge_show_mse: bool = False,
+    generator_approximate_mse: bool = False,
+    judge_approximate_mse: bool = False
 ) -> dict:
     client = genai.Client()
 
     equation_text = EQUATIONS[equation_option]
-    
-    if judge_approximate_mse:
-        judge_instruction = "Choose the pair of values that achieves the lowest mean-squared error. You should explicitly approximate the mean-squared error for each option."
-    else:
-        judge_instruction = "Choose the pair of values that provide the best fit."
 
     # Log formatted templates once on startup
     logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE.format(equation_text=equation_text, past_iterates='{past_iterates}')}\n")
     
     is_llm_judge = judge_model not in ["mse", "random"]
     if is_llm_judge:
-        logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}', judge_instruction=judge_instruction)}\n")
+        logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}')}\n")
 
-    iterates = []
     rounds_data = []
     consecutive_low_mse = 0
 
     if initial_results:
-        for r_data in initial_results.get("rounds", []):
-            rounds_data.append(r_data)
-            chosen_data = r_data["chosen"]
-            iterates.append((chosen_data["m"], chosen_data["b"]))
+        rounds_data = list(initial_results.get("rounds", []))
         
         # Recalculate consecutive low MSE so far from resumed history
         for r_data in rounds_data:
@@ -182,25 +206,31 @@ def run_experiment(
         logger.info(f"--- Round {i + 1} ---")
         guesses = []
         
-        # Slices the list of past iterates if configured
-        if max_past_iterates == "all":
-            visible_iterates = iterates
-        else:
-            visible_iterates = iterates[-max_past_iterates:] if max_past_iterates > 0 else []
+        # Slices the list of past completed rounds if configured
+        visible_rounds = rounds_data[-max_past_iterates:] if max_past_iterates != "all" and max_past_iterates > 0 else rounds_data[:i]
 
-        # Formats the visible past iterates, conditionally appending their MSE
+        # Represent visible past iterates as a list of dictionaries, reading directly from history!
+        visible_iterates_dicts = []
+        for r_past in visible_rounds:
+            chosen_past = r_past["chosen"]
+            d = {"m": chosen_past["m"], "b": chosen_past["b"]}
+            if generator_approximate_mse:
+                d["mse"] = chosen_past.get("approximated_mse_by_generator")
+            elif generator_show_mse:
+                d["mse"] = chosen_past["approx_mse"]
+            visible_iterates_dicts.append(d)
+
         past_iterates_strings = []
-        for m_val, b_val in visible_iterates:
-            if generator_show_mse:
-                it_mse = approximate_mse(m_val, b_val)
-                past_iterates_strings.append(f"({m_val}, {b_val}) with MSE = {it_mse:.6f}")
+        for d in visible_iterates_dicts:
+            if "mse" in d and d["mse"] is not None:
+                past_iterates_strings.append(f"({d['m']}, {d['b']}) with MSE = {d['mse']:.6f}")
             else:
-                past_iterates_strings.append(f"({m_val}, {b_val})")
+                past_iterates_strings.append(f"({d['m']}, {d['b']})")
 
         generator_prompt = GENERATOR_PROMPT_TEMPLATE.format(
             equation_text=equation_text,
             past_iterates=(
-                ITERATES_DESCRIPTION.format(past_iterates="\n".join(past_iterates_strings)) if visible_iterates else ""
+                ITERATES_DESCRIPTION.format(past_iterates="\n".join(past_iterates_strings)) if visible_rounds else ""
             )
         )
         for j in range(n_guesses):
@@ -211,28 +241,52 @@ def run_experiment(
                     logger.info("Attempting fallback extraction for generator response...")
                     ans = fallback_extract_answer(client, response.text)
                 if ans is not None:
-                    guesses.append(ans)
+                    guess_entry = {"m": ans[0], "b": ans[1]}
+                    if generator_approximate_mse:
+                        logger.info(f"Prompting generator to approximate MSE for new guess ({ans[0]}, {ans[1]})...")
+                        prompt = APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=ans[0], b=ans[1])
+                        approx_resp = wrapped_generate(client, generator_model, prompt)
+                        approx_val = extract_single_value(approx_resp.text)
+                        if approx_val is None:
+                            logger.info("Attempting fallback extraction for generator MSE approximation response...")
+                            approx_val = fallback_extract_single_value(client, approx_resp.text)
+                        logger.info(f"Generator approximated MSE for guess ({ans[0]}, {ans[1]}) as: {approx_val}")
+                        guess_entry["approximated_mse_by_generator"] = approx_val
+                    guesses.append(guess_entry)
                     break
                 logger.warning(f"No match found in generator response (guess {j + 1}/{n_guesses}). Retrying generation...")
-        
-        # Convert guesses list to JSON-serializable list
-        round_guesses_json = [{"m": g[0], "b": g[1]} for g in guesses]
-        
-        # Formats the proposed guesses, conditionally appending their MSE
+
+        # Conditionally prompt the judge to approximate the MSE of each proposed guess
+        if judge_approximate_mse and is_llm_judge:
+            for d in guesses:
+                logger.info(f"Prompting judge to approximate MSE for proposed guess ({d['m']}, {d['b']})...")
+                prompt = APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=d["m"], b=d["b"])
+                response = wrapped_generate(client, judge_model, prompt)
+                approx_val = extract_single_value(response.text)
+                if approx_val is None:
+                    logger.info("Attempting fallback extraction for judge MSE approximation response...")
+                    approx_val = fallback_extract_single_value(client, response.text)
+                logger.info(f"Judge approximated MSE for proposed guess ({d['m']}, {d['b']}) as: {approx_val}")
+                d["mse"] = approx_val
+                # Save approximated MSE under custom key inside guesses for results.json backwards compatibility
+                d["approximated_mse_by_judge"] = approx_val
+        elif judge_show_mse:
+            for d in guesses:
+                d["mse"] = approximate_mse(d["m"], d["b"])
+
+        # Format proposed guesses strings cleanly and dynamically
         guesses_strings = []
-        for g_val in guesses:
-            if judge_show_mse:
-                g_mse = approximate_mse(g_val[0], g_val[1])
-                guesses_strings.append(f"({g_val[0]}, {g_val[1]}) with MSE = {g_mse:.6f}")
+        for d in guesses:
+            if "mse" in d and d["mse"] is not None:
+                guesses_strings.append(f"({d['m']}, {d['b']}) with MSE = {d['mse']:.6f}")
             else:
-                guesses_strings.append(f"({g_val[0]}, {g_val[1]})")
+                guesses_strings.append(f"({d['m']}, {d['b']})")
 
         if is_llm_judge:
             judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
                 equation_text=equation_text,
                 n_guesses=n_guesses,
-                guesses="\n".join(guesses_strings),
-                judge_instruction=judge_instruction
+                guesses="\n".join(guesses_strings)
             )
             while True:
                 response = wrapped_generate(client, judge_model, judge_prompt)
@@ -243,21 +297,34 @@ def run_experiment(
                 if chosen is not None:
                     break
                 logger.warning("No match found in judge response. Retrying selection...")
+            
+            # Find chosen guess dictionary directly
+            chosen_dict = None
+            for d in guesses:
+                if (d["m"], d["b"]) == chosen:
+                    chosen_dict = dict(d)
+                    break
+            if chosen_dict is None:
+                chosen_dict = {"m": chosen[0], "b": chosen[1]}
         elif judge_model == "mse":
-            chosen = min(guesses, key=lambda g: approximate_mse(g[0], g[1]))
+            chosen_dict = dict(min(guesses, key=lambda g: approximate_mse(g["m"], g["b"])))
         elif judge_model == "random":
-            chosen = random.choice(guesses)
+            chosen_dict = dict(random.choice(guesses))
 
-        mse = approximate_mse(chosen[0], chosen[1])
-        chosen_json = {"m": chosen[0], "b": chosen[1], "approx_mse": mse}
+        mse = approximate_mse(chosen_dict["m"], chosen_dict["b"])
+        chosen_dict["approx_mse"] = mse
+        
+        # Remove temporary 'mse' key from the selection dict before round logging/saving
+        chosen_dict.pop("mse", None)
 
-        rounds_data.append({
+        round_record = {
             "round": i + 1,
-            "guesses": round_guesses_json,
-            "chosen": chosen_json
-        })
+            "guesses": guesses,
+            "chosen": chosen_dict
+        }
 
-        iterates.append(chosen)
+        rounds_data.append(round_record)
+
         logger.info(f"Round {i + 1} completed.")
 
         # Check early stopping condition
@@ -362,11 +429,6 @@ if __name__ == "__main__":
         help="The mathematical equation option to optimize (1, 2, 3, or 4) (default: 1).",
     )
     parser.add_argument(
-        "--judge_approximate_mse", "--judge-approximate-mse",
-        action="store_true",
-        help="Ask the judge model to explicitly approximate and choose the lowest MSE.",
-    )
-    parser.add_argument(
         "--early_stopping_mse", "--early-stopping-mse",
         type=float,
         default=0.18,
@@ -381,6 +443,16 @@ if __name__ == "__main__":
         "--judge_show_mse", "--judge-show-mse",
         action="store_true",
         help="Provide the judge model with the MSE of every proposed guess in its prompt.",
+    )
+    parser.add_argument(
+        "--generator_approximate_mse", "--generator-approximate-mse",
+        action="store_true",
+        help="Ask the generator model to independently approximate the MSE of past iterates.",
+    )
+    parser.add_argument(
+        "--judge_approximate_mse", "--judge-approximate-mse",
+        action="store_true",
+        help="Ask the judge model to independently approximate the MSE of proposed guesses.",
     )
     parser.add_argument(
         "--output_dir", "--output-dir",
@@ -433,10 +505,11 @@ if __name__ == "__main__":
                 f"  Guesses per step: {args.n_guesses}\n"
                 f"  Max past iterates: {args.max_past_iterates}\n"
                 f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
-                f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
                 f"  Early Stopping MSE: {args.early_stopping_mse}\n"
                 f"  Generator Show MSE: {args.generator_show_mse}\n"
                 f"  Judge Show MSE: {args.judge_show_mse}\n"
+                f"  Generator Approx MSE: {args.generator_approximate_mse}\n"
+                f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
                 f"  Output Directory: {args.output_dir}")
 
     results = run_experiment(
@@ -446,12 +519,13 @@ if __name__ == "__main__":
         n_guesses=args.n_guesses,
         max_past_iterates=args.max_past_iterates,
         equation_option=args.equation_option,
-        judge_approximate_mse=args.judge_approximate_mse,
         early_stopping_mse=args.early_stopping_mse,
         initial_results=initial_results,
         output_dir=args.output_dir,
         generator_show_mse=args.generator_show_mse,
-        judge_show_mse=args.judge_show_mse
+        judge_show_mse=args.judge_show_mse,
+        generator_approximate_mse=args.generator_approximate_mse,
+        judge_approximate_mse=args.judge_approximate_mse
     )
 
     # Save final results to results.json (completely validated and outputted)

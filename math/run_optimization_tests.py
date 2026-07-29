@@ -194,5 +194,72 @@ class TestMSEPromptOptions(unittest.TestCase):
             self.assertTrue("with MSE =" in judge_prompts[0])
 
 
+class TestMSEApproximations(unittest.TestCase):
+    def test_generator_and_judge_mse_approximations(self):
+        # Verify generator and judge MSE approximations are triggered and correctly recorded in results
+        mock_client = MagicMock()
+        
+        mock_initial = {
+            "rounds": [
+                {
+                    "round": 1,
+                    "guesses": [{"m": 5.62, "b": 0.65}],
+                    "chosen": {
+                        "m": 5.62,
+                        "b": 0.65,
+                        "approx_mse": 0.15,
+                        "approximated_mse_by_generator": 0.150000
+                    }
+                }
+            ]
+        }
+        
+        with patch('google.genai.Client', return_value=mock_client):
+            mock_resp_approx = MagicMock(text="$\\boxed{0.125}$")
+            mock_resp_tuple = MagicMock(text="$\\boxed{(5.62, 0.65)}$")
+            
+            # Sequenced side effect for mock calls matching proactive guess approximation flow:
+            mock_client.models.generate_content.side_effect = [
+                mock_resp_tuple,  # Generator guess generation
+                mock_resp_approx, # Generator approximation of the newly generated guess
+                mock_resp_approx, # Judge approximation of the proposed guess
+                mock_resp_tuple   # Judge selection
+            ]
+            
+            results = run_experiment(
+                generator_model="mock-gen",
+                judge_model="mock-judge",
+                n_steps=2,
+                n_guesses=1,
+                initial_results=mock_initial,
+                generator_approximate_mse=True,
+                judge_approximate_mse=True
+            )
+            
+            # Assertions to verify that approximated values are saved inside results!
+            round_2 = results["rounds"][1]
+            
+            # Judge approximation for the single guess in Round 2 should be parsed and saved
+            self.assertEqual(round_2["guesses"][0]["approximated_mse_by_judge"], 0.125)
+            
+            # Generator approximation for the past iterate in Round 2 should be parsed and saved
+            self.assertEqual(round_2["guesses"][0]["approximated_mse_by_generator"], 0.125)
+            
+            # Verify that the subsequent prompts contains the LLM-approximated MSE values!
+            calls = mock_client.models.generate_content.call_args_list
+            prompts = [call[1]['contents'] for call in calls]
+            
+            # Find generator and judge prompts
+            generator_prompts = [p for p in prompts if "Below are the values found in past iterations." in p]
+            self.assertTrue(len(generator_prompts) >= 1)
+            # Generator prompt should contain the loaded previous round's generator approximation: "with MSE = 0.150000"
+            self.assertTrue("with MSE = 0.150000" in generator_prompts[0])
+            
+            judge_prompts = [p for p in prompts if "Below are 1 possible values" in p]
+            self.assertTrue(len(judge_prompts) >= 1)
+            # Judge prompt should contain the current round's judge approximation: "with MSE = 0.125000"
+            self.assertTrue("with MSE = 0.125000" in judge_prompts[0])
+
+
 if __name__ == "__main__":
     unittest.main()
