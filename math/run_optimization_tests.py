@@ -305,6 +305,12 @@ class TestOpenRouterIntegration(unittest.TestCase):
 
 
 class TestGoogleClient(unittest.TestCase):
+    def setUp(self):
+        # Patch random.randint to return 0 to make retry delays deterministic (1s)
+        self.randint_patcher = patch('run_optimization.random.randint', return_value=0)
+        self.randint_patcher.start()
+        self.addCleanup(self.randint_patcher.stop)
+
     @patch('run_optimization.genai.Client')
     def test_init(self, mock_genai_client_class):
         mock_client = MagicMock()
@@ -418,8 +424,43 @@ class TestGoogleClient(unittest.TestCase):
         self.assertEqual(mock_client.models.generate_content.call_count, 2)
         mock_sleep.assert_called_once_with(1)
 
+    @patch('run_optimization.genai.Client')
+    def test_generate_jitter_behavior(self, mock_genai_client_class):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Success"
+        
+        # Temporarily stop the setUp patcher so we can test actual randint patching
+        self.randint_patcher.stop()
+        
+        try:
+            with patch('run_optimization.random.randint') as mock_randint, \
+                 patch('time.sleep') as mock_sleep:
+                mock_randint.return_value = 1
+                mock_client.models.generate_content.side_effect = [
+                    httpx.HTTPError("Error"),
+                    mock_response
+                ]
+                mock_genai_client_class.return_value = mock_client
+                client = GoogleClient("gemini-3.5-flash")
+                client.generate("test prompt")
+                
+                # Assert random.randint was called with (-1, 1)
+                mock_randint.assert_called_once_with(-1, 1)
+                # Delay is 1 + jitter (1) = 2
+                mock_sleep.assert_called_once_with(2)
+        finally:
+            # Re-start setUp patcher to clean up
+            self.randint_patcher.start()
+
 
 class TestOpenRouterClient(unittest.TestCase):
+    def setUp(self):
+        # Patch random.randint to return 0 to make retry delays deterministic (1s)
+        self.randint_patcher = patch('run_optimization.random.randint', return_value=0)
+        self.randint_patcher.start()
+        self.addCleanup(self.randint_patcher.stop)
+
     @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
     @patch('openrouter.OpenRouter')
     def test_init(self, mock_openrouter_client_class):

@@ -64,19 +64,25 @@ class GoogleClient:
                 )
                 return res.text
             except genai.errors.ServerError:
-                logger.warning(f"Google GenAI Server Error encountered. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                half_delay = max(1, delay // 2)
+                sleep_time = max(1, delay + random.randint(-half_delay, half_delay))
+                logger.warning(f"Google GenAI Server Error encountered. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
                 delay += 1
             except httpx.HTTPError as e:
                 status = getattr(e, "status_code", e.__class__.__name__)
-                logger.warning(f"Google GenAI Network Error ({status}) encountered. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                half_delay = max(1, delay // 2)
+                sleep_time = max(1, delay + random.randint(-half_delay, half_delay))
+                logger.warning(f"Google GenAI Network Error ({status}) encountered. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
                 delay += 1
             except genai.errors.APIError as e:
                 # Code 429 indicates rate-limiting (Resource Exhausted)
                 if e.code == 429:
-                    logger.warning(f"Google GenAI Rate limit reached (429). Retrying in {delay} seconds...")
-                    time.sleep(delay)
+                    half_delay = max(1, delay // 2)
+                    sleep_time = max(1, delay + random.randint(-half_delay, half_delay))
+                    logger.warning(f"Google GenAI Rate limit reached (429). Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
                     delay += 1
                 else:
                     raise e
@@ -110,8 +116,10 @@ class OpenRouterClient:
                 httpx.HTTPError,
             ) as e:
                 status = getattr(e, "status_code", e.__class__.__name__)
-                logger.warning(f"OpenRouter Error ({status}) encountered. Retrying in {delay} seconds...")
-                time.sleep(delay)
+                half_delay = max(1, delay // 2)
+                sleep_time = max(1, delay + random.randint(-half_delay, half_delay))
+                logger.warning(f"OpenRouter Error ({status}) encountered. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
                 delay += 1
             except openrouter.errors.OpenRouterError as e:
                 logger.warning(f"OpenRouter API error: {e.message}")
