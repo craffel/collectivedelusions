@@ -397,6 +397,27 @@ class TestGoogleClient(unittest.TestCase):
         with self.assertRaises(errors.APIError):
             client.generate("test prompt")
 
+    @patch('time.sleep')
+    @patch('run_optimization.genai.Client')
+    def test_generate_httpx_http_error_retry(self, mock_genai_client_class, mock_sleep):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hello after httpx error"
+        
+        # Raise httpx.HTTPError, then return successful response
+        mock_client.models.generate_content.side_effect = [
+            httpx.HTTPError("Network failure"),
+            mock_response
+        ]
+        mock_genai_client_class.return_value = mock_client
+        
+        client = GoogleClient("gemini-3.5-flash")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after httpx error")
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
 
 class TestOpenRouterClient(unittest.TestCase):
     @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})

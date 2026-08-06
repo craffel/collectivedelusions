@@ -67,6 +67,11 @@ class GoogleClient:
                 logger.warning(f"Google GenAI Server Error encountered. Retrying in {delay} seconds...")
                 time.sleep(delay)
                 delay += 1
+            except httpx.HTTPError as e:
+                status = getattr(e, "status_code", e.__class__.__name__)
+                logger.warning(f"Google GenAI Network Error ({status}) encountered. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay += 1
             except genai.errors.APIError as e:
                 # Code 429 indicates rate-limiting (Resource Exhausted)
                 if e.code == 429:
