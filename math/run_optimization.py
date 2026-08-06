@@ -17,6 +17,7 @@ import sys
 import time
 import json
 import httpx
+import concurrent.futures
 
 from google import genai
 import openrouter
@@ -371,7 +372,9 @@ def run_experiment(
                 ITERATES_DESCRIPTION.format(past_iterates="\n".join(past_iterates_strings)) if visible_rounds else ""
             )
         )
-        for j in range(n_guesses):
+        
+        # Define helper for parallel guess generation
+        def generate_single_guess(j):
             ans = generate_and_parse_with_fallback(
                 generator_client,
                 prompt=generator_prompt,
@@ -393,11 +396,16 @@ def run_experiment(
                     label=f"generator MSE approximation for guess ({ans[0]}, {ans[1]})"
                 )
                 guess_entry["approximated_mse_by_generator"] = approx_val
-            guesses.append(guess_entry)
+            return guess_entry
+
+        # Run generator calls concurrently
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_guesses) as executor:
+            futures = [executor.submit(generate_single_guess, j) for j in range(n_guesses)]
+            guesses = [fut.result() for fut in futures]
 
         # Conditionally prompt the judge to approximate the MSE of each proposed guess
         if judge_approximate_mse and is_llm_judge:
-            for d in guesses:
+            def approximate_single_judge_mse(d):
                 approx_val = generate_and_parse_with_fallback(
                     judge_client,
                     prompt=APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=d["m"], b=d["b"]),
@@ -406,9 +414,15 @@ def run_experiment(
                     fallback_prompt_template=SINGLE_EXTRACTION_PROMPT,
                     label=f"judge MSE approximation for proposed guess ({d['m']}, {d['b']})"
                 )
-                d["mse"] = approx_val
-                # Save approximated MSE under custom key inside guesses for results.json backwards compatibility
-                d["approximated_mse_by_judge"] = approx_val
+                return approx_val
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_guesses) as executor:
+                futures = [executor.submit(approximate_single_judge_mse, d) for d in guesses]
+                results = [fut.result() for fut in futures]
+                for d, approx_val in zip(guesses, results):
+                    d["mse"] = approx_val
+                    # Save approximated MSE under custom key inside guesses for results.json backwards compatibility
+                    d["approximated_mse_by_judge"] = approx_val
         elif judge_show_mse:
             for d in guesses:
                 d["mse"] = approximate_mse(d["m"], d["b"])
