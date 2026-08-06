@@ -4,6 +4,8 @@
 #   "google-genai",
 #   "numpy",
 #   "scipy",
+#   "openrouter",
+#   "httpx",
 # ]
 # ///
 
@@ -13,8 +15,12 @@ import random
 import re
 import sys
 import time
+import json
+import httpx
 
 from google import genai
+import openrouter
+import openrouter.errors
 import numpy as np
 import scipy.integrate
 
@@ -26,6 +32,99 @@ logger.propagate = False
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(handler)
+
+
+def parse_provider_and_model(model_str: str) -> tuple[str, str]:
+    if model_str in ["mse", "random"]:
+        return "", model_str
+    if "/" in model_str:
+        provider, model_name = model_str.split("/", 1)
+        if provider not in ["google", "openrouter"]:
+            raise ValueError(f"Invalid API provider: '{provider}'. Must be 'google' or 'openrouter'.")
+        return provider, model_name
+    else:
+        raise ValueError(
+            f"Invalid model name '{model_str}'. Model name must be preceded by an API provider prefix and a slash, "
+            f"e.g., 'google/gemini-2.5-flash' or 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free'."
+        )
+
+
+class GoogleClient:
+    def __init__(self, model_name: str, client: genai.Client = None):
+        self.client = client if client is not None else genai.Client()
+        self.model_name = model_name
+
+    def generate(self, prompt: str) -> str:
+        delay = 1
+        while True:
+            try:
+                res = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                )
+                return res.text
+            except genai.errors.ServerError:
+                logger.warning(f"Google GenAI Server Error encountered. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay += 1
+            except genai.errors.APIError as e:
+                # Code 429 indicates rate-limiting (Resource Exhausted)
+                if e.code == 429:
+                    logger.warning(f"Google GenAI Rate limit reached (429). Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    delay += 1
+                else:
+                    raise e
+
+
+class OpenRouterClient:
+    def __init__(self, model_name: str, client: openrouter.OpenRouter = None):
+        self.model_name = model_name
+        self.api_key = os.environ["OPENROUTER_API_KEY"]
+        self.client = client if client is not None else openrouter.OpenRouter(api_key=self.api_key)
+
+    def generate(self, prompt: str) -> str:
+        delay = 1
+        while True:
+            try:
+                res = self.client.chat.send(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    provider={
+                        "max_price": {"prompt": 0, "completion": 0}
+                    }
+                )
+                return res.choices[0].message.content
+            except (
+                openrouter.errors.TooManyRequestsResponseError,
+                openrouter.errors.InternalServerResponseError,
+                openrouter.errors.BadGatewayResponseError,
+                openrouter.errors.ServiceUnavailableResponseError,
+                openrouter.errors.ProviderOverloadedResponseError,
+                openrouter.errors.ResponseValidationError,
+                httpx.HTTPError,
+            ) as e:
+                status = getattr(e, "status_code", e.__class__.__name__)
+                logger.warning(f"OpenRouter Error ({status}) encountered. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay += 1
+            except openrouter.errors.OpenRouterError as e:
+                logger.warning(f"OpenRouter API error: {e.message}")
+                raise e
+
+
+def create_client(model_str: str, google_sdk_client: genai.Client = None, openrouter_sdk_client: openrouter.OpenRouter = None):
+    """
+    Factory function to instantiate GoogleClient or OpenRouterClient based on the model prefix.
+    """
+    provider, model_name = parse_provider_and_model(model_str)
+    if provider == "google":
+        return GoogleClient(model_name, client=google_sdk_client)
+    elif provider == "openrouter":
+        return OpenRouterClient(model_name, client=openrouter_sdk_client)
+    else:
+        return None
+
 
 EQUATIONS = {
     1: "(sin(pi*x/2) + 1)^(x + 1)^1.5",
@@ -93,6 +192,8 @@ def approximate_mse(m: float, b: float) -> float:
 
 
 def extract_answer(response: str) -> tuple[float, float] | None:
+    if response is None:
+        return None
     # Captures:
     # - Optional negative/positive signs (- or +)
     # - Integers and floats (including leading dot floats like -.5)
@@ -113,6 +214,8 @@ def extract_answer(response: str) -> tuple[float, float] | None:
 
 
 def extract_single_value(response: str) -> float | None:
+    if response is None:
+        return None
     # Captures a single boxed float, supporting scientific notation and negative values
     pattern = r"\\boxed\s*\{\s*(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\}"
     matches = re.findall(pattern, response)
@@ -124,30 +227,16 @@ def extract_single_value(response: str) -> float | None:
     return None
 
 
-def wrapped_generate(client, model, prompt):
-    while True:
-        try:
-            return client.models.generate_content(
-                model=model,
-                contents=prompt,
-            )
-        except genai.errors.ServerError:
-            logger.warning("Google GenAI Server Error encountered. Retrying in 1 second...")
-            time.sleep(1)
-        except genai.errors.APIError as e:
-            # Code 429 indicates rate-limiting (Resource Exhausted)
-            if e.code == 429:
-                logger.warning("Google GenAI Rate limit reached (429). Retrying in 5 seconds...")
-                time.sleep(5)
-            else:
-                raise e
-
-
-def fallback_extract(client, response_text: str, prompt_template: str, parser):
+def fallback_extract(response_text: str, prompt_template: str, parser, fallback_client: GoogleClient):
+    """
+    Uses gemini-3.5-flash as a cheap, robust fallback parser if the primary regex extraction failed.
+    """
+    if response_text is None:
+        return None
     extraction_prompt = prompt_template.format(response_text=response_text)
     try:
-        res = wrapped_generate(client, "gemini-3.5-flash", extraction_prompt)
-        return parser(res.text)
+        res_text = fallback_client.generate(extraction_prompt)
+        return parser(res_text)
     except Exception as e:
         logger.warning(f"Fallback extraction failed: {e}")
         return None
@@ -155,10 +244,10 @@ def fallback_extract(client, response_text: str, prompt_template: str, parser):
 
 def generate_and_parse_with_fallback(
     client,
-    model: str,
     prompt: str,
     primary_parser,
-    fallback_parser=None,
+    fallback_client: GoogleClient = None,
+    fallback_prompt_template: str = None,
     label: str = "generation"
 ):
     """
@@ -168,14 +257,18 @@ def generate_and_parse_with_fallback(
     it retries the full LLM invocation loop.
     """
     while True:
-        response = wrapped_generate(client, model, prompt)
-        ans = primary_parser(response.text)
+        response_text = client.generate(prompt)
+        if response_text is None:
+            logger.warning(f"Generation returned None for {label}. Retrying full generation...")
+            continue
+            
+        ans = primary_parser(response_text)
         if ans is not None:
             return ans
             
-        if fallback_parser:
+        if fallback_client is not None and fallback_prompt_template is not None:
             logger.info(f"Attempting fallback extraction for {label} response...")
-            ans = fallback_parser(client, response.text)
+            ans = fallback_extract(response_text, fallback_prompt_template, primary_parser, fallback_client)
             if ans is not None:
                 return ans
                 
@@ -197,14 +290,23 @@ def run_experiment(
     generator_approximate_mse: bool = False,
     judge_approximate_mse: bool = False
 ) -> dict:
-    client = genai.Client()
+    # Instantiate exactly one underlying SDK client for Google and OpenRouter to share across wrappers
+    shared_google_sdk_client = genai.Client()
+    shared_openrouter_sdk_client = openrouter.OpenRouter()
+
+    generator_client = create_client(generator_model, shared_google_sdk_client, shared_openrouter_sdk_client)
+    judge_client = create_client(judge_model, shared_google_sdk_client, shared_openrouter_sdk_client)
+
+    is_llm_judge = judge_client is not None
+
+    # Instantiate exactly one fallback client for the entire experiment run
+    fallback_client = GoogleClient("gemini-3.5-flash", client=shared_google_sdk_client)
 
     equation_text = EQUATIONS[equation_option]
 
     # Log formatted templates once on startup
     logger.info(f"Generator Prompt Template:\n{GENERATOR_PROMPT_TEMPLATE.format(equation_text=equation_text, past_iterates='{past_iterates}')}\n")
     
-    is_llm_judge = judge_model not in ["mse", "random"]
     if is_llm_judge:
         logger.info(f"Judge Prompt Template:\n{JUDGE_PROMPT_TEMPLATE.format(equation_text=equation_text, n_guesses='{n_guesses}', guesses='{guesses}')}\n")
 
@@ -258,11 +360,11 @@ def run_experiment(
         )
         for j in range(n_guesses):
             ans = generate_and_parse_with_fallback(
-                client,
-                model=generator_model,
+                generator_client,
                 prompt=generator_prompt,
                 primary_parser=extract_answer,
-                fallback_parser=lambda c, r: fallback_extract(c, r, TUPLE_EXTRACTION_PROMPT, extract_answer),
+                fallback_client=fallback_client,
+                fallback_prompt_template=TUPLE_EXTRACTION_PROMPT,
                 label=f"generator guess {j + 1}/{n_guesses}"
             )
             
@@ -270,11 +372,11 @@ def run_experiment(
             guess_entry = {"m": ans[0], "b": ans[1]}
             if generator_approximate_mse:
                 approx_val = generate_and_parse_with_fallback(
-                    client,
-                    model=generator_model,
+                    generator_client,
                     prompt=APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=ans[0], b=ans[1]),
                     primary_parser=extract_single_value,
-                    fallback_parser=lambda c, r: fallback_extract(c, r, SINGLE_EXTRACTION_PROMPT, extract_single_value),
+                    fallback_client=fallback_client,
+                    fallback_prompt_template=SINGLE_EXTRACTION_PROMPT,
                     label=f"generator MSE approximation for guess ({ans[0]}, {ans[1]})"
                 )
                 guess_entry["approximated_mse_by_generator"] = approx_val
@@ -284,11 +386,11 @@ def run_experiment(
         if judge_approximate_mse and is_llm_judge:
             for d in guesses:
                 approx_val = generate_and_parse_with_fallback(
-                    client,
-                    model=judge_model,
+                    judge_client,
                     prompt=APPROXIMATE_MSE_PROMPT_TEMPLATE.format(equation_text=equation_text, m=d["m"], b=d["b"]),
                     primary_parser=extract_single_value,
-                    fallback_parser=lambda c, r: fallback_extract(c, r, SINGLE_EXTRACTION_PROMPT, extract_single_value),
+                    fallback_client=fallback_client,
+                    fallback_prompt_template=SINGLE_EXTRACTION_PROMPT,
                     label=f"judge MSE approximation for proposed guess ({d['m']}, {d['b']})"
                 )
                 d["mse"] = approx_val
@@ -313,11 +415,11 @@ def run_experiment(
                 guesses="\n".join(guesses_strings)
             )
             chosen = generate_and_parse_with_fallback(
-                client,
-                model=judge_model,
+                judge_client,
                 prompt=judge_prompt,
                 primary_parser=extract_answer,
-                fallback_parser=lambda c, r: fallback_extract(c, r, TUPLE_EXTRACTION_PROMPT, extract_answer),
+                fallback_client=fallback_client,
+                fallback_prompt_template=TUPLE_EXTRACTION_PROMPT,
                 label="judge final selection"
             )
             
@@ -486,10 +588,18 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Fail fast if GEMINI_API_KEY is not set
+    # Fail fast if required API keys are not set
     if "GEMINI_API_KEY" not in os.environ:
         logger.error("Error: GEMINI_API_KEY environment variable is not set. Please set it before running the script.")
         sys.exit(1)
+
+    generator_provider, _ = parse_provider_and_model(args.generator_model)
+    judge_provider, _ = parse_provider_and_model(args.judge_model)
+
+    if generator_provider == "openrouter" or judge_provider == "openrouter":
+        if "OPENROUTER_API_KEY" not in os.environ:
+            logger.error("Error: OPENROUTER_API_KEY environment variable is not set. Please set it before running the script with OpenRouter models.")
+            sys.exit(1)
 
     # Check for existing partial results.json to support resuming
     results_path = os.path.join(args.output_dir, "results.json")

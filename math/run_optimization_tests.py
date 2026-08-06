@@ -4,12 +4,17 @@
 #   "google-genai",
 #   "numpy",
 #   "scipy",
+#   "openrouter",
+#   "httpx",
 # ]
 # ///
 
 import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
+import openrouter
+import openrouter.errors
+import httpx
 from run_optimization import (
     extract_answer,
     parse_max_past_iterates,
@@ -17,11 +22,14 @@ from run_optimization import (
     approximate_mse,
     fallback_extract,
     run_experiment,
-    TUPLE_EXTRACTION_PROMPT
+    TUPLE_EXTRACTION_PROMPT,
+    GoogleClient,
+    OpenRouterClient
 )
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
+        self.assertIsNone(extract_answer(None))
         self.assertEqual(extract_answer(r"$\boxed{(1.5, 2.0)}$"), (1.5, 2.0))
         self.assertEqual(extract_answer(r"\boxed{(1.5, 2.0)}"), (1.5, 2.0))
 
@@ -95,19 +103,21 @@ class TestFallbackExtraction(unittest.TestCase):
         mock_response = MagicMock()
         mock_client.models.generate_content.return_value = mock_response
         
+        fallback_client = GoogleClient("gemini-3.5-flash", client=mock_client)
+        
         # Test case 1: fallback returns "NONE" (preventing hallucination)
         mock_response.text = "NONE"
-        res = fallback_extract(mock_client, "some input text", TUPLE_EXTRACTION_PROMPT, extract_answer)
+        res = fallback_extract("some input text", TUPLE_EXTRACTION_PROMPT, extract_answer, fallback_client)
         self.assertIsNone(res)
         
         # Test case 2: fallback returns "none" in lowercase/whitespace
         mock_response.text = "  none  \n"
-        res = fallback_extract(mock_client, "some input text", TUPLE_EXTRACTION_PROMPT, extract_answer)
+        res = fallback_extract("some input text", TUPLE_EXTRACTION_PROMPT, extract_answer, fallback_client)
         self.assertIsNone(res)
         
         # Test case 3: fallback returns valid boxed tuple
         mock_response.text = "$\\boxed{(5.62, 0.65)}$"
-        res = fallback_extract(mock_client, "some input text", TUPLE_EXTRACTION_PROMPT, extract_answer)
+        res = fallback_extract("some input text", TUPLE_EXTRACTION_PROMPT, extract_answer, fallback_client)
         self.assertEqual(res, (5.62, 0.65))
 
 
@@ -140,8 +150,8 @@ class TestResume(unittest.TestCase):
             # Round 3 should execute, and since its MSE will be < 0.18, 
             # the consecutive_low_mse count will hit 3, triggering early stopping!
             results = run_experiment(
-                generator_model="mock-gen",
-                judge_model="mock-judge",
+                generator_model="google/mock-gen",
+                judge_model="google/mock-judge",
                 n_steps=3,
                 n_guesses=1,
                 initial_results=mock_initial,
@@ -176,8 +186,8 @@ class TestMSEPromptOptions(unittest.TestCase):
         with patch('google.genai.Client', return_value=mock_client):
             # Run experiment for 2 steps, resuming from 1 completed round
             results = run_experiment(
-                generator_model="mock-gen",
-                judge_model="mock-judge",
+                generator_model="google/mock-gen",
+                judge_model="google/mock-judge",
                 n_steps=2,
                 n_guesses=1,
                 initial_results=mock_initial,
@@ -235,8 +245,8 @@ class TestMSEApproximations(unittest.TestCase):
             ]
             
             results = run_experiment(
-                generator_model="mock-gen",
-                judge_model="mock-judge",
+                generator_model="google/mock-gen",
+                judge_model="google/mock-judge",
                 n_steps=2,
                 n_guesses=1,
                 initial_results=mock_initial,
@@ -267,6 +277,273 @@ class TestMSEApproximations(unittest.TestCase):
             self.assertTrue(len(judge_prompts) >= 1)
             # Judge prompt should contain the current round's judge approximation: "with MSE = 0.125000"
             self.assertTrue("with MSE = 0.125000" in judge_prompts[0])
+
+
+class TestOpenRouterIntegration(unittest.TestCase):
+    def test_provider_parsing(self):
+        from run_optimization import parse_provider_and_model
+        
+        provider, name = parse_provider_and_model("openrouter/nvidia/nemotron")
+        self.assertEqual(provider, "openrouter")
+        self.assertEqual(name, "nvidia/nemotron")
+        
+        provider, name = parse_provider_and_model("google/gemini-2.5-flash")
+        self.assertEqual(provider, "google")
+        self.assertEqual(name, "gemini-2.5-flash")
+        
+        provider, name = parse_provider_and_model("mse")
+        self.assertEqual(provider, "")
+        self.assertEqual(name, "mse")
+
+        # Ensure that no API prefix throws a ValueError
+        with self.assertRaises(ValueError):
+            parse_provider_and_model("gemini-3.5-flash")
+            
+        # Ensure that an invalid API prefix throws a ValueError
+        with self.assertRaises(ValueError):
+            parse_provider_and_model("aws/claude")
+
+
+class TestGoogleClient(unittest.TestCase):
+    @patch('run_optimization.genai.Client')
+    def test_init(self, mock_genai_client_class):
+        mock_client = MagicMock()
+        mock_genai_client_class.return_value = mock_client
+        
+        client = GoogleClient("gemini-3.5-flash")
+        
+        self.assertEqual(client.model_name, "gemini-3.5-flash")
+        mock_genai_client_class.assert_called_once()
+        self.assertEqual(client.client, mock_client)
+
+    @patch('run_optimization.genai.Client')
+    def test_generate_success(self, mock_genai_client_class):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hello world"
+        mock_client.models.generate_content.return_value = mock_response
+        mock_genai_client_class.return_value = mock_client
+        
+        client = GoogleClient("gemini-3.5-flash")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello world")
+        mock_client.models.generate_content.assert_called_once_with(
+            model="gemini-3.5-flash",
+            contents="test prompt"
+        )
+
+    @patch('time.sleep')
+    @patch('run_optimization.genai.Client')
+    def test_generate_server_error_retry(self, mock_genai_client_class, mock_sleep):
+        import run_optimization
+        errors = run_optimization.genai.errors
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hello after retry"
+        
+        # Raise ServerError first, then return successful response
+        mock_client.models.generate_content.side_effect = [
+            errors.ServerError(500, {}),
+            mock_response
+        ]
+        mock_genai_client_class.return_value = mock_client
+        
+        client = GoogleClient("gemini-3.5-flash")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after retry")
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch('time.sleep')
+    @patch('run_optimization.genai.Client')
+    def test_generate_rate_limit_retry(self, mock_genai_client_class, mock_sleep):
+        import run_optimization
+        errors = run_optimization.genai.errors
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Hello after rate limit"
+        
+        # Create an APIError with e.code == 429
+        api_error = errors.APIError(429, {})
+        
+        mock_client.models.generate_content.side_effect = [
+            api_error,
+            mock_response
+        ]
+        mock_genai_client_class.return_value = mock_client
+        
+        client = GoogleClient("gemini-3.5-flash")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after rate limit")
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch('run_optimization.genai.Client')
+    def test_generate_other_api_error_raises(self, mock_genai_client_class):
+        import run_optimization
+        errors = run_optimization.genai.errors
+        mock_client = MagicMock()
+        
+        # Create an APIError with e.code == 400
+        api_error = errors.APIError(400, {})
+        
+        mock_client.models.generate_content.side_effect = api_error
+        mock_genai_client_class.return_value = mock_client
+        
+        client = GoogleClient("gemini-3.5-flash")
+        with self.assertRaises(errors.APIError):
+            client.generate("test prompt")
+
+
+class TestOpenRouterClient(unittest.TestCase):
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_init(self, mock_openrouter_client_class):
+        mock_client = MagicMock()
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        
+        self.assertEqual(client.model_name, "nvidia/nemotron")
+        self.assertEqual(client.api_key, "fake_key")
+        self.assertEqual(client.client, mock_client)
+        mock_openrouter_client_class.assert_called_once_with(api_key="fake_key")
+
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_generate_success(self, mock_openrouter_client_class):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello from OpenRouter"))
+        ]
+        mock_client.chat.send.return_value = mock_response
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello from OpenRouter")
+        mock_client.chat.send.assert_called_once_with(
+            model="nvidia/nemotron",
+            messages=[{"role": "user", "content": "test prompt"}],
+            provider={
+                "max_price": {"prompt": 0, "completion": 0}
+            }
+        )
+
+    @patch('time.sleep')
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_generate_rate_limit_retry(self, mock_openrouter_client_class, mock_sleep):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello after rate limit"))
+        ]
+        
+        # Raise TooManyRequestsResponseError, then return successful response
+        mock_client.chat.send.side_effect = [
+            openrouter.errors.TooManyRequestsResponseError(MagicMock(), MagicMock()),
+            mock_response
+        ]
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after rate limit")
+        self.assertEqual(mock_client.chat.send.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch('time.sleep')
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_generate_server_error_retry(self, mock_openrouter_client_class, mock_sleep):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello after server error"))
+        ]
+        
+        # Raise InternalServerResponseError, then return successful response
+        mock_client.chat.send.side_effect = [
+            openrouter.errors.InternalServerResponseError(MagicMock(), MagicMock()),
+            mock_response
+        ]
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after server error")
+        self.assertEqual(mock_client.chat.send.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch('time.sleep')
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_generate_response_validation_error_retry(self, mock_openrouter_client_class, mock_sleep):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello after validation error"))
+        ]
+        
+        # Raise ResponseValidationError, then return successful response
+        mock_client.chat.send.side_effect = [
+            openrouter.errors.ResponseValidationError("Response validation failed", MagicMock(), Exception()),
+            mock_response
+        ]
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after validation error")
+        self.assertEqual(mock_client.chat.send.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch('time.sleep')
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_generate_httpx_http_error_retry(self, mock_openrouter_client_class, mock_sleep):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello after httpx error"))
+        ]
+        
+        # Raise httpx.HTTPError, then return successful response
+        mock_client.chat.send.side_effect = [
+            httpx.HTTPError("Network failure"),
+            mock_response
+        ]
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        res = client.generate("test prompt")
+        
+        self.assertEqual(res, "Hello after httpx error")
+        self.assertEqual(mock_client.chat.send.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('openrouter.OpenRouter')
+    def test_generate_api_error_other_raises(self, mock_openrouter_client_class):
+        mock_client = MagicMock()
+        
+        # Raise a general OpenRouterError (with a mock raw_response, etc.)
+        mock_client.chat.send.side_effect = openrouter.errors.OpenRouterError("Some bad error", MagicMock())
+        mock_openrouter_client_class.return_value = mock_client
+        
+        client = OpenRouterClient("nvidia/nemotron")
+        with self.assertRaises(openrouter.errors.OpenRouterError) as ctx:
+            client.generate("test prompt")
+        self.assertEqual(ctx.exception.message, "Some bad error")
 
 
 if __name__ == "__main__":
