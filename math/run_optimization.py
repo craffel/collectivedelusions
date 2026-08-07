@@ -20,6 +20,7 @@ import httpx
 import concurrent.futures
 
 from google import genai
+from google.genai import types
 import openrouter
 import openrouter.errors
 import numpy as np
@@ -52,7 +53,7 @@ def parse_provider_and_model(model_str: str) -> tuple[str, str]:
 
 class GoogleClient:
     def __init__(self, model_name: str, client: genai.Client = None):
-        self.client = client if client is not None else genai.Client()
+        self.client = client if client is not None else genai.Client(http_options=types.HttpOptions(timeout=60000))
         self.model_name = model_name
 
     def generate(self, prompt: str) -> str:
@@ -305,7 +306,7 @@ def run_experiment(
     judge_approximate_mse: bool = False
 ) -> dict:
     # Instantiate exactly one underlying SDK client for Google and OpenRouter to share across wrappers
-    shared_google_sdk_client = genai.Client()
+    shared_google_sdk_client = genai.Client(http_options=types.HttpOptions(timeout=60000))
     shared_openrouter_sdk_client = openrouter.OpenRouter()
 
     generator_client = create_client(generator_model, shared_google_sdk_client, shared_openrouter_sdk_client)
