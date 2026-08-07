@@ -493,7 +493,7 @@ class TestOpenRouterClient(unittest.TestCase):
             model="nvidia/nemotron",
             messages=[{"role": "user", "content": "test prompt"}],
             provider={
-                "max_price": {"prompt": 0, "completion": 0}
+                "sort": "price"
             }
         )
 

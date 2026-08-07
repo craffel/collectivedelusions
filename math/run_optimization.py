@@ -103,7 +103,7 @@ class OpenRouterClient:
                     model=self.model_name,
                     messages=[{"role": "user", "content": prompt}],
                     provider={
-                        "max_price": {"prompt": 0, "completion": 0}
+                        "sort": "price",
                     }
                 )
                 return res.choices[0].message.content
