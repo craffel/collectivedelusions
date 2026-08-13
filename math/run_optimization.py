@@ -774,13 +774,7 @@ if __name__ == "__main__":
         json.dump(vars(args), f, indent=4)
 
     if args.first_step_performance:
-        logger.info(f"Starting first-step performance estimation with:\n"
-                    f"  Generator Model: {args.generator_model}\n"
-                    f"  Judge Model: {args.judge_model}\n"
-                    f"  Steps: {args.n_steps}\n"
-                    f"  Guesses per step: {args.n_guesses}\n"
-                    f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
-                    f"  Output Directory: {args.output_dir}")
+        logger.info(f"Starting first-step performance estimation with\n{vars(args)}")
 
         results = run_first_step_performance(
             generator_model=args.generator_model,
@@ -791,19 +785,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir
         )
     else:
-        logger.info(f"Starting experiment with:\n"
-                    f"  Generator Model: {args.generator_model}\n"
-                    f"  Judge Model: {args.judge_model}\n"
-                    f"  Steps: {args.n_steps}\n"
-                    f"  Guesses per step: {args.n_guesses}\n"
-                    f"  Max past iterates: {args.max_past_iterates}\n"
-                    f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
-                    f"  Early Stopping MSE: {args.early_stopping_mse}\n"
-                    f"  Generator Show MSE: {args.generator_show_mse}\n"
-                    f"  Judge Show MSE: {args.judge_show_mse}\n"
-                    f"  Generator Approx MSE: {args.generator_approximate_mse}\n"
-                    f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
-                    f"  Output Directory: {args.output_dir}")
+        logger.info(f"Starting experiment with\n{vars(args)}")
 
         results = run_experiment(
             generator_model=args.generator_model,
