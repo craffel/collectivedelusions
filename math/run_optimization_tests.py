@@ -11,23 +11,25 @@
 
 import unittest
 from unittest.mock import MagicMock, patch
-import numpy as np
+
+import httpx
 import openrouter
 import openrouter.errors
-import httpx
+
 from run_optimization import (
-    extract_answer,
-    parse_max_past_iterates,
     EQUATIONS,
-    approximate_mse,
-    fallback_extract,
-    run_experiment,
-    run_first_step_performance,
-    instantiate_clients,
     TUPLE_EXTRACTION_PROMPT,
     GoogleClient,
-    OpenRouterClient
+    OpenRouterClient,
+    approximate_mse,
+    extract_answer,
+    fallback_extract,
+    instantiate_clients,
+    parse_max_past_iterates,
+    run_experiment,
+    run_first_step_performance,
 )
+
 
 class TestExtractAnswer(unittest.TestCase):
     def test_standard_case(self):
@@ -87,7 +89,7 @@ class TestParseMaxPastIterates(unittest.TestCase):
 class TestEquationsAndMSE(unittest.TestCase):
     def test_equations_are_strings(self):
         # Make sure EQUATIONS dictionary holds valid string prompt segments
-        for opt_id, text in EQUATIONS.items():
+        for text in EQUATIONS.values():
             self.assertTrue(isinstance(text, str))
             self.assertTrue(len(text) > 0)
 
@@ -187,7 +189,7 @@ class TestMSEPromptOptions(unittest.TestCase):
         
         with patch('google.genai.Client', return_value=mock_client):
             # Run experiment for 2 steps, resuming from 1 completed round
-            results = run_experiment(
+            run_experiment(
                 generator_model="google/mock-gen",
                 judge_model="google/mock-judge",
                 n_steps=2,

@@ -9,22 +9,22 @@
 # ]
 # ///
 
+import concurrent.futures
+import json
 import logging
 import os
 import random
 import re
 import sys
 import time
-import json
-import httpx
-import concurrent.futures
 
-from google import genai
-from google.genai import types
+import httpx
+import numpy as np
 import openrouter
 import openrouter.errors
-import numpy as np
 import scipy.integrate
+from google import genai
+from google.genai import types
 
 # Configure isolated local logging to completely suppress third-party package noise
 logger = logging.getLogger("optimization")
@@ -52,11 +52,11 @@ def parse_provider_and_model(model_str: str) -> tuple[str, str]:
 
 
 class GoogleClient:
-    def __init__(self, model_name: str, client: genai.Client = None):
+    def __init__(self, model_name: str, client: genai.Client | None = None):
         self.client = client if client is not None else genai.Client(http_options=types.HttpOptions(timeout=60000))
         self.model_name = model_name
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str) -> str | None:
         delay = 1
         while True:
             try:
@@ -87,16 +87,16 @@ class GoogleClient:
                     time.sleep(sleep_time)
                     delay += 1
                 else:
-                    raise e
+                    raise
 
 
 class OpenRouterClient:
-    def __init__(self, model_name: str, client: openrouter.OpenRouter = None):
+    def __init__(self, model_name: str, client: openrouter.OpenRouter | None = None):
         self.model_name = model_name
         self.api_key = os.environ["OPENROUTER_API_KEY"]
         self.client = client if client is not None else openrouter.OpenRouter(api_key=self.api_key)
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str) -> str | None:
         delay = 1
         while True:
             try:
@@ -107,7 +107,10 @@ class OpenRouterClient:
                         "sort": "price",
                     }
                 )
-                return res.choices[0].message.content
+                content = res.choices[0].message.content
+                if isinstance(content, str):
+                    return content
+                return None
             except (
                 openrouter.errors.TooManyRequestsResponseError,
                 openrouter.errors.InternalServerResponseError,
@@ -125,10 +128,10 @@ class OpenRouterClient:
                 delay += 1
             except openrouter.errors.OpenRouterError as e:
                 logger.warning(f"OpenRouter API error: {e.message}")
-                raise e
+                raise
 
 
-def create_client(model_str: str, google_sdk_client: genai.Client = None, openrouter_sdk_client: openrouter.OpenRouter = None):
+def create_client(model_str: str, google_sdk_client: genai.Client | None = None, openrouter_sdk_client: openrouter.OpenRouter | None = None):
     """
     Factory function to instantiate GoogleClient or OpenRouterClient based on the model prefix.
     """
@@ -222,7 +225,7 @@ def approximate_mse(m: float, b: float) -> float:
     return scipy.integrate.quad(squared_error, 0, 1)[0]
 
 
-def extract_answer(response: str) -> tuple[float, float] | None:
+def extract_answer(response: str | None) -> tuple[float, float] | None:
     if response is None:
         return None
     # Captures:
@@ -244,7 +247,7 @@ def extract_answer(response: str) -> tuple[float, float] | None:
     return None
 
 
-def extract_single_value(response: str) -> float | None:
+def extract_single_value(response: str | None) -> float | None:
     if response is None:
         return None
     # Captures a single boxed float, supporting scientific notation and negative values
@@ -258,17 +261,17 @@ def extract_single_value(response: str) -> float | None:
     return None
 
 
-def fallback_extract(response_text: str, prompt_template: str, parser, fallback_client: GoogleClient):
+def fallback_extract(response_text: str | None, prompt_template: str, parser, fallback_client: GoogleClient):
     """
     Uses gemini-3.5-flash as a cheap, robust fallback parser if the primary regex extraction failed.
     """
     if response_text is None:
         return None
-    extraction_prompt = prompt_template.format(response_text=response_text)
     try:
+        extraction_prompt = prompt_template.format(response_text=response_text)
         res_text = fallback_client.generate(extraction_prompt)
         return parser(res_text)
-    except Exception as e:
+    except (genai.errors.APIError, httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as e:
         logger.warning(f"Fallback extraction failed: {e}")
         return None
 
@@ -277,8 +280,8 @@ def generate_and_parse_with_fallback(
     client,
     prompt: str,
     primary_parser,
-    fallback_client: GoogleClient = None,
-    fallback_prompt_template: str = None,
+    fallback_client: GoogleClient | None = None,
+    fallback_prompt_template: str | None = None,
     label: str = "generation"
 ):
     """
@@ -311,7 +314,7 @@ def run_first_step_performance(
     n_steps: int = 10,
     n_guesses: int = 5,
     equation_option: int = 1,
-    output_dir: str = None
+    output_dir: str | None = None
 ) -> dict:
     generator_client, judge_client, fallback_client = instantiate_clients(generator_model, judge_model)
     equation_text = EQUATIONS[equation_option]
@@ -416,8 +419,8 @@ def run_experiment(
     max_past_iterates: str | int = "all",
     equation_option: int = 1,
     early_stopping_mse: float = 0.18,
-    initial_results: dict = None,
-    output_dir: str = None,
+    initial_results: dict | None = None,
+    output_dir: str | None = None,
     generator_show_mse: bool = False,
     judge_show_mse: bool = False,
     generator_approximate_mse: bool = False,
@@ -455,7 +458,7 @@ def run_experiment(
         guesses = []
         
         # Slices the list of past completed rounds if configured
-        visible_rounds = rounds_data[-max_past_iterates:] if max_past_iterates != "all" and max_past_iterates > 0 else rounds_data[:i]
+        visible_rounds = rounds_data[-max_past_iterates:] if isinstance(max_past_iterates, int) and max_past_iterates > 0 else rounds_data[:i]
 
         # Represent visible past iterates as a list of dictionaries, reading directly from history!
         visible_iterates_dicts = []
@@ -484,10 +487,10 @@ def run_experiment(
         )
         
         # Define helper for parallel guess generation
-        def generate_single_guess(j):
+        def generate_single_guess(j, prompt=generator_prompt):
             ans = generate_and_parse_with_fallback(
                 generator_client,
-                prompt=generator_prompt,
+                prompt=prompt,
                 primary_parser=extract_answer,
                 fallback_client=fallback_client,
                 fallback_prompt_template=TUPLE_EXTRACTION_PROMPT,
@@ -570,7 +573,7 @@ def run_experiment(
                 chosen_dict = {"m": chosen[0], "b": chosen[1]}
         elif judge_model == "mse":
             chosen_dict = dict(min(guesses, key=lambda g: approximate_mse(g["m"], g["b"])))
-        elif judge_model == "random":
+        else:
             chosen_dict = dict(random.choice(guesses))
 
         mse = approximate_mse(chosen_dict["m"], chosen_dict["b"])
@@ -738,10 +741,9 @@ if __name__ == "__main__":
     generator_provider, _ = parse_provider_and_model(args.generator_model)
     judge_provider, _ = parse_provider_and_model(args.judge_model)
 
-    if generator_provider == "openrouter" or judge_provider == "openrouter":
-        if "OPENROUTER_API_KEY" not in os.environ:
-            logger.error("Error: OPENROUTER_API_KEY environment variable is not set. Please set it before running the script with OpenRouter models.")
-            sys.exit(1)
+    if (generator_provider == "openrouter" or judge_provider == "openrouter") and "OPENROUTER_API_KEY" not in os.environ:
+        logger.error("Error: OPENROUTER_API_KEY environment variable is not set. Please set it before running the script with OpenRouter models.")
+        sys.exit(1)
 
     # Check for existing partial results.json to support resuming
     results_path = os.path.join(args.output_dir, "results.json")
@@ -756,7 +758,7 @@ if __name__ == "__main__":
                 sys.exit(0)
             elif completed_rounds > 0:
                 logger.info(f"Resuming experiment in {args.output_dir} from round {completed_rounds + 1} ({completed_rounds}/{args.n_steps} rounds already completed).")
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Could not parse existing results.json, starting from scratch. Error: {e}")
 
     # Create output directory if starting fresh
