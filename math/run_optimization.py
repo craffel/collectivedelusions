@@ -141,6 +141,22 @@ def create_client(model_str: str, google_sdk_client: genai.Client = None, openro
         return None
 
 
+def instantiate_clients(generator_model: str, judge_model: str):
+    """
+    Instantiates shared SDK clients for Google and OpenRouter, then creates
+    and returns generator_client, judge_client, and fallback_client.
+    """
+    shared_google_sdk_client = genai.Client(http_options=types.HttpOptions(timeout=60000))
+    shared_openrouter_sdk_client = openrouter.OpenRouter()
+
+    generator_client = create_client(generator_model, shared_google_sdk_client, shared_openrouter_sdk_client)
+    judge_client = create_client(judge_model, shared_google_sdk_client, shared_openrouter_sdk_client)
+
+    fallback_client = GoogleClient("gemini-3.5-flash", client=shared_google_sdk_client)
+
+    return generator_client, judge_client, fallback_client
+
+
 EQUATIONS = {
     1: "(sin(pi*x/2) + 1)^(x + 1)^1.5",
     2: "exp((x + 1)^(3/2) ln(sin(pi*x/2) + 1))",
@@ -289,6 +305,108 @@ def generate_and_parse_with_fallback(
                 
         logger.warning(f"Failed to extract a valid answer for {label}. Retrying full generation...")
 
+def run_first_step_performance(
+    generator_model: str,
+    judge_model: str,
+    n_steps: int = 10,
+    n_guesses: int = 5,
+    equation_option: int = 1,
+    output_dir: str = None
+) -> dict:
+    generator_client, judge_client, fallback_client = instantiate_clients(generator_model, judge_model)
+    equation_text = EQUATIONS[equation_option]
+
+    logger.info("Evaluating generator first-step performance...")
+    generator_prompt = GENERATOR_PROMPT_TEMPLATE.format(
+        equation_text=equation_text,
+        past_iterates=""
+    )
+
+    def generate_single_run(r):
+        ans = generate_and_parse_with_fallback(
+            generator_client,
+            prompt=generator_prompt,
+            primary_parser=extract_answer,
+            fallback_client=fallback_client,
+            fallback_prompt_template=TUPLE_EXTRACTION_PROMPT,
+            label=f"generator first-step run {r + 1}/{n_steps}"
+        )
+        mse = approximate_mse(ans[0], ans[1])
+        return {"run": r + 1, "m": ans[0], "b": ans[1], "mse": mse}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_steps, 10)) as executor:
+        futures = [executor.submit(generate_single_run, r) for r in range(n_steps)]
+        generator_results = [fut.result() for fut in futures]
+
+    logger.info("Evaluating judge first-step performance...")
+
+    def run_single_judge_eval(r):
+        guesses = [
+            {"m": 6.046, "b": 0.1409},
+            {"m": 6.103, "b": 1.0}
+        ]
+        n_additional = max(0, n_guesses - 2)
+        for _ in range(n_additional):
+            m_rand = round(random.uniform(-10, 10), 3)
+            b_rand = round(random.uniform(-10, 10), 3)
+            guesses.append({"m": m_rand, "b": b_rand})
+
+        guesses_strings = [f"({d['m']}, {d['b']})" for d in guesses]
+
+        judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+            equation_text=equation_text,
+            n_guesses=len(guesses),
+            guesses="\n".join(guesses_strings)
+        )
+        chosen = generate_and_parse_with_fallback(
+            judge_client,
+            prompt=judge_prompt,
+            primary_parser=extract_answer,
+            fallback_client=fallback_client,
+            fallback_prompt_template=TUPLE_EXTRACTION_PROMPT,
+            label=f"judge first-step selection run {r + 1}/{n_steps}"
+        )
+        picked_target = (abs(chosen[0] - 6.046) < 1e-3 and abs(chosen[1] - 0.1409) < 1e-3)
+
+        return {
+            "run": r + 1,
+            "guesses": guesses,
+            "chosen": {"m": chosen[0], "b": chosen[1]},
+            "picked_target": picked_target
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_steps, 10)) as executor:
+        futures = [executor.submit(run_single_judge_eval, r) for r in range(n_steps)]
+        judge_results = [fut.result() for fut in futures]
+
+    mean_mse = sum(r["mse"] for r in generator_results) / len(generator_results) if generator_results else 0.0
+    picked_count = sum(1 for r in judge_results if r["picked_target"])
+    pick_rate = picked_count / len(judge_results) if judge_results else 0.0
+
+    logger.info("First-step performance evaluation complete:")
+    logger.info(f"  Generator Mean MSE: {mean_mse:.6f}")
+    logger.info(f"  Judge Target Pick Rate: {pick_rate * 100:.1f}% ({picked_count}/{n_steps})")
+
+    results = {
+        "generator_results": generator_results,
+        "judge_results": judge_results,
+        "summary": {
+            "generator_mean_mse": mean_mse,
+            "judge_target_pick_rate": pick_rate,
+            "judge_target_picks": picked_count,
+            "total_steps": n_steps
+        }
+    }
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        results_path = os.path.join(output_dir, "results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=4)
+
+    return results
+
+
 
 def run_experiment(
     generator_model: str,
@@ -305,17 +423,8 @@ def run_experiment(
     generator_approximate_mse: bool = False,
     judge_approximate_mse: bool = False
 ) -> dict:
-    # Instantiate exactly one underlying SDK client for Google and OpenRouter to share across wrappers
-    shared_google_sdk_client = genai.Client(http_options=types.HttpOptions(timeout=60000))
-    shared_openrouter_sdk_client = openrouter.OpenRouter()
-
-    generator_client = create_client(generator_model, shared_google_sdk_client, shared_openrouter_sdk_client)
-    judge_client = create_client(judge_model, shared_google_sdk_client, shared_openrouter_sdk_client)
-
+    generator_client, judge_client, fallback_client = instantiate_clients(generator_model, judge_model)
     is_llm_judge = judge_client is not None
-
-    # Instantiate exactly one fallback client for the entire experiment run
-    fallback_client = GoogleClient("gemini-3.5-flash", client=shared_google_sdk_client)
 
     equation_text = EQUATIONS[equation_option]
 
@@ -608,6 +717,11 @@ if __name__ == "__main__":
         help="Ask the judge model to independently approximate the MSE of proposed guesses.",
     )
     parser.add_argument(
+        "--first_step_performance", "--first-step-performance",
+        action="store_true",
+        help="Estimate accuracy of judge and generator models in the first iteration of optimization.",
+    )
+    parser.add_argument(
         "--output_dir", "--output-dir",
         type=str,
         required=True,
@@ -659,35 +773,53 @@ if __name__ == "__main__":
     with open(config_path, "w") as f:
         json.dump(vars(args), f, indent=4)
 
-    logger.info(f"Starting experiment with:\n"
-                f"  Generator Model: {args.generator_model}\n"
-                f"  Judge Model: {args.judge_model}\n"
-                f"  Steps: {args.n_steps}\n"
-                f"  Guesses per step: {args.n_guesses}\n"
-                f"  Max past iterates: {args.max_past_iterates}\n"
-                f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
-                f"  Early Stopping MSE: {args.early_stopping_mse}\n"
-                f"  Generator Show MSE: {args.generator_show_mse}\n"
-                f"  Judge Show MSE: {args.judge_show_mse}\n"
-                f"  Generator Approx MSE: {args.generator_approximate_mse}\n"
-                f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
-                f"  Output Directory: {args.output_dir}")
+    if args.first_step_performance:
+        logger.info(f"Starting first-step performance estimation with:\n"
+                    f"  Generator Model: {args.generator_model}\n"
+                    f"  Judge Model: {args.judge_model}\n"
+                    f"  Steps: {args.n_steps}\n"
+                    f"  Guesses per step: {args.n_guesses}\n"
+                    f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
+                    f"  Output Directory: {args.output_dir}")
 
-    results = run_experiment(
-        generator_model=args.generator_model,
-        judge_model=args.judge_model,
-        n_steps=args.n_steps,
-        n_guesses=args.n_guesses,
-        max_past_iterates=args.max_past_iterates,
-        equation_option=args.equation_option,
-        early_stopping_mse=args.early_stopping_mse,
-        initial_results=initial_results,
-        output_dir=args.output_dir,
-        generator_show_mse=args.generator_show_mse,
-        judge_show_mse=args.judge_show_mse,
-        generator_approximate_mse=args.generator_approximate_mse,
-        judge_approximate_mse=args.judge_approximate_mse
-    )
+        results = run_first_step_performance(
+            generator_model=args.generator_model,
+            judge_model=args.judge_model,
+            n_steps=args.n_steps,
+            n_guesses=args.n_guesses,
+            equation_option=args.equation_option,
+            output_dir=args.output_dir
+        )
+    else:
+        logger.info(f"Starting experiment with:\n"
+                    f"  Generator Model: {args.generator_model}\n"
+                    f"  Judge Model: {args.judge_model}\n"
+                    f"  Steps: {args.n_steps}\n"
+                    f"  Guesses per step: {args.n_guesses}\n"
+                    f"  Max past iterates: {args.max_past_iterates}\n"
+                    f"  Equation Option: {args.equation_option} ({EQUATIONS[args.equation_option]})\n"
+                    f"  Early Stopping MSE: {args.early_stopping_mse}\n"
+                    f"  Generator Show MSE: {args.generator_show_mse}\n"
+                    f"  Judge Show MSE: {args.judge_show_mse}\n"
+                    f"  Generator Approx MSE: {args.generator_approximate_mse}\n"
+                    f"  Judge Approx MSE: {args.judge_approximate_mse}\n"
+                    f"  Output Directory: {args.output_dir}")
+
+        results = run_experiment(
+            generator_model=args.generator_model,
+            judge_model=args.judge_model,
+            n_steps=args.n_steps,
+            n_guesses=args.n_guesses,
+            max_past_iterates=args.max_past_iterates,
+            equation_option=args.equation_option,
+            early_stopping_mse=args.early_stopping_mse,
+            initial_results=initial_results,
+            output_dir=args.output_dir,
+            generator_show_mse=args.generator_show_mse,
+            judge_show_mse=args.judge_show_mse,
+            generator_approximate_mse=args.generator_approximate_mse,
+            judge_approximate_mse=args.judge_approximate_mse
+        )
 
     # Save final results to results.json (completely validated and outputted)
     results_path = os.path.join(args.output_dir, "results.json")

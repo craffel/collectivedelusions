@@ -22,6 +22,8 @@ from run_optimization import (
     approximate_mse,
     fallback_extract,
     run_experiment,
+    run_first_step_performance,
+    instantiate_clients,
     TUPLE_EXTRACTION_PROMPT,
     GoogleClient,
     OpenRouterClient
@@ -302,6 +304,30 @@ class TestOpenRouterIntegration(unittest.TestCase):
         # Ensure that an invalid API prefix throws a ValueError
         with self.assertRaises(ValueError):
             parse_provider_and_model("aws/claude")
+
+class TestInstantiateClients(unittest.TestCase):
+    @patch('run_optimization.genai.Client')
+    @patch.dict('os.environ', {'OPENROUTER_API_KEY': 'fake_key'})
+    @patch('run_optimization.openrouter.OpenRouter')
+    def test_instantiate_clients(self, mock_openrouter, mock_genai):
+        gen_client, judge_client, fallback_client = instantiate_clients(
+            "google/gemini-2.5-flash",
+            "openrouter/nvidia/nemotron"
+        )
+        self.assertIsInstance(gen_client, GoogleClient)
+        self.assertIsInstance(judge_client, OpenRouterClient)
+        self.assertIsInstance(fallback_client, GoogleClient)
+        self.assertEqual(fallback_client.model_name, "gemini-3.5-flash")
+
+    @patch('run_optimization.genai.Client')
+    def test_instantiate_clients_mse_judge(self, mock_genai):
+        gen_client, judge_client, fallback_client = instantiate_clients(
+            "google/gemini-2.5-flash",
+            "mse"
+        )
+        self.assertIsInstance(gen_client, GoogleClient)
+        self.assertIsNone(judge_client)
+        self.assertIsInstance(fallback_client, GoogleClient)
 
 
 class TestGoogleClient(unittest.TestCase):
@@ -606,6 +632,87 @@ class TestOpenRouterClient(unittest.TestCase):
         with self.assertRaises(openrouter.errors.OpenRouterError) as ctx:
             client.generate("test prompt")
         self.assertEqual(ctx.exception.message, "Some bad error")
+class TestFirstStepPerformance(unittest.TestCase):
+    @patch('run_optimization.genai.Client')
+    @patch('run_optimization.GoogleClient')
+    def test_first_step_performance_basic(self, mock_google_client_class, mock_genai_client_class):
+        mock_genai_client_class.return_value = MagicMock()
+        mock_fallback_client = MagicMock()
+        mock_fallback_client.generate.return_value = r"\boxed{(6.0, 0.2)}"
+        mock_google_client_class.return_value = mock_fallback_client
+
+        def mock_generate_and_parse(client, prompt, primary_parser, **kwargs):
+            if "generator first-step run" in kwargs.get("label", ""):
+                return (6.0, 0.2)
+            if "judge first-step selection" in kwargs.get("label", ""):
+                return (6.046, 0.1409)
+            return (6.0, 0.2)
+
+        # Test with LLM models for generator and judge
+        with patch('run_optimization.generate_and_parse_with_fallback', side_effect=mock_generate_and_parse):
+            results = run_first_step_performance(
+                generator_model="google/gemini-2.5-flash",
+                judge_model="google/gemini-2.5-flash",
+                n_steps=3,
+                n_guesses=5,
+                equation_option=1
+            )
+        self.assertIn("generator_results", results)
+        self.assertIn("judge_results", results)
+        self.assertEqual(len(results["generator_results"]), 3)
+        self.assertEqual(len(results["judge_results"]), 3)
+
+        for gen_res in results["generator_results"]:
+            self.assertEqual(gen_res["m"], 6.0)
+            self.assertEqual(gen_res["b"], 0.2)
+            self.assertIn("mse", gen_res)
+            self.assertGreater(gen_res["mse"], 0.0)
+
+        for judge_res in results["judge_results"]:
+            guesses = judge_res["guesses"]
+            self.assertEqual(len(guesses), 5)
+            self.assertEqual((guesses[0]["m"], guesses[0]["b"]), (6.046, 0.1409))
+            self.assertEqual((guesses[1]["m"], guesses[1]["b"]), (6.103, 1.0))
+            for g in guesses[2:]:
+                self.assertGreaterEqual(g["m"], -10.0)
+                self.assertLessEqual(g["m"], 10.0)
+                self.assertGreaterEqual(g["b"], -10.0)
+                self.assertLessEqual(g["b"], 10.0)
+                # Verify formatting to 3 decimal places
+                self.assertEqual(g["m"], round(g["m"], 3))
+                self.assertEqual(g["b"], round(g["b"], 3))
+            self.assertTrue(judge_res["picked_target"])
+
+        self.assertEqual(results["summary"]["judge_target_picks"], 3)
+        self.assertEqual(results["summary"]["judge_target_pick_rate"], 1.0)
+
+    @patch('run_optimization.genai.Client')
+    @patch('run_optimization.GoogleClient')
+    def test_first_step_performance_llm_judge(self, mock_google_client_class, mock_genai_client_class):
+        mock_genai_client_class.return_value = MagicMock()
+        mock_fallback_client = MagicMock()
+        mock_google_client_class.return_value = mock_fallback_client
+
+        # Mock generate_and_parse_with_fallback for generator and judge
+        def mock_generate_and_parse(client, prompt, primary_parser, **kwargs):
+            if "first-step run" in kwargs.get("label", ""):
+                return (6.0, 0.2)
+            if "judge first-step selection" in kwargs.get("label", ""):
+                return (6.046, 0.1409)
+            return (6.0, 0.2)
+
+        with patch('run_optimization.generate_and_parse_with_fallback', side_effect=mock_generate_and_parse):
+            results = run_first_step_performance(
+                generator_model="google/gemini-2.5-flash",
+                judge_model="google/gemini-2.5-flash",
+                n_steps=2,
+                n_guesses=4,
+                equation_option=1
+            )
+        self.assertEqual(len(results["judge_results"]), 2)
+        for judge_res in results["judge_results"]:
+            self.assertEqual(len(judge_res["guesses"]), 4)
+            self.assertTrue(judge_res["picked_target"])
 
 
 if __name__ == "__main__":
